@@ -1,0 +1,284 @@
+{
+  "maps": [
+    {
+      "name": "长寿村",
+      "aliases": [
+        "长寿村"
+      ],
+      "image": "maps/长寿村.png",
+      "left_x": 0,
+      "right_x": 160,
+      "top_y": 210,
+      "bottom_y": 0,
+      "tasks": [
+        "抓鬼"
+      ]
+    },
+    {
+      "name": "大唐境外",
+      "aliases": [
+        "大唐境外"
+      ],
+      "image": "maps/大唐境外.png",
+      "left_x": 0,
+      "right_x": 638,
+      "top_y": 118,
+      "bottom_y": 0,
+      "tasks": [
+        "抓鬼"
+      ]
+    },
+    {
+      "name": "天宫",
+      "aliases": [
+        "天宫"
+      ],
+      "image": "maps/天宫.png",
+      "left_x": 0,
+      "right_x": 253,
+      "top_y": 170,
+      "bottom_y": 0,
+      "tasks": [
+        "鬼王"
+      ]
+    },
+    {
+      "name": "地狱迷宫三层",
+      "aliases": [
+        "地狱迷宫三层"
+      ],
+      "image": "maps/地狱迷宫三层.png",
+      "left_x": 0,
+      "right_x": 120,
+      "top_y": 90,
+      "bottom_y": 0,
+      "tasks": [
+        "鬼王"
+      ]
+    },
+    {
+      "name": "西凉女国",
+      "aliases": [
+        "西凉女国"
+      ],
+      "image": "maps/西凉女国.png",
+      "left_x": 0,
+      "right_x": 164,
+      "top_y": 124,
+      "bottom_y": 0,
+      "tasks": [
+        "抓鬼"
+      ]
+    },
+    {
+      "name": "海底迷宫一层",
+      "aliases": [
+        "海底迷宫一层"
+      ],
+      "image": "maps/海底迷宫一层.png",
+      "left_x": 0,
+      "right_x": 64,
+      "top_y": 48,
+      "bottom_y": 0,
+      "tasks": [
+        "鬼王"
+      ]
+    },
+    {
+      "name": "花果山",
+      "aliases": [
+        "花果山"
+      ],
+      "image": "maps/花果山.png",
+      "left_x": 0,
+      "right_x": 159,
+      "top_y": 119,
+      "bottom_y": 0,
+      "tasks": [
+        "鬼王"
+      ]
+    },
+    {
+      "name": "江南野外",
+      "aliases": [
+        "江南野外"
+      ],
+      "image": "maps/江南野外.png",
+      "left_x": 0,
+      "right_x": 159,
+      "top_y": 119,
+      "bottom_y": 0,
+      "tasks": [
+        "抓鬼"
+      ]
+    },
+    {
+      "name": "女娲神迹",
+      "aliases": [
+        "女娲神迹"
+      ],
+      "image": "maps/女娲神迹.png",
+      "left_x": 0,
+      "right_x": 192,
+      "top_y": 142,
+      "bottom_y": 0,
+      "tasks": [
+        "鬼王"
+      ]
+    },
+    {
+      "name": "傲来国",
+      "aliases": [
+        "傲来国"
+      ],
+      "image": "maps/傲来国.png",
+      "left_x": 0,
+      "right_x": 225,
+      "top_y": 150,
+      "bottom_y": 0,
+      "tasks": [
+        "抓鬼"
+      ]
+    },
+    {
+      "name": "五庄观",
+      "aliases": [
+        "五庄观"
+      ],
+      "image": "maps/五庄观.png",
+      "left_x": 0,
+      "right_x": 100,
+      "top_y": 75,
+      "bottom_y": 0,
+      "tasks": [
+        "抓鬼"
+      ]
+    },
+    {
+      "name": "北俱芦洲",
+      "aliases": [
+        "北俱芦洲"
+      ],
+      "image": "maps/北俱芦洲.png",
+      "left_x": 0,
+      "right_x": 227,
+      "top_y": 169,
+      "bottom_y": 0,
+      "tasks": [
+        "鬼王"
+      ]
+    },
+    {
+      "name": "女儿村",
+      "aliases": [
+        "女儿村"
+      ],
+      "image": "maps/女儿村.png",
+      "left_x": 0,
+      "right_x": 127,
+      "top_y": 143,
+      "bottom_y": 0,
+      "tasks": [
+        "抓鬼"
+      ]
+    },
+    {
+      "name": "宝象国",
+      "aliases": [
+        "宝象国"
+      ],
+      "image": "maps/宝象国.png",
+      "left_x": 0,
+      "right_x": 160,
+      "top_y": 120,
+      "bottom_y": 0,
+      "tasks": [
+        "抓鬼"
+      ]
+    },
+    {
+      "name": "建邺城",
+      "aliases": [
+        "建邺城"
+      ],
+      "image": "maps/建邺城.png",
+      "left_x": 0,
+      "right_x": 288,
+      "top_y": 145,
+      "bottom_y": 0,
+      "tasks": [
+        "抓鬼"
+      ]
+    },
+    {
+      "name": "普陀山",
+      "aliases": [
+        "普陀山"
+      ],
+      "image": "maps/普陀山.png",
+      "left_x": 0,
+      "right_x": 95,
+      "top_y": 71,
+      "bottom_y": 0,
+      "tasks": [
+        "抓鬼"
+      ]
+    },
+    {
+      "name": "朱紫国",
+      "aliases": [
+        "朱紫国"
+      ],
+      "image": "maps/朱紫国.png",
+      "left_x": 0,
+      "right_x": 192,
+      "top_y": 120,
+      "bottom_y": 0,
+      "tasks": [
+        "抓鬼"
+      ]
+    },
+    {
+      "name": "波月洞",
+      "aliases": [
+        "波月洞"
+      ],
+      "image": "maps/波月洞.png",
+      "left_x": 0,
+      "right_x": 95,
+      "top_y": 143,
+      "bottom_y": 0,
+      "tasks": [
+        "鬼王"
+      ]
+    },
+    {
+      "name": "碗子山",
+      "aliases": [
+        "碗子山"
+      ],
+      "image": "maps/碗子山.png",
+      "left_x": 0,
+      "right_x": 95,
+      "top_y": 190,
+      "bottom_y": 0,
+      "tasks": [
+        "鬼王"
+      ]
+    },
+    {
+      "name": "麒麟山",
+      "aliases": [
+        "麒麟山"
+      ],
+      "image": "maps/麒麟山.png",
+      "left_x": 0,
+      "right_x": 189,
+      "top_y": 142,
+      "bottom_y": 0,
+      "tasks": [
+        "鬼王"
+      ]
+    }
+  ]
+}

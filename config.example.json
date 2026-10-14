@@ -1,0 +1,43 @@
+// 梦幻西游抓鬼/鬼王任务坐标辅助（rust-mhxy）配置示例
+//
+// 复制成 config.json 放在程序（或 exe）目录下即可生效。
+// 支持 // 行注释和 /* */ 块注释。
+{
+  // ---- 识图（OCR）----
+  // "local" 用内置本地 PP-OCR；"remote" 走远端 PP-OCR 服务
+  "ocr/mode": "local",
+  // 识别间隔（秒），范围 1~60
+  "ocr/interval_seconds": 5,
+  // 任务栏截图区域，格式「左,上,右,下」，相对游戏客户区的百分比（0~1）
+  "ocr/task_region": "0.70,0.24,0.99,0.70",
+  // 第二个截图区域
+  "ocr/extra_task_region": "0.70,0.71,0.99,0.90",
+  // 是否启用第二个截图区域
+  "ocr/extra_region_enabled": false,
+
+  // ---- 远端 PP-OCR ----
+  // 请求格式："multipart"（POST /ocr，表单字段 file）/"raw"（POST /ocr/raw，原始字节）
+  "api/format": "multipart",
+  // PP-OCR 服务根地址，会自动拼 /ocr 或 /ocr/raw
+  "api/url": "http://192.168.3.207:8008",
+  // Bearer Token，可留空
+  "api/token": "",
+
+  // ---- 任务 ----
+  // 是否把「鬼王」也纳入识别（抓鬼任务页的勾选项）
+  "task/option/鬼王": true,
+  // 捉鬼「高概率区域」叠加（地图上的半透明 50x50 框）开关
+  "task/high_chance": false,
+  // 抓鬼/鬼王任务布局：false 上下等分，true 左右等分（只有一个任务时占满整个区域）
+  "task/horizontal_layout": false,
+
+  // ---- 日志 ----
+  // 是否在左侧边栏底部输出带时间的日志（任务情况 / 识别错误等）
+  "log/enabled": false,
+
+  // ---- 窗口 ----
+  // 左侧设置栏是否展开
+  "window/sidebar_expanded": true,
+  // 窗口置顶
+  "window/coordinate/on_top": false
+}
