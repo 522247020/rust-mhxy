@@ -76,6 +76,17 @@ pub fn list_windows() -> Result<Vec<WindowInfo>, String> {
     Ok(filter_game_windows(windows))
 }
 
+/// 只截取客户区里的一小块（图色门控用），开销远小于整张客户区。
+pub fn capture_client_rect(
+    handle: i64,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) -> Result<RgbImage, String> {
+    imp::capture_client_rect(handle, x, y, width.max(1), height.max(1))
+}
+
 #[cfg(not(windows))]
 mod imp {
     use super::WindowInfo;
@@ -123,6 +134,22 @@ mod imp {
             let pixel = rgba.get_pixel(x, y);
             image::Rgb([pixel[0], pixel[1], pixel[2]])
         }))
+    }
+
+    pub fn capture_client_rect(
+        handle: i64,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    ) -> Result<RgbImage, String> {
+        let full = capture_client(handle, crate::core::DEFAULT_TASK_REGION)?;
+        let (full_w, full_h) = full.dimensions();
+        let x = x.clamp(0, full_w as i32 - 1) as u32;
+        let y = y.clamp(0, full_h as i32 - 1) as u32;
+        let width = width.clamp(1, full_w as i32 - x as i32) as u32;
+        let height = height.clamp(1, full_h as i32 - y as i32) as u32;
+        Ok(image::imageops::crop_imm(&full, x, y, width, height).to_image())
     }
 }
 
@@ -268,6 +295,26 @@ mod imp {
                 return Err("任务区域被其他窗口遮挡".into());
             }
             capture_screen(origin.x, origin.y, width, height)
+        }
+    }
+
+    pub fn capture_client_rect(
+        handle: i64,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    ) -> Result<RgbImage, String> {
+        unsafe {
+            let hwnd = HWND(handle as *mut core::ffi::c_void);
+            if !IsWindow(Some(hwnd)).as_bool() || IsIconic(hwnd).as_bool() {
+                return Err("游戏窗口已关闭或最小化".into());
+            }
+            let mut origin = POINT { x: 0, y: 0 };
+            if !ClientToScreen(hwnd, &mut origin).as_bool() {
+                return Err("定位游戏窗口失败".into());
+            }
+            capture_screen(origin.x + x, origin.y + y, width, height)
         }
     }
 }

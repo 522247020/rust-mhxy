@@ -31,9 +31,23 @@
   // 抓鬼/鬼王任务布局：false 上下等分，true 左右等分（只有一个任务时占满整个区域）
   "task/horizontal_layout": false,
 
+  // ---- 图色门控 ----
+  // 用少量点位的颜色快速判断「当前有没有任务」：未命中（战斗 / 任务完成）就跳过 OCR。
+  // 点位坐标是游戏客户区像素（和截图同一坐标系），可在「识别区域」窗口里点击图片取点取色。
+  "color_gate/enabled": false,
+  // 轮询间隔（毫秒）
+  "color_gate/interval_ms": 300,
+  // 多点逻辑："all" 全部命中才算有任务；"any" 任一命中即可
+  "color_gate/mode": "all",
+  // 新增点位的默认容差（每通道 0~255）
+  "color_gate/tolerance": 12,
+  "color_gate/points": [
+    // { "x": 1234, "y": 567, "color": "#d4a017", "tolerance": 15, "radius": 1, "label": "任务图标" }
+  ],
+
   // ---- 日志 ----
-  // 是否在左侧边栏底部输出带时间的日志（任务情况 / 识别错误等）
-  "log/enabled": false,
+  // 日志常开："simple" 只记启动应用 / 任务开始 / 任务停止；"detailed" 额外记录 OCR 过程与错误
+  "log/level": "simple",
 
   // ---- 窗口 ----
   // 左侧设置栏是否展开

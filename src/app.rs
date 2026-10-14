@@ -6,15 +6,18 @@ use crate::core::{
     map_coordinate, map_point, map_rect, parse_tasks, MapDefinition, TaskLocation,
     HIGH_CHANCE_SIZE, MAP_COORDINATE_TOLERANCE,
 };
+use crate::gate::{self, ColorPoint, GateMode};
 use crate::ocr::{self, LocalWorker, OcrEvent, OcrText};
 use egui::{pos2, vec2, Align2, Color32, CornerRadius, FontId, Rect, Sense, TextureHandle, Vec2};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
 const TASK_ORDER: [&str; 2] = ["抓鬼", "鬼王"];
+/// 左侧栏底部日志框的固定高度（像素）。
+const LOG_PANEL_HEIGHT: f32 = 240.0;
 
 #[derive(Default)]
 struct TaskState {
@@ -39,8 +42,14 @@ pub struct MhxyApp {
     pending_signature: Option<u64>,
     tasks: HashMap<&'static str, TaskState>,
     map_textures: HashMap<String, TextureHandle>,
+    map_texture_failed: HashSet<String>,
     preview_full: Option<egui::ColorImage>,
     show_region_window: bool,
+    pick_points: bool,
+    gate_active: bool,
+    last_gate_check: Instant,
+    gate_result: Option<gate::GateResult>,
+    testing_remote: bool,
     last_window_refresh: Instant,
     api_url_edit: String,
     api_token_edit: String,
@@ -86,8 +95,14 @@ impl MhxyApp {
             pending_signature: None,
             tasks,
             map_textures: HashMap::new(),
+            map_texture_failed: HashSet::new(),
             preview_full: None,
             show_region_window: false,
+            pick_points: true,
+            gate_active: true,
+            last_gate_check: Instant::now(),
+            gate_result: None,
+            testing_remote: false,
             last_window_refresh: Instant::now(),
             worker,
             receiver,
@@ -95,6 +110,7 @@ impl MhxyApp {
             logs: Vec::new(),
         };
         app.log(format!("程序启动，加载 {} 张地图", app.maps.len()));
+        app.log_detail(format!("资源目录：{}", assets_dir().display()));
         if let Some(err) = map_error {
             app.log(err);
         }
@@ -102,13 +118,22 @@ impl MhxyApp {
         app
     }
 
-    /// 写一条带时间的日志（仅在开启日志时记录）。
+    /// 简单日志：启动应用、任务开始/停止。详细模式下也显示。
     fn log(&mut self, message: impl Into<String>) {
-        if !self.config.log_enabled {
+        self.push_log(true, message.into());
+    }
+
+    /// 详细日志：只在「详细」级别显示（OCR 过程、错误、窗口变化等）。
+    fn log_detail(&mut self, message: impl Into<String>) {
+        self.push_log(false, message.into());
+    }
+
+    fn push_log(&mut self, simple: bool, message: String) {
+        if !simple && self.config.log_level != "detailed" {
             return;
         }
         let time = chrono::Local::now().format("%H:%M:%S");
-        self.logs.push(format!("[{time}] {}", message.into()));
+        self.logs.push(format!("[{time}] {message}"));
         if self.logs.len() > 1000 {
             let excess = self.logs.len() - 1000;
             self.logs.drain(0..excess);
@@ -138,16 +163,16 @@ impl MhxyApp {
                                 .find(|window| window.handle == handle)
                                 .map(|window| window.title.clone())
                                 .unwrap_or_default();
-                            self.log(format!("自动选择游戏窗口：{title}（可选 {count} 个）"));
+                            self.log_detail(format!("自动选择游戏窗口：{title}（可选 {count} 个）"));
                         }
-                        None => self.log(format!("未找到游戏窗口（可选 {count} 个）")),
+                        None => self.log_detail(format!("未找到游戏窗口（可选 {count} 个）")),
                     }
                 } else if log_always {
-                    self.log(format!("扫描到 {count} 个可用窗口"));
+                    self.log_detail(format!("扫描到 {count} 个可用窗口"));
                 }
             }
             Err(err) => {
-                self.log(format!("枚举窗口失败：{err}"));
+                self.log_detail(format!("枚举窗口失败：{err}"));
             }
         }
     }
@@ -164,14 +189,79 @@ impl MhxyApp {
         }
     }
 
+    /// 图色门控：抓一小块屏幕比对点位颜色，判断当前是否有任务。
+    fn check_gate(&mut self) {
+        if !self.config.color_gate_enabled || self.config.color_gate_points.is_empty() {
+            self.gate_active = true;
+            self.gate_result = None;
+            return;
+        }
+        if self.selected_handle.is_none() {
+            self.gate_active = false;
+            return;
+        }
+        let Some(handle) = self.selected_handle else {
+            self.gate_active = false;
+            return;
+        };
+        let Some((mut x, mut y, mut width, mut height)) =
+            gate::bounding_box(&self.config.color_gate_points)
+        else {
+            self.gate_active = true;
+            return;
+        };
+        if let Some(image) = &self.preview_full {
+            let client_w = image.width() as i32;
+            let client_h = image.height() as i32;
+            x = x.clamp(0, (client_w - 1).max(0));
+            y = y.clamp(0, (client_h - 1).max(0));
+            width = width.clamp(1, (client_w - x).max(1));
+            height = height.clamp(1, (client_h - y).max(1));
+        }
+        match capture::capture_client_rect(handle, x, y, width, height) {
+            Ok(image) => {
+                let mode = GateMode::from_str(&self.config.color_gate_mode);
+                let result = gate::evaluate(&image, (x, y), &self.config.color_gate_points, mode);
+                let previous = self.gate_active;
+                self.gate_active = result.active;
+                self.gate_result = Some(result);
+                if self.gate_active != previous {
+                    if self.gate_active {
+                        self.log("任务开始（图色命中）");
+                        // 立即识别一次，不用等下一个识别间隔。
+                        self.last_scan = None;
+                    } else {
+                        self.log("任务停止（图色未命中）");
+                    }
+                }
+            }
+            Err(err) => {
+                if self.gate_active {
+                    self.log_detail(format!("图色采样失败：{err}"));
+                }
+                self.gate_active = false;
+            }
+        }
+    }
+
     fn trigger_scan(&mut self) {
         if self.selected_handle.is_none() {
             self.refresh_windows(false);
         }
         let Some(handle) = self.selected_handle else {
-            self.log("未找到游戏窗口，等待下次扫描");
+            self.log_detail("未找到游戏窗口，等待下次扫描");
             return;
         };
+        if self.config.color_gate_enabled && !self.gate_active {
+            let title = self
+                .windows
+                .iter()
+                .find(|window| window.handle == handle)
+                .map(|window| window.title.clone())
+                .unwrap_or_default();
+            self.log_detail(format!("{title}：图色未命中，暂停 OCR"));
+            return;
+        }
         let window_title = self
             .windows
             .iter()
@@ -188,7 +278,7 @@ impl MhxyApp {
         {
             Ok(result) => result,
             Err(err) => {
-                self.log(format!("截图失败（{window_title}）：{err}"));
+                self.log_detail(format!("截图失败（{window_title}）：{err}"));
                 self.mark_all_stale("本轮识别失败");
                 if err.contains("关闭") || err.contains("最小化") {
                     self.selected_handle = None;
@@ -200,7 +290,7 @@ impl MhxyApp {
 
         let signature = hash_image(&panel);
         if self.last_signature == Some(signature) {
-            self.log(format!("{window_title}：识别区域未变化，跳过"));
+            self.log_detail(format!("{window_title}：识别区域未变化，跳过"));
             return;
         }
         self.generation = self.generation.wrapping_add(1);
@@ -212,7 +302,7 @@ impl MhxyApp {
             let png = match ocr::encode_png(&panel) {
                 Ok(png) => png,
                 Err(err) => {
-                    self.log(format!("编码截图失败：{err}"));
+                    self.log_detail(format!("编码截图失败：{err}"));
                     self.busy = false;
                     return;
                 }
@@ -221,13 +311,13 @@ impl MhxyApp {
             let token = self.config.api_token.clone();
             let format = self.config.api_format.clone();
             let sender = self.sender.clone();
-            self.log(format!("{window_title}：请求远端 PP-OCR {url}"));
+            self.log_detail(format!("{window_title}：请求远端 PP-OCR {url}"));
             thread::spawn(move || {
                 let result = ocr::remote_recognize(&url, &token, &format, &png);
                 let _ = sender.send(OcrEvent::Remote { generation, result });
             });
         } else {
-            self.log(format!("{window_title}：本地 PP-OCR 识别中"));
+            self.log_detail(format!("{window_title}：本地 PP-OCR 识别中"));
             self.worker.submit(generation, panel);
         }
     }
@@ -237,6 +327,17 @@ impl MhxyApp {
             let (generation, result) = match event {
                 OcrEvent::Local { generation, result } => (generation, result),
                 OcrEvent::Remote { generation, result } => (generation, result),
+                OcrEvent::Test { result } => {
+                    self.testing_remote = false;
+                    match result {
+                        Ok(text) => self.log_detail(format!(
+                            "远端 PP-OCR 连接正常（返回 {} 字）",
+                            text.text.chars().count()
+                        )),
+                        Err(err) => self.log_detail(format!("远端 PP-OCR 连接失败：{err}")),
+                    }
+                    continue;
+                }
             };
             if generation != self.generation {
                 continue;
@@ -244,7 +345,7 @@ impl MhxyApp {
             self.busy = false;
             match result {
                 Err(err) => {
-                    self.log(format!("识别失败：{err}"));
+                    self.log_detail(format!("识别失败：{err}"));
                     self.mark_all_stale("本轮识别失败");
                 }
                 Ok(text) => {
@@ -253,6 +354,35 @@ impl MhxyApp {
                 }
             }
         }
+    }
+
+    /// 测试远端 PP-OCR 连接：发一张 16×16 白图，把结果写日志。
+    fn test_remote_ocr(&mut self) {
+        self.config.api_url = self.api_url_edit.trim().to_string();
+        self.config.api_token = self.api_token_edit.trim().to_string();
+        self.persist();
+        if self.config.api_url.is_empty() {
+            self.log_detail("远端 PP-OCR 测试失败：未填写 API 地址");
+            return;
+        }
+        let image = image::RgbImage::from_pixel(16, 16, image::Rgb([255, 255, 255]));
+        let png = match ocr::encode_png(&image) {
+            Ok(png) => png,
+            Err(err) => {
+                self.log_detail(format!("远端 PP-OCR 测试失败：{err}"));
+                return;
+            }
+        };
+        let url = self.config.api_url.clone();
+        let token = self.config.api_token.clone();
+        let format = self.config.api_format.clone();
+        let sender = self.sender.clone();
+        self.testing_remote = true;
+        self.log_detail(format!("正在测试远端 PP-OCR：{url}"));
+        thread::spawn(move || {
+            let result = ocr::remote_recognize(&url, &token, &format, &png);
+            let _ = sender.send(OcrEvent::Test { result });
+        });
     }
 
     fn apply_ocr(&mut self, ocr_text: &OcrText) {
@@ -311,7 +441,7 @@ impl MhxyApp {
                 (Some(message), _) => format!("{task_type} {message}"),
                 (None, None) => format!("{task_type} 无结果"),
             };
-            self.log(format!("{summary}（{:.2}s）", ocr_text.elapsed_secs));
+            self.log_detail(format!("{summary}（{:.2}s）", ocr_text.elapsed_secs));
             if let Some(state) = self.tasks.get_mut(task_type) {
                 if task_status.is_none() {
                     state.location = location;
@@ -330,8 +460,20 @@ impl MhxyApp {
         if let Some(handle) = self.map_textures.get(&key) {
             return Some(handle.clone());
         }
-        let image = image::open(&definition.image).ok()?;
-        let rgba = image.to_rgba8();
+        let image = match crate::core::load_rgb_image(&definition.image) {
+            Ok(image) => image,
+            Err(err) => {
+                if self.map_texture_failed.insert(definition.name.clone()) {
+                    self.log_detail(format!(
+                        "地图 {} 图片加载失败：{}（{err}）",
+                        definition.name,
+                        definition.image.display()
+                    ));
+                }
+                return None;
+            }
+        };
+        let rgba = image::DynamicImage::ImageRgb8(image).to_rgba8();
         let size = [rgba.width() as usize, rgba.height() as usize];
         let color = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
         let handle = ctx.load_texture(key.clone(), color, egui::TextureOptions::LINEAR);
@@ -490,12 +632,11 @@ impl MhxyApp {
     }
 
     fn controls(&mut self, ui: &mut egui::Ui) {
-        // 日志框固定在侧栏底部，设置区在上面滚动。
-        egui::Panel::bottom("log_panel")
-            .resizable(true)
-            .default_size(190.0)
-            .show(ui, |ui| self.log_ui(ui));
-        egui::ScrollArea::vertical().show(ui, |ui| {
+        // 整栏一个竖向瀑布流：设置与日志顺序往下排，整体滚动，不会互相遮挡。
+        egui::ScrollArea::vertical()
+            .id_salt("sidebar")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
             ui.heading("抓鬼 / 鬼王");
             ui.label(egui::RichText::new("任务坐标辅助").weak());
             ui.add_space(8.0);
@@ -521,7 +662,7 @@ impl MhxyApp {
                             if ui.selectable_label(selected, &window.title).clicked() {
                                 self.selected_handle = Some(window.handle);
                                 self.last_signature = None;
-                                self.log(format!("手动选择窗口：{}", window.title));
+                                self.log_detail(format!("手动选择窗口：{}", window.title));
                             }
                         }
                     });
@@ -548,12 +689,20 @@ impl MhxyApp {
                         } else {
                             self.running = true;
                             self.last_scan = None;
+                            self.last_gate_check = Instant::now();
                             self.last_signature = None;
                             self.log("开始自动识别");
                         }
                     }
                 }
-                ui.checkbox(&mut self.show_region_window, "显示识别区域");
+                let label = if self.show_region_window {
+                    "关闭识别区域"
+                } else {
+                    "显示识别区域"
+                };
+                if ui.button(label).clicked() {
+                    self.show_region_window = !self.show_region_window;
+                }
             });
             ui.add_space(6.0);
 
@@ -595,7 +744,7 @@ impl MhxyApp {
                 } else {
                     "本地 PP-OCR"
                 };
-                self.log(format!("切换识图模式：{label}"));
+                self.log_detail(format!("切换识图模式：{label}"));
             }
             if self.config.ocr_mode == "remote" {
                 ui.add_space(4.0);
@@ -636,7 +785,17 @@ impl MhxyApp {
                     self.config.api_format = format;
                     self.persist();
                 }
-                ui.label(egui::RichText::new("multipart → /ocr，raw → /ocr/raw").weak());
+                ui.horizontal(|ui| {
+                    let button = egui::Button::new(if self.testing_remote {
+                        "测试中…"
+                    } else {
+                        "测试连接"
+                    });
+                    if ui.add_enabled(!self.testing_remote, button).clicked() {
+                        self.test_remote_ocr();
+                    }
+                    ui.label(egui::RichText::new("multipart → /ocr，raw → /ocr/raw").weak());
+                });
             } else {
                 ui.label(
                     egui::RichText::new("本地模型首次使用时会自动下载（约 25MB）").weak(),
@@ -668,24 +827,24 @@ impl MhxyApp {
                 self.persist();
             }
             ui.separator();
-
-            ui.label(egui::RichText::new("识别区域").strong());
-            if ui.button("打开识别区域设置…").clicked() {
-                self.show_region_window = true;
-            }
-            ui.label(egui::RichText::new("截图预览与区域设置在新窗口里").weak());
+            self.log_ui(ui);
             ui.add_space(6.0);
         });
     }
 
     fn log_ui(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(4.0);
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("日志").strong());
-            if ui
-                .checkbox(&mut self.config.log_enabled, "开启日志")
-                .changed()
-            {
+            let mut level = self.config.log_level.clone();
+            let mut changed = false;
+            changed |= ui
+                .radio_value(&mut level, "simple".to_string(), "简单")
+                .changed();
+            changed |= ui
+                .radio_value(&mut level, "detailed".to_string(), "详细")
+                .changed();
+            if changed {
+                self.config.log_level = level;
                 self.persist();
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -694,52 +853,50 @@ impl MhxyApp {
                 }
             });
         });
-        if !self.config.log_enabled {
-            ui.label(egui::RichText::new("日志已关闭").weak());
-            return;
-        }
-        egui::ScrollArea::vertical()
-            .id_salt("log_scroll")
-            .stick_to_bottom(true)
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                if self.logs.is_empty() {
-                    ui.label(egui::RichText::new("暂无日志").weak());
-                    return;
-                }
-                for line in &self.logs {
-                    ui.label(egui::RichText::new(line).monospace().size(11.0));
-                }
-            });
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .id_salt("log_scroll")
+                .stick_to_bottom(true)
+                .max_height(LOG_PANEL_HEIGHT)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    if self.logs.is_empty() {
+                        ui.label(egui::RichText::new("暂无日志").weak());
+                        return;
+                    }
+                    for line in &self.logs {
+                        ui.label(egui::RichText::new(line).monospace().size(11.0));
+                    }
+                });
+        });
     }
 
-    fn preview(&mut self, ui: &mut egui::Ui) {
+    /// 画客户区预览：红框主区域、蓝框备用区域、图色点位；点击时返回 (x, y, 颜色)。
+    fn preview(&self, ui: &mut egui::Ui) -> Option<(i32, i32, [u8; 3])> {
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("识别区域预览").strong());
-            ui.label(egui::RichText::new("红框=主区域，蓝框=备用区域").weak());
+            ui.label(egui::RichText::new("红框=主区域，蓝框=备用区域；点击图片可取点").weak());
         });
-        let source = self.preview_full.as_ref();
-        let Some(image) = source else {
-            ui.colored_label(Color32::from_gray(150), "开始识别后这里会显示截图");
-            return;
-        };
+        let image = self.preview_full.as_ref()?;
         let size = Vec2::new(image.width() as f32, image.height() as f32);
         let available = ui.available_size();
-        let scale = (available.x / size.x).min(available.y / size.y);
-        let (rect, _) = ui.allocate_exact_size(size * scale.max(0.05), Sense::hover());
+        let scale = (available.x / size.x).min(available.y / size.y).max(0.05);
+        let (rect, response) = ui.allocate_exact_size(size * scale, Sense::click());
         let painter = ui.painter_at(rect);
         let target = fit_rect(rect, size);
-        let texture = ui.ctx().load_texture(
-            "preview",
-            image.clone(),
-            egui::TextureOptions::LINEAR,
-        );
+        let texture = ui
+            .ctx()
+            .load_texture("preview", image.clone(), egui::TextureOptions::LINEAR);
         painter.image(
             texture.id(),
             target,
             Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
             Color32::WHITE,
         );
+        let draw_scale = target.width() / size.x;
+        let to_screen = |x: f32, y: f32| {
+            pos2(target.min.x + x * draw_scale, target.min.y + y * draw_scale)
+        };
         for (region, color) in [
             (self.config.task_region, Color32::from_rgb(255, 50, 50)),
             (self.config.extra_task_region, Color32::from_rgb(60, 150, 255)),
@@ -747,20 +904,53 @@ impl MhxyApp {
             if region == self.config.extra_task_region && !self.config.extra_region_enabled {
                 continue;
             }
-            let (left, top, right, bottom) =
-                crate::core::task_region(size.x, size.y, region);
-            let scale_x = target.width() / size.x;
-            let draw = Rect::from_min_max(
-                pos2(target.min.x + left * scale_x, target.min.y + top * scale_x),
-                pos2(target.min.x + right * scale_x, target.min.y + bottom * scale_x),
-            );
+            let (left, top, right, bottom) = crate::core::task_region(size.x, size.y, region);
             painter.rect_stroke(
-                draw,
+                Rect::from_min_max(to_screen(left, top), to_screen(right, bottom)),
                 CornerRadius::ZERO,
                 egui::Stroke::new(2.0, color),
                 egui::StrokeKind::Inside,
             );
         }
+
+        // 鼠标悬停：显示客户区坐标与该像素颜色；点击则可取点。
+        let mut picked = None;
+        if let Some(pos) = response.hover_pos().filter(|pos| target.contains(*pos)) {
+            let px = ((pos.x - target.min.x) / draw_scale).floor() as i32;
+            let py = ((pos.y - target.min.y) / draw_scale).floor() as i32;
+            if let Some(color) = sample_image(image, px, py) {
+                painter.circle_stroke(
+                    to_screen(px as f32, py as f32),
+                    5.0,
+                    egui::Stroke::new(1.5, Color32::WHITE),
+                );
+                painter.text(
+                    target.left_top() + vec2(8.0, 8.0),
+                    Align2::LEFT_TOP,
+                    format!("({px}, {py})  {}", gate::to_hex(color)),
+                    FontId::proportional(13.0),
+                    Color32::WHITE,
+                );
+                if self.pick_points && response.clicked() {
+                    picked = Some((px, py, color));
+                }
+            }
+        }
+
+        // 已配置的点位，标在地图上。
+        for point in &self.config.color_gate_points {
+            let center = to_screen(point.x as f32, point.y as f32);
+            let box_rect = Rect::from_center_size(center, vec2(9.0, 9.0));
+            let color = Color32::from_rgb(point.color[0], point.color[1], point.color[2]);
+            painter.rect_filled(box_rect, CornerRadius::ZERO, color);
+            painter.rect_stroke(
+                box_rect,
+                CornerRadius::ZERO,
+                egui::Stroke::new(1.5, Color32::WHITE),
+                egui::StrokeKind::Outside,
+            );
+        }
+        picked
     }
 
     fn region_window_ui(&mut self, ui: &mut egui::Ui) {
@@ -775,6 +965,8 @@ impl MhxyApp {
                     self.capture_preview_once();
                 }
                 ui.label(egui::RichText::new("只截屏更新预览，不做 OCR").weak());
+                ui.separator();
+                ui.checkbox(&mut self.pick_points, "点击预览取点");
             });
             ui.separator();
             let mut changed = region_row(ui, "主区域", &mut self.config.task_region);
@@ -791,12 +983,145 @@ impl MhxyApp {
             if changed {
                 self.last_signature = None;
                 self.persist();
-                self.log("已更新识别区域设置");
+                self.log_detail("已更新识别区域设置");
             }
             ui.label(egui::RichText::new("单位 %，相对游戏客户区；改动下一轮识别生效").weak());
             ui.separator();
-            self.preview(ui);
+            self.color_gate_ui(ui);
+            ui.separator();
+            if let Some((x, y, color)) = self.preview(ui) {
+                let label = format!("点{}", self.config.color_gate_points.len() + 1);
+                let mut point =
+                    ColorPoint::new(x, y, color, self.config.color_gate_tolerance, 1);
+                point.label = label;
+                self.config.color_gate_points.push(point);
+                self.persist();
+                self.log_detail(format!("新增图色点位 ({x}, {y}) {}", gate::to_hex(color)));
+            }
         });
+    }
+
+    fn color_gate_ui(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("图色门控").strong());
+            if ui
+                .checkbox(&mut self.config.color_gate_enabled, "启用")
+                .changed()
+            {
+                self.last_gate_check = Instant::now();
+                self.persist();
+            }
+            ui.label("间隔");
+            let mut interval = self.config.color_gate_interval_ms;
+            if ui
+                .add(egui::DragValue::new(&mut interval).range(50..=2000).suffix(" ms"))
+                .changed()
+            {
+                self.config.color_gate_interval_ms = interval;
+                self.persist();
+            }
+            ui.label("默认容差");
+            let mut tolerance = self.config.color_gate_tolerance;
+            if ui
+                .add(egui::DragValue::new(&mut tolerance).range(0..=255))
+                .changed()
+            {
+                self.config.color_gate_tolerance = tolerance;
+                self.persist();
+            }
+            let mut mode = self.config.color_gate_mode.clone();
+            let mut mode_changed = false;
+            mode_changed |= ui
+                .radio_value(&mut mode, "all".to_string(), "全部命中")
+                .changed();
+            mode_changed |= ui
+                .radio_value(&mut mode, "any".to_string(), "任一命中")
+                .changed();
+            if mode_changed {
+                self.config.color_gate_mode = mode;
+                self.persist();
+            }
+        });
+        let status = if !self.config.color_gate_enabled {
+            "未启用".to_string()
+        } else if self.config.color_gate_points.is_empty() {
+            "未配置点位（默认允许 OCR）".to_string()
+        } else if self.gate_active {
+            "有任务：允许 OCR".to_string()
+        } else {
+            "未命中：暂停 OCR".to_string()
+        };
+        ui.label(egui::RichText::new(format!("状态：{status}")).weak());
+
+        let mut points = self.config.color_gate_points.clone();
+        let gate_result = self.gate_result.clone();
+        let mut changed = false;
+        let mut remove = None;
+        for (index, point) in points.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                let (swatch, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
+                ui.painter().rect_filled(
+                    swatch,
+                    CornerRadius::same(2),
+                    Color32::from_rgb(point.color[0], point.color[1], point.color[2]),
+                );
+                ui.label(format!("({}, {}) {}", point.x, point.y, point.hex()));
+                ui.label("容差");
+                let mut tolerance = point.tolerance;
+                if ui
+                    .add(egui::DragValue::new(&mut tolerance).range(0..=255))
+                    .changed()
+                {
+                    point.tolerance = tolerance;
+                    changed = true;
+                }
+                ui.label("半径");
+                let mut radius = point.radius;
+                if ui
+                    .add(egui::DragValue::new(&mut radius).range(0..=20))
+                    .changed()
+                {
+                    point.radius = radius;
+                    changed = true;
+                }
+                if let Some(result) = &gate_result {
+                    if let (Some(hit), Some(sampled)) =
+                        (result.matched.get(index), result.sampled.get(index))
+                    {
+                        let text = match sampled {
+                            Some(color) => format!(
+                                "实测 {} {}",
+                                gate::to_hex(*color),
+                                if *hit { "命中" } else { "未命中" }
+                            ),
+                            None => "越界".to_string(),
+                        };
+                        let color = if *hit {
+                            Color32::from_rgb(120, 220, 120)
+                        } else {
+                            Color32::from_rgb(240, 160, 160)
+                        };
+                        ui.colored_label(color, text);
+                    }
+                }
+                if ui.small_button("删除").clicked() {
+                    remove = Some(index);
+                }
+            });
+        }
+        if let Some(index) = remove {
+            points.remove(index);
+            changed = true;
+        }
+        if ui.button("清空点位").clicked() {
+            points.clear();
+            changed = true;
+        }
+        if changed {
+            self.config.color_gate_points = points;
+            self.last_gate_check = Instant::now();
+            self.persist();
+        }
     }
 
     /// 手动截取一次游戏客户区，只更新预览，不做 OCR。
@@ -805,7 +1130,7 @@ impl MhxyApp {
             self.refresh_windows(false);
         }
         let Some(handle) = self.selected_handle else {
-            self.log("手动截图失败：未找到游戏窗口");
+            self.log_detail("手动截图失败：未找到游戏窗口");
             return;
         };
         let extra = if self.config.extra_region_enabled {
@@ -822,10 +1147,12 @@ impl MhxyApp {
         match capture::capture_task_panel(handle, self.config.task_region, extra) {
             Ok((_panel, full)) => {
                 self.preview_full = Some(to_color_image(&full));
-                self.log(format!("手动截取截图：{title}"));
+                self.log_detail(format!("手动截取截图：{title}"));
+                // 立即刷新一次图色门控状态，方便在取点工具里看命中情况。
+                self.check_gate();
             }
             Err(err) => {
-                self.log(format!("手动截图失败：{err}"));
+                self.log_detail(format!("手动截图失败：{err}"));
                 if err.contains("关闭") || err.contains("最小化") {
                     self.selected_handle = None;
                 }
@@ -895,6 +1222,15 @@ impl eframe::App for MhxyApp {
             self.refresh_windows(false);
             self.last_window_refresh = Instant::now();
         }
+        if self.running && self.config.color_gate_enabled {
+            let gate_interval =
+                Duration::from_millis(self.config.color_gate_interval_ms.max(50) as u64);
+            if self.last_gate_check.elapsed() >= gate_interval {
+                self.check_gate();
+                self.last_gate_check = Instant::now();
+            }
+            ctx.request_repaint_after(gate_interval);
+        }
         if self.running && !self.busy {
             let interval = Duration::from_secs(self.config.interval_seconds.max(1) as u64);
             let due = self.last_scan.map_or(true, |last| last.elapsed() >= interval);
@@ -927,6 +1263,8 @@ impl eframe::App for MhxyApp {
             egui::Panel::left("controls")
                 .resizable(true)
                 .default_size(320.0)
+                .min_size(260.0)
+                .max_size(460.0)
                 .show(ui, |ui| self.controls(ui));
         }
         egui::CentralPanel::default().show(ui, |ui| {
@@ -1019,6 +1357,14 @@ fn to_color_image(image: &image::RgbImage) -> egui::ColorImage {
         rgba.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 255]);
     }
     egui::ColorImage::from_rgba_unmultiplied(size, &rgba)
+}
+
+fn sample_image(image: &egui::ColorImage, x: i32, y: i32) -> Option<[u8; 3]> {
+    if x < 0 || y < 0 || x as usize >= image.width() || y as usize >= image.height() {
+        return None;
+    }
+    let pixel = image.pixels[y as usize * image.width() + x as usize];
+    Some([pixel.r(), pixel.g(), pixel.b()])
 }
 
 fn hash_image(image: &image::RgbImage) -> u64 {

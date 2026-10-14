@@ -32,6 +32,10 @@ pub enum OcrEvent {
         generation: u64,
         result: Result<OcrText, String>,
     },
+    /// 远端连接测试的结果（只用于日志提示）。
+    Test {
+        result: Result<OcrText, String>,
+    },
 }
 
 struct LocalJob {

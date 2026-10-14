@@ -3,6 +3,7 @@ mod app;
 mod capture;
 mod config;
 mod core;
+mod gate;
 mod ocr;
 
 use std::sync::Arc;

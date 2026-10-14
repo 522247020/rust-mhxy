@@ -3,6 +3,7 @@
 use crate::core::{
     parse_region_setting, TaskRegion, DEFAULT_EXTRA_REGION, DEFAULT_TASK_REGION,
 };
+use crate::gate::{parse_hex, to_hex, ColorPoint};
 use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
 
@@ -23,7 +24,12 @@ pub struct Config {
     pub high_chance: bool,
     pub horizontal_layout: bool,
     pub sidebar_expanded: bool,
-    pub log_enabled: bool,
+    pub log_level: String,
+    pub color_gate_enabled: bool,
+    pub color_gate_interval_ms: u32,
+    pub color_gate_mode: String,
+    pub color_gate_tolerance: u8,
+    pub color_gate_points: Vec<ColorPoint>,
     pub on_top: bool,
 }
 
@@ -42,7 +48,12 @@ impl Default for Config {
             high_chance: false,
             horizontal_layout: false,
             sidebar_expanded: true,
-            log_enabled: false,
+            log_level: "simple".into(),
+            color_gate_enabled: false,
+            color_gate_interval_ms: 300,
+            color_gate_mode: "all".into(),
+            color_gate_tolerance: 12,
+            color_gate_points: Vec::new(),
             on_top: true,
         }
     }
@@ -85,7 +96,23 @@ impl Config {
         config.high_chance = get_bool(map, "task/high_chance", false);
         config.horizontal_layout = get_bool(map, "task/horizontal_layout", false);
         config.sidebar_expanded = get_bool(map, "window/sidebar_expanded", true);
-        config.log_enabled = get_bool(map, "log/enabled", false);
+        config.log_level = match get_string(map, "log/level", &config.log_level).as_str() {
+            "detailed" => "detailed".into(),
+            _ => "simple".into(),
+        };
+        config.color_gate_enabled = get_bool(map, "color_gate/enabled", false);
+        config.color_gate_interval_ms =
+            get_u32(map, "color_gate/interval_ms", 300).clamp(50, 5000);
+        config.color_gate_mode = match get_string(map, "color_gate/mode", "all").as_str() {
+            "any" => "any".into(),
+            _ => "all".into(),
+        };
+        config.color_gate_tolerance = map
+            .get("color_gate/tolerance")
+            .and_then(Value::as_u64)
+            .map(|value| value.min(255) as u8)
+            .unwrap_or(12);
+        config.color_gate_points = get_points(map, "color_gate/points");
         config.on_top = get_bool(map, "window/coordinate/on_top", true);
         config
     }
@@ -128,7 +155,24 @@ impl Config {
             "window/sidebar_expanded",
             Value::Bool(self.sidebar_expanded),
         );
-        insert("log/enabled", Value::Bool(self.log_enabled));
+        insert("log/level", Value::String(self.log_level.clone()));
+        insert("color_gate/enabled", Value::Bool(self.color_gate_enabled));
+        insert(
+            "color_gate/interval_ms",
+            Value::from(self.color_gate_interval_ms),
+        );
+        insert(
+            "color_gate/mode",
+            Value::String(self.color_gate_mode.clone()),
+        );
+        insert(
+            "color_gate/tolerance",
+            Value::from(self.color_gate_tolerance),
+        );
+        insert(
+            "color_gate/points",
+            points_to_value(&self.color_gate_points),
+        );
         insert("window/coordinate/on_top", Value::Bool(self.on_top));
 
         if let Some(parent) = path.parent() {
@@ -178,6 +222,65 @@ fn get_bool(map: &Map<String, Value>, key: &str, default: bool) -> bool {
         Some(Value::Number(value)) => value.as_i64().map(|v| v != 0).unwrap_or(default),
         _ => default,
     }
+}
+
+fn get_points(map: &Map<String, Value>, key: &str) -> Vec<ColorPoint> {
+    map.get(key)
+        .and_then(Value::as_array)
+        .map(|items| items.iter().filter_map(point_from_value).collect())
+        .unwrap_or_default()
+}
+
+fn point_from_value(value: &Value) -> Option<ColorPoint> {
+    let object = value.as_object()?;
+    let x = object.get("x")?.as_i64()? as i32;
+    let y = object.get("y")?.as_i64()? as i32;
+    let color = object
+        .get("color")
+        .and_then(Value::as_str)
+        .and_then(parse_hex)
+        .unwrap_or([255, 255, 255]);
+    let tolerance = object
+        .get("tolerance")
+        .and_then(Value::as_u64)
+        .map(|value| value.min(255) as u8)
+        .unwrap_or(12);
+    let radius = object
+        .get("radius")
+        .and_then(Value::as_u64)
+        .map(|value| value.min(20) as u8)
+        .unwrap_or(0);
+    let label = object
+        .get("label")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    Some(ColorPoint {
+        x,
+        y,
+        color,
+        tolerance,
+        radius,
+        label,
+    })
+}
+
+fn points_to_value(points: &[ColorPoint]) -> Value {
+    Value::Array(
+        points
+            .iter()
+            .map(|point| {
+                let mut object = Map::new();
+                object.insert("x".into(), Value::from(point.x));
+                object.insert("y".into(), Value::from(point.y));
+                object.insert("color".into(), Value::String(to_hex(point.color)));
+                object.insert("tolerance".into(), Value::from(point.tolerance));
+                object.insert("radius".into(), Value::from(point.radius));
+                object.insert("label".into(), Value::String(point.label.clone()));
+                Value::Object(object)
+            })
+            .collect(),
+    )
 }
 
 /// 去掉 JSON 里的 // 与 /* */ 注释，字符串里的斜杠保持原样。
@@ -305,9 +408,17 @@ mod tests {
         let mut config = Config::default();
         config.api_url = "http://192.168.3.207:8008".into();
         config.ghost_king_enabled = false;
+        config.log_level = "detailed".into();
+        config.color_gate_enabled = true;
+        config.color_gate_points = vec![ColorPoint::new(100, 200, [0xd4, 0xa0, 0x17], 15, 1)];
         config.save(&path).unwrap();
         let loaded = Config::load(&path);
         assert_eq!(loaded.api_url, "http://192.168.3.207:8008");
         assert!(!loaded.ghost_king_enabled);
+        assert_eq!(loaded.log_level, "detailed");
+        assert!(loaded.color_gate_enabled);
+        assert_eq!(loaded.color_gate_points.len(), 1);
+        assert_eq!(loaded.color_gate_points[0].color, [0xd4, 0xa0, 0x17]);
+        assert_eq!(loaded.color_gate_points[0].tolerance, 15);
     }
 }

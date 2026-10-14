@@ -94,7 +94,7 @@ pub fn load_maps(path: &Path) -> Result<Vec<MapDefinition>, String> {
         maps.push(MapDefinition {
             name,
             aliases,
-            image: base.join(raw.image),
+            image: resolve_image(base, &raw.image),
             left_x: raw.left_x,
             right_x: raw.right_x,
             top_y: raw.top_y,
@@ -103,6 +103,40 @@ pub fn load_maps(path: &Path) -> Result<Vec<MapDefinition>, String> {
         });
     }
     Ok(maps)
+}
+
+/// 读取图片并按内容嗅探格式（不依赖扩展名）。
+/// 注意：仓库里的地图文件其实是 JPEG 但扩展名是 `.png`，按扩展名解码会失败。
+pub fn load_rgb_image(path: &Path) -> Result<image::RgbImage, String> {
+    let reader = image::ImageReader::open(path).map_err(|err| err.to_string())?;
+    let reader = reader.with_guessed_format().map_err(|err| err.to_string())?;
+    let image = reader.decode().map_err(|err| err.to_string())?;
+    Ok(image.to_rgb8())
+}
+
+/// 解析地图图片路径：先按 maps.json 里的相对路径找，找不到再在常见目录里找同名文件。
+/// 这样 assets/ 或 exe 旁边的目录结构略有差异时也能找到图片。
+fn resolve_image(base: &Path, image: &str) -> PathBuf {
+    let raw = Path::new(image);
+    let file = raw.file_name().map(PathBuf::from);
+    let mut candidates = vec![base.join(raw)];
+    if let Some(file) = &file {
+        candidates.push(base.join("maps").join(file));
+        candidates.push(base.join("assets").join("maps").join(file));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join(raw));
+            if let Some(file) = &file {
+                candidates.push(dir.join("maps").join(file));
+                candidates.push(dir.join("assets").join("maps").join(file));
+            }
+        }
+    }
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.exists())
+        .unwrap_or_else(|| base.join(raw))
 }
 
 fn compact(text: &str) -> String {
@@ -584,5 +618,17 @@ mod tests {
             parse_region_setting("0.7,0.2,0.99,0.7", DEFAULT_TASK_REGION),
             (0.7, 0.2, 0.99, 0.7)
         );
+    }
+
+    #[test]
+    fn all_map_images_load() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/maps.json");
+        let maps = load_maps(&path).expect("加载 maps.json");
+        assert!(!maps.is_empty());
+        for map in &maps {
+            assert!(map.image.exists(), "缺少地图图片：{}", map.image.display());
+            load_rgb_image(&map.image)
+                .unwrap_or_else(|err| panic!("打开地图图片失败 {}：{err}", map.image.display()));
+        }
     }
 }
