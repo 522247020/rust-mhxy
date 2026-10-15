@@ -1,6 +1,10 @@
 # rust-mhxy
 
-梦幻西游任务坐标辅助的 **Rust + egui** 重写版。
+[![Windows build](https://github.com/522247020/rust-mhxy/actions/workflows/windows.yml/badge.svg)](https://github.com/522247020/rust-mhxy/actions/workflows/windows.yml)
+
+梦幻西游任务坐标辅助的 **Rust + egui** 重写版，当前版本 **v0.1.0**。
+
+Windows 下载：[GitHub Releases](https://github.com/522247020/rust-mhxy/releases)。
 
 只保留最基础的两件事：
 
@@ -47,13 +51,13 @@ rustup target add x86_64-pc-windows-msvc
 cargo xwin build --release --target x86_64-pc-windows-msvc
 ```
 
-可直接使用项目脚本构建并组装完整分发包（还需 `7z`、`curl`、`zip`、`python3`）：
+可直接使用项目脚本构建并组装完整分发包（还需 Python 3.11+，缺少模型和运行库时会下载并校验 SHA256）：
 
 ```bash
 bash scripts/package-windows.sh
 ```
 
-压缩包在 `dist/rust-mhxy-windows.zip`，解压整个目录后双击 `rust-mhxy.exe` 即可运行。Windows 程序使用 GUI 子系统，启动时不会弹出命令窗口；打包脚本会检查 EXE 的子系统标记。
+压缩包在 `dist/rust-mhxy-v0.1.0-windows-x86_64.zip`，同时生成 `.zip.sha256` 校验文件。包内包含 20 张地图、本地 PP-OCRv5 模型、DirectML 和 VC++ 运行库；解压整个目录后双击 `rust-mhxy.exe` 即可运行。Windows 程序使用 GUI 子系统，启动时不会弹出命令窗口；打包脚本会检查 EXE 的架构和子系统标记。
 
 单独编译的程序在 `target/x86_64-pc-windows-msvc/release/rust-mhxy.exe`。分发时需要一起带上：
 
@@ -62,6 +66,31 @@ bash scripts/package-windows.sh
 - 运行库：`DirectML.dll`、`msvcp140*.dll`、`vcruntime140*.dll` 等（可 app-local 放在 exe 旁边）
 
 本地 OCR 模型想离线可用，把 `pp-ocrv5_mobile_det.onnx` / `pp-ocrv5_mobile_rec.onnx` / `ppocrv5_dict.txt` 放到 `assets/models/` 即可。
+
+## 自动构建与版本发布
+
+[Windows build 工作流](https://github.com/522247020/rust-mhxy/actions/workflows/windows.yml) 在 Windows Server 2022 上原生构建 x64 程序：
+
+- 推送 `main`、提交到 `main` 的 Pull Request，或在 Actions 页面点击 **Run workflow**：检查格式、构建、运行 Clippy 和测试，成功后上传包含 ZIP 与 SHA256 的构建产物，保留 30 天。
+- 推送 `v*` 标签：校验标签与 `Cargo.toml` 的版本一致，构建通过后自动创建 GitHub Release 并附上 Windows ZIP 和 SHA256；重新运行会更新同版本附件。
+- 版本统一取自 `Cargo.toml`，界面状态栏、窗口标题、ZIP 文件名和包内 `VERSION.txt` 均显示相同版本。
+
+发布 `v0.1.0`：
+
+```bash
+git tag -a v0.1.0 -m "Release v0.1.0"
+git push origin main
+git push origin v0.1.0
+```
+
+后续版本先修改 `Cargo.toml` 中的 `package.version` 并更新 `Cargo.lock`，提交后推送对应版本标签。工作流通过 GitHub 自带的 `GITHUB_TOKEN` 发布，无需配置额外凭据。
+
+在 Windows 本地打包可使用 Python 3.11+：
+
+```powershell
+cargo build --locked --release --target x86_64-pc-windows-msvc
+python scripts/package-windows.py
+```
 
 ## 目录结构
 
@@ -123,7 +152,7 @@ config.example.json
 - **图色门控**默认每 300ms 轮询点位：命中允许 OCR，从未命中转为命中时立即重新识别；战斗或任务完成导致未命中时暂停 OCR。区域设置窗口打开时也会更新命中状态。
 - 任务默认上下等分，可切换左右等分；关闭鬼王后抓鬼占满地图区。任务卡片标题与状态同一行左右排列：左侧显示任务、地图和坐标，右侧显示「等待识别」「本轮未识别到任务」或更新时间。标题行高度固定，状态变化不会改变地图尺寸；未识别到任务时保留上次地图和坐标。
 - 切换游戏窗口会清除旧坐标；暂停、切换窗口或更改识别设置后，迟到的 OCR 结果会被丢弃。
-- 底部状态栏显示识别方式、间隔、最近一次耗时和设置保存状态。
+- 底部状态栏显示版本号、识别方式、间隔、最近一次耗时和设置保存状态。
 
 开发验证使用 `cargo test`、`cargo clippy --all-targets -- -D warnings` 和 `cargo run`；需要本地模型或真实任务截图的两项 OCR 集成测试默认忽略。
 

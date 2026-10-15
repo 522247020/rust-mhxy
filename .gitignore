@@ -2,3 +2,6 @@
 /config.json
 *.tmp
 /dist
+/.ort-cache
+/.ocr-models
+__pycache__/

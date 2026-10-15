@@ -1,0 +1,131 @@
+name: Windows build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  build:
+    name: Build Windows x64
+    runs-on: windows-2022
+    timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: '0'
+      ORT_CACHE_DIR: ${{ github.workspace }}/.ort-cache
+      OAR_HOME: ${{ github.workspace }}/.ocr-models
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Read and validate version
+        id: version
+        run: |
+          $version = python scripts/package-windows.py --print-version
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot read Cargo version' }
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -cne $version) {
+            throw "Tag $env:GITHUB_REF_NAME does not match Cargo version $version"
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "artifact=rust-mhxy-$version-windows-x86_64" >> $env:GITHUB_OUTPUT
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+          components: rustfmt, clippy
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-x86_64
+          cache-on-failure: true
+
+      - name: Cache ONNX Runtime and OCR models
+        uses: actions/cache@v4
+        with:
+          path: |
+            .ort-cache
+            .ocr-models
+          key: windows-ocr-${{ hashFiles('Cargo.lock', 'scripts/package-windows.py') }}
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Build Windows executable
+        run: cargo build --locked --release --target x86_64-pc-windows-msvc
+
+      - name: Package executable, models and runtimes
+        run: python scripts/package-windows.py
+
+      - name: Check Clippy
+        run: cargo clippy --locked --all-targets --target x86_64-pc-windows-msvc -- -D warnings
+
+      - name: Run tests
+        run: |
+          $dll = Get-ChildItem -Path "$env:ORT_CACHE_DIR/dfbin/x86_64-pc-windows-msvc" -Recurse -Filter DirectML.dll |
+            Select-Object -First 1
+          if (-not $dll) { throw 'DirectML.dll is missing' }
+          $env:PATH = "$($dll.DirectoryName);$env:PATH"
+          cargo test --locked --target x86_64-pc-windows-msvc
+
+      - name: Upload Windows package
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.version.outputs.artifact }}
+          path: |
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      artifact: ${{ steps.version.outputs.artifact }}
+
+  release:
+    name: Publish version release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v') && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download Windows package
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.artifact }}
+          path: release
+
+      - name: Create release and upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.build.outputs.version }}
+        run: |
+          if gh release view "$RELEASE_TAG" > /dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" release/* --clobber
+          else
+            gh release create "$RELEASE_TAG" release/* \
+              --verify-tag --title "rust-mhxy $RELEASE_TAG" --generate-notes
+          fi

@@ -12,10 +12,12 @@ mod theme;
 
 use std::sync::Arc;
 
+pub const APP_VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"));
+
 fn main() -> eframe::Result {
     let config = config::Config::load(&config::default_config_path());
     let mut viewport = egui::ViewportBuilder::default()
-        .with_title("梦幻西游任务坐标辅助（rust-mhxy）")
+        .with_title(format!("梦幻西游任务坐标辅助（rust-mhxy {APP_VERSION}）"))
         .with_inner_size([1120.0, 800.0])
         .with_min_inner_size([760.0, 540.0]);
     if config.on_top {

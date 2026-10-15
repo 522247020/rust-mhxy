@@ -1578,6 +1578,8 @@ impl eframe::App for MhxyApp {
             )
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(crate::APP_VERSION).small().weak());
+                    ui.separator();
                     ui.label(
                         egui::RichText::new(if self.config.ocr_mode == "remote" {
                             "远端 PP-OCR"
