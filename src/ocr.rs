@@ -33,9 +33,7 @@ pub enum OcrEvent {
         result: Result<OcrText, String>,
     },
     /// 远端连接测试的结果（只用于日志提示）。
-    Test {
-        result: Result<OcrText, String>,
-    },
+    Test { result: Result<OcrText, String> },
 }
 
 struct LocalJob {
@@ -43,35 +41,49 @@ struct LocalJob {
     image: RgbImage,
 }
 
-/// 常驻线程：启动时加载一次本地 OCR 模型，之后循环处理截图。
+/// 常驻线程：收到第一张截图时才加载模型，远端模式不占用模型内存。
 pub struct LocalWorker {
     sender: Sender<LocalJob>,
 }
 
 impl LocalWorker {
-    pub fn spawn(reply: Sender<OcrEvent>) -> LocalWorker {
+    pub fn spawn(reply: Sender<OcrEvent>, ctx: egui::Context) -> LocalWorker {
         let (sender, receiver) = channel::<LocalJob>();
         thread::spawn(move || {
-            let engine = match LocalEngine::new() {
-                Ok(engine) => Ok(engine),
-                Err(err) => Err(err),
-            };
-            while let Ok(job) = receiver.recv() {
-                let result = match &engine {
-                    Ok(engine) => engine.recognize(&job.image),
-                    Err(err) => Err(err.clone()),
-                };
-                let _ = reply.send(OcrEvent::Local {
-                    generation: job.generation,
-                    result,
-                });
+            let mut engine = None;
+            while let Ok(mut job) = receiver.recv() {
+                // 切换设置时只处理最新的待识别截图，避免堆积无效任务。
+                while let Ok(newer) = receiver.try_recv() {
+                    job = newer;
+                }
+                let result = (|| {
+                    if engine.is_none() {
+                        engine = Some(LocalEngine::new()?);
+                    }
+                    engine
+                        .as_ref()
+                        .expect("initialized engine")
+                        .recognize(&job.image)
+                })();
+                if reply
+                    .send(OcrEvent::Local {
+                        generation: job.generation,
+                        result,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                ctx.request_repaint();
             }
         });
         LocalWorker { sender }
     }
 
-    pub fn submit(&self, generation: u64, image: RgbImage) {
-        let _ = self.sender.send(LocalJob { generation, image });
+    pub fn submit(&self, generation: u64, image: RgbImage) -> Result<(), String> {
+        self.sender
+            .send(LocalJob { generation, image })
+            .map_err(|_| "本地识别线程已退出，请重启程序".to_string())
     }
 }
 
@@ -180,10 +192,13 @@ pub fn build_ppocr_body(png: &[u8], format: &str) -> Result<(String, Vec<u8>), S
     match format {
         "raw" => Ok(("image/png".to_string(), png.to_vec())),
         "multipart" => {
-            let boundary = format!("{:032x}", std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|duration| duration.as_nanos())
-                .unwrap_or(0));
+            let boundary = format!(
+                "{:032x}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|duration| duration.as_nanos())
+                    .unwrap_or(0)
+            );
             let head = format!(
                 "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"crop.png\"\r\nContent-Type: image/png\r\n\r\n"
             );
@@ -191,10 +206,7 @@ pub fn build_ppocr_body(png: &[u8], format: &str) -> Result<(String, Vec<u8>), S
             body.extend_from_slice(head.as_bytes());
             body.extend_from_slice(png);
             body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
-            Ok((
-                format!("multipart/form-data; boundary={boundary}"),
-                body,
-            ))
+            Ok((format!("multipart/form-data; boundary={boundary}"), body))
         }
         other => Err(format!("不支持的 OCR 请求格式：{other}")),
     }
@@ -291,7 +303,9 @@ fn collect_lines(node: &Value, out: &mut Vec<String>) {
             }
             // [[box...], [text, score]] 形式
             if items.len() >= 2 {
-                if let (Some(Value::Array(_)), Some(Value::Array(second))) = (items.first(), items.get(1)) {
+                if let (Some(Value::Array(_)), Some(Value::Array(second))) =
+                    (items.first(), items.get(1))
+                {
                     if let Some(text) = second.first().and_then(|value| value.as_str()) {
                         if !text.trim().is_empty() {
                             out.push(text.trim().to_string());
@@ -304,10 +318,8 @@ fn collect_lines(node: &Value, out: &mut Vec<String>) {
                 collect_lines(child, out);
             }
         }
-        Value::String(text) => {
-            if !text.trim().is_empty() {
-                out.push(text.trim().to_string());
-            }
+        Value::String(text) if !text.trim().is_empty() => {
+            out.push(text.trim().to_string());
         }
         _ => {}
     }
@@ -358,7 +370,9 @@ mod tests {
             return;
         };
         let engine = LocalEngine::new().expect("加载本地 PP-OCR 模型");
-        let result = engine.recognize(&image.to_rgb8()).expect("本地 PP-OCR 推理");
+        let result = engine
+            .recognize(&image.to_rgb8())
+            .expect("本地 PP-OCR 推理");
         println!("OCR 文本：\n{}", result.text);
         let maps = crate::core::load_maps(std::path::Path::new(concat!(
             env!("CARGO_MANIFEST_DIR"),

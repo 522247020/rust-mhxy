@@ -1,8 +1,6 @@
 //! 用户配置的读写。为了兼容 Python 版，支持 JSON 里的 ``//`` 与 ``/* */`` 注释，
 //! 并且对布尔值的字符串写法（"true" / "false"）做容错。
-use crate::core::{
-    parse_region_setting, TaskRegion, DEFAULT_EXTRA_REGION, DEFAULT_TASK_REGION,
-};
+use crate::core::{parse_region_setting, TaskRegion, DEFAULT_EXTRA_REGION, DEFAULT_TASK_REGION};
 use crate::gate::{parse_hex, to_hex, ColorPoint};
 use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
@@ -30,6 +28,7 @@ pub struct Config {
     pub color_gate_mode: String,
     pub color_gate_tolerance: u8,
     pub color_gate_points: Vec<ColorPoint>,
+    pub window_scale: f32,
     pub on_top: bool,
 }
 
@@ -54,6 +53,7 @@ impl Default for Config {
             color_gate_mode: "all".into(),
             color_gate_tolerance: 12,
             color_gate_points: Vec::new(),
+            window_scale: 1.0,
             on_top: true,
         }
     }
@@ -75,12 +75,10 @@ impl Config {
             "remote" => "remote".into(),
             _ => "local".into(),
         };
-        config.interval_seconds = get_u32(map, "ocr/interval_seconds", config.interval_seconds)
-            .clamp(1, 60);
-        config.task_region = parse_region_setting(
-            &get_string(map, "ocr/task_region", ""),
-            DEFAULT_TASK_REGION,
-        );
+        config.interval_seconds =
+            get_u32(map, "ocr/interval_seconds", config.interval_seconds).clamp(1, 60);
+        config.task_region =
+            parse_region_setting(&get_string(map, "ocr/task_region", ""), DEFAULT_TASK_REGION);
         config.extra_task_region = parse_region_setting(
             &get_string(map, "ocr/extra_task_region", ""),
             DEFAULT_EXTRA_REGION,
@@ -101,8 +99,7 @@ impl Config {
             _ => "simple".into(),
         };
         config.color_gate_enabled = get_bool(map, "color_gate/enabled", false);
-        config.color_gate_interval_ms =
-            get_u32(map, "color_gate/interval_ms", 300).clamp(50, 5000);
+        config.color_gate_interval_ms = get_u32(map, "color_gate/interval_ms", 300).clamp(50, 5000);
         config.color_gate_mode = match get_string(map, "color_gate/mode", "all").as_str() {
             "any" => "any".into(),
             _ => "all".into(),
@@ -113,6 +110,7 @@ impl Config {
             .map(|value| value.min(255) as u8)
             .unwrap_or(12);
         config.color_gate_points = get_points(map, "color_gate/points");
+        config.window_scale = normalize_window_scale(get_f32(map, "window/scale", 1.0));
         config.on_top = get_bool(map, "window/coordinate/on_top", true);
         config
     }
@@ -123,10 +121,7 @@ impl Config {
             map.insert(key.to_string(), value);
         };
         insert("ocr/mode", Value::String(self.ocr_mode.clone()));
-        insert(
-            "ocr/interval_seconds",
-            Value::from(self.interval_seconds),
-        );
+        insert("ocr/interval_seconds", Value::from(self.interval_seconds));
         insert(
             "ocr/task_region",
             Value::String(region_to_string(self.task_region)),
@@ -142,10 +137,7 @@ impl Config {
         insert("api/format", Value::String(self.api_format.clone()));
         insert("api/url", Value::String(self.api_url.clone()));
         insert("api/token", Value::String(self.api_token.clone()));
-        insert(
-            "task/option/鬼王",
-            Value::Bool(self.ghost_king_enabled),
-        );
+        insert("task/option/鬼王", Value::Bool(self.ghost_king_enabled));
         insert("task/high_chance", Value::Bool(self.high_chance));
         insert(
             "task/horizontal_layout",
@@ -173,10 +165,14 @@ impl Config {
             "color_gate/points",
             points_to_value(&self.color_gate_points),
         );
+        insert("window/scale", Value::from(self.window_scale as f64));
         insert("window/coordinate/on_top", Value::Bool(self.on_top));
 
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent).map_err(|err| format!("创建配置目录失败：{err}"))?;
         }
         let payload = serde_json::to_string_pretty(&Value::Object(map))
             .map_err(|err| format!("序列化配置失败：{err}"))?;
@@ -206,9 +202,31 @@ fn get_string(map: &Map<String, Value>, key: &str, default: &str) -> String {
 
 fn get_u32(map: &Map<String, Value>, key: &str, default: u32) -> u32 {
     match map.get(key) {
-        Some(Value::Number(value)) => value.as_u64().map(|v| v as u32).unwrap_or(default),
+        Some(Value::Number(value)) => value
+            .as_u64()
+            .and_then(|v| u32::try_from(v).ok())
+            .unwrap_or(default),
         Some(Value::String(value)) => value.trim().parse().unwrap_or(default),
         _ => default,
+    }
+}
+
+fn get_f32(map: &Map<String, Value>, key: &str, default: f32) -> f32 {
+    match map.get(key) {
+        Some(Value::Number(value)) => value.as_f64().map(|v| v as f32).unwrap_or(default),
+        Some(Value::String(value)) => value.trim().parse().unwrap_or(default),
+        _ => default,
+    }
+}
+
+/// 0 表示系统 DPI；固定缩放至少为 75%，避免错误配置让界面无法操作。
+fn normalize_window_scale(scale: f32) -> f32 {
+    if !scale.is_finite() || scale < 0.0 {
+        1.0
+    } else if scale == 0.0 {
+        0.0
+    } else {
+        scale.clamp(0.75, 2.5)
     }
 }
 
@@ -401,21 +419,35 @@ mod tests {
     }
 
     #[test]
+    fn invalid_scales_remain_usable() {
+        for scale in [f32::NAN, f32::INFINITY, -1.0] {
+            assert_eq!(normalize_window_scale(scale), 1.0);
+        }
+        assert_eq!(normalize_window_scale(0.0), 0.0);
+        assert_eq!(normalize_window_scale(0.01), 0.75);
+        assert_eq!(normalize_window_scale(100.0), 2.5);
+    }
+
+    #[test]
     fn round_trips_config() {
         let dir = std::env::temp_dir().join("rust-mhxy-config-test");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("config.json");
-        let mut config = Config::default();
-        config.api_url = "http://192.168.3.207:8008".into();
-        config.ghost_king_enabled = false;
-        config.log_level = "detailed".into();
-        config.color_gate_enabled = true;
-        config.color_gate_points = vec![ColorPoint::new(100, 200, [0xd4, 0xa0, 0x17], 15, 1)];
+        let config = Config {
+            api_url: "http://192.168.3.207:8008".into(),
+            ghost_king_enabled: false,
+            log_level: "detailed".into(),
+            window_scale: 1.25,
+            color_gate_enabled: true,
+            color_gate_points: vec![ColorPoint::new(100, 200, [0xd4, 0xa0, 0x17], 15, 1)],
+            ..Default::default()
+        };
         config.save(&path).unwrap();
         let loaded = Config::load(&path);
         assert_eq!(loaded.api_url, "http://192.168.3.207:8008");
         assert!(!loaded.ghost_king_enabled);
         assert_eq!(loaded.log_level, "detailed");
+        assert_eq!(loaded.window_scale, 1.25);
         assert!(loaded.color_gate_enabled);
         assert_eq!(loaded.color_gate_points.len(), 1);
         assert_eq!(loaded.color_gate_points[0].color, [0xd4, 0xa0, 0x17]);

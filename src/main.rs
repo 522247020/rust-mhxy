@@ -1,10 +1,14 @@
 //! 梦幻西游抓鬼/鬼王任务坐标辅助（Rust + egui）。
+// Windows 使用 GUI 子系统，双击启动时不创建控制台窗口。
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 mod app;
 mod capture;
 mod config;
 mod core;
 mod gate;
 mod ocr;
+mod theme;
 
 use std::sync::Arc;
 
@@ -12,7 +16,7 @@ fn main() -> eframe::Result {
     let config = config::Config::load(&config::default_config_path());
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("梦幻西游任务坐标辅助（rust-mhxy）")
-        .with_inner_size([1000.0, 740.0])
+        .with_inner_size([1120.0, 800.0])
         .with_min_inner_size([760.0, 540.0]);
     if config.on_top {
         viewport = viewport.with_always_on_top();
@@ -26,6 +30,7 @@ fn main() -> eframe::Result {
         options,
         Box::new(|cc| {
             install_fonts(&cc.egui_ctx);
+            theme::install(&cc.egui_ctx);
             Ok(Box::new(app::MhxyApp::new(cc)))
         }),
     )
@@ -48,17 +53,15 @@ fn install_fonts(ctx: &egui::Context) {
         "/System/Library/Fonts/PingFang.ttc",
         "/System/Library/Fonts/STHeiti Medium.ttc",
     ];
-    let Some(bytes) = CANDIDATES
-        .iter()
-        .find_map(|path| std::fs::read(path).ok())
-    else {
+    let Some(bytes) = CANDIDATES.iter().find_map(|path| std::fs::read(path).ok()) else {
         eprintln!("未找到可用的中文字体，界面中文可能显示为方块");
         return;
     };
     let mut fonts = egui::FontDefinitions::default();
-    fonts
-        .font_data
-        .insert("cjk".to_owned(), Arc::new(egui::FontData::from_owned(bytes)));
+    fonts.font_data.insert(
+        "cjk".to_owned(),
+        Arc::new(egui::FontData::from_owned(bytes)),
+    );
     fonts
         .families
         .entry(egui::FontFamily::Proportional)

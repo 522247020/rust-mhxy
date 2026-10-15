@@ -85,7 +85,10 @@ pub fn load_maps(path: &Path) -> Result<Vec<MapDefinition>, String> {
             .map(|task| task.trim().to_string())
             .filter(|task| !task.is_empty())
             .collect();
-        if let Some(unknown) = tasks.iter().find(|task| !TASK_TYPES.contains(&task.as_str())) {
+        if let Some(unknown) = tasks
+            .iter()
+            .find(|task| !TASK_TYPES.contains(&task.as_str()))
+        {
             return Err(format!("地图 {name} 的任务类型无效：{unknown}"));
         }
         if raw.left_x == raw.right_x || raw.top_y == raw.bottom_y {
@@ -109,7 +112,9 @@ pub fn load_maps(path: &Path) -> Result<Vec<MapDefinition>, String> {
 /// 注意：仓库里的地图文件其实是 JPEG 但扩展名是 `.png`，按扩展名解码会失败。
 pub fn load_rgb_image(path: &Path) -> Result<image::RgbImage, String> {
     let reader = image::ImageReader::open(path).map_err(|err| err.to_string())?;
-    let reader = reader.with_guessed_format().map_err(|err| err.to_string())?;
+    let reader = reader
+        .with_guessed_format()
+        .map_err(|err| err.to_string())?;
     let image = reader.decode().map_err(|err| err.to_string())?;
     Ok(image.to_rgb8())
 }
@@ -212,7 +217,7 @@ fn match_map<'a>(
                 continue;
             }
             let score = similarity(&normalized, &alias);
-            if score >= 0.6 && best.map_or(true, |(_, best_score)| score > best_score) {
+            if score >= 0.6 && best.is_none_or(|(_, best_score)| score > best_score) {
                 best = Some((definition, score));
             }
         }
@@ -225,10 +230,13 @@ pub fn find_map_definition<'a>(
     maps: &'a [MapDefinition],
     task_type: Option<&str>,
 ) -> Option<&'a MapDefinition> {
-    match_map(name, maps.iter().filter(|map| match task_type {
-        Some(task) => map.supports_task(task),
-        None => true,
-    }))
+    match_map(
+        name,
+        maps.iter().filter(|map| match task_type {
+            Some(task) => map.supports_task(task),
+            None => true,
+        }),
+    )
 }
 
 /// 在 ``block`` 中寻找第一个「数字 分隔符 数字」坐标，返回 (字节起点, x, y)。
@@ -321,9 +329,13 @@ pub fn parse_tasks(
     let mut matches: Vec<(usize, usize, &str)> = Vec::new();
     let mut index = 0;
     while index < chars.len() {
-        let keyword = ["抓鬼", "捉鬼", "鬼王"]
-            .into_iter()
-            .find(|keyword| chars[index..].starts_with(&keyword.chars().collect::<Vec<_>>()));
+        let keyword = [
+            ("抓鬼", ['抓', '鬼']),
+            ("捉鬼", ['捉', '鬼']),
+            ("鬼王", ['鬼', '王']),
+        ]
+        .into_iter()
+        .find_map(|(keyword, prefix)| chars[index..].starts_with(&prefix).then_some(keyword));
         match keyword {
             Some(keyword) if index == 0 || !is_cjk(chars[index - 1]) => {
                 matches.push((index, index + keyword.chars().count(), keyword));
@@ -344,7 +356,11 @@ pub fn parse_tasks(
 
     let mut tasks: Vec<TaskLocation> = Vec::new();
     for (position, (start, end, keyword)) in matches.iter().enumerate() {
-        let task_type = if *keyword == "捉鬼" { "抓鬼" } else { *keyword };
+        let task_type = if *keyword == "捉鬼" {
+            "抓鬼"
+        } else {
+            *keyword
+        };
         if task_type == "鬼王" && !include_ghost_king {
             continue;
         }
@@ -439,7 +455,10 @@ pub fn high_chance_areas(map_name: &str, x: f32, y: f32, size: f32) -> Vec<(f32,
         corners.push((x, y));
     }
     // 上面算出来的是格子左上角（游戏 y 越大越靠上）；换成左下角绘制。
-    corners.into_iter().map(|(cx, cy)| (cx, cy - size)).collect()
+    corners
+        .into_iter()
+        .map(|(cx, cy)| (cx, cy - size))
+        .collect()
 }
 
 pub fn map_point(
@@ -499,12 +518,7 @@ pub fn map_rect(
     let top = y1.max(y2).clamp(min_y, max_y);
     let (px1, py1) = map_point(definition, left, bottom, width, height).unwrap_or((0.0, 0.0));
     let (px2, py2) = map_point(definition, right, top, width, height).unwrap_or((0.0, 0.0));
-    (
-        px1.min(px2),
-        py1.min(py2),
-        px1.max(px2),
-        py1.max(py2),
-    )
+    (px1.min(px2), py1.min(py2), px1.max(px2), py1.max(py2))
 }
 
 /// 以 (x, y) 为中心、边长为 size 的正方形，超出地图的部分会被裁掉。
@@ -517,7 +531,15 @@ pub fn map_area(
     height: f32,
 ) -> (f32, f32, f32, f32) {
     let half = size / 2.0;
-    map_rect(definition, x - half, y - half, x + half, y + half, width, height)
+    map_rect(
+        definition,
+        x - half,
+        y - half,
+        x + half,
+        y + half,
+        width,
+        height,
+    )
 }
 
 /// 把百分比区域换算成图片像素区域。
@@ -539,16 +561,17 @@ pub fn parse_region_setting(saved: &str, default: TaskRegion) -> TaskRegion {
     let mut values = [0f32; 4];
     for (slot, part) in values.iter_mut().zip(parts.iter()) {
         match part.trim().parse::<f32>() {
-            Ok(value) => *slot = value,
+            Ok(value) if value.is_finite() => *slot = value,
+            Ok(_) => return default,
             Err(_) => return default,
         }
     }
     let (left, top, right, bottom) = (values[0], values[1], values[2], values[3]);
     if !(0.0..1.0).contains(&left)
-        || !(left < right)
+        || left >= right
         || right > 1.0
         || !(0.0..1.0).contains(&top)
-        || !(top < bottom)
+        || top >= bottom
         || bottom > 1.0
     {
         return default;
@@ -613,7 +636,17 @@ mod tests {
 
     #[test]
     fn region_setting_defaults_on_bad_input() {
-        assert_eq!(parse_region_setting("bad", DEFAULT_TASK_REGION), DEFAULT_TASK_REGION);
+        for input in [
+            "bad",
+            "0.7,0.2,NaN,0.7",
+            "0.7,0.2,0.99,inf",
+            "0.7,0.8,0.6,0.9",
+        ] {
+            assert_eq!(
+                parse_region_setting(input, DEFAULT_TASK_REGION),
+                DEFAULT_TASK_REGION
+            );
+        }
         assert_eq!(
             parse_region_setting("0.7,0.2,0.99,0.7", DEFAULT_TASK_REGION),
             (0.7, 0.2, 0.99, 0.7)

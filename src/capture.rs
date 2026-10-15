@@ -46,8 +46,8 @@ fn stack_panels(panels: &[RgbImage]) -> RgbImage {
     }
     const GAP: u32 = 8;
     let width = panels.iter().map(|panel| panel.width()).max().unwrap_or(1);
-    let height = panels.iter().map(|panel| panel.height()).sum::<u32>()
-        + GAP * (panels.len() as u32 - 1);
+    let height =
+        panels.iter().map(|panel| panel.height()).sum::<u32>() + GAP * (panels.len() as u32 - 1);
     let mut combined = RgbImage::from_pixel(width, height, image::Rgb([255, 255, 255]));
     let mut offset = 0;
     for panel in panels {
@@ -96,6 +96,9 @@ mod imp {
         let windows = xcap::Window::all().map_err(|err| format!("枚举窗口失败：{err}"))?;
         let mut items = Vec::new();
         for window in windows {
+            if window.pid().ok() == Some(std::process::id()) {
+                continue;
+            }
             let title = window.title().unwrap_or_default().trim().to_string();
             if title.is_empty() {
                 continue;
@@ -114,7 +117,10 @@ mod imp {
         Ok(items)
     }
 
-    pub fn capture_client(handle: i64, _region: crate::core::TaskRegion) -> Result<RgbImage, String> {
+    pub fn capture_client(
+        handle: i64,
+        _region: crate::core::TaskRegion,
+    ) -> Result<RgbImage, String> {
         let windows = xcap::Window::all().map_err(|err| format!("枚举窗口失败：{err}"))?;
         let window = windows
             .into_iter()
@@ -167,13 +173,18 @@ mod imp {
         DIB_RGB_COLORS, HGDIOBJ, SRCCOPY,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetAncestor, GetClientRect, GetWindowRect, GetWindowTextW, IsIconic, IsWindow,
-        IsWindowVisible, WindowFromPoint, GA_ROOT,
+        EnumWindows, GetAncestor, GetClientRect, GetWindowRect, GetWindowTextW,
+        GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, WindowFromPoint, GA_ROOT,
     };
 
     unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
         let windows = &mut *(lparam.0 as *mut Vec<WindowInfo>);
         if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
+            return TRUE;
+        }
+        let mut process_id = 0;
+        GetWindowThreadProcessId(hwnd, Some(&mut process_id));
+        if process_id == std::process::id() {
             return TRUE;
         }
         let mut buffer = [0u16; 512];
@@ -266,7 +277,10 @@ mod imp {
         result
     }
 
-    pub fn capture_client(handle: i64, region: crate::core::TaskRegion) -> Result<RgbImage, String> {
+    pub fn capture_client(
+        handle: i64,
+        region: crate::core::TaskRegion,
+    ) -> Result<RgbImage, String> {
         unsafe {
             let hwnd = HWND(handle as *mut core::ffi::c_void);
             if !IsWindow(Some(hwnd)).as_bool() || IsIconic(hwnd).as_bool() {
@@ -284,8 +298,7 @@ mod imp {
                 return Err("定位游戏窗口失败".into());
             }
             // 任务区域被其他窗口挡住时截到的是别的画面，先检查一下。
-            let (left, top, right, bottom) =
-                task_region(width as f32, height as f32, region);
+            let (left, top, right, bottom) = task_region(width as f32, height as f32, region);
             let center = POINT {
                 x: origin.x + ((left + right) / 2.0) as i32,
                 y: origin.y + ((top + bottom) / 2.0) as i32,

@@ -80,7 +80,12 @@ pub fn bounding_box(points: &[ColorPoint]) -> Option<(i32, i32, i32, i32)> {
         max_x = max_x.max(point.x + margin);
         max_y = max_y.max(point.y + margin);
     }
-    Some((min_x, min_y, (max_x - min_x + 1).max(1), (max_y - min_y + 1).max(1)))
+    Some((
+        min_x,
+        min_y,
+        (max_x - min_x + 1).max(1),
+        (max_y - min_y + 1).max(1),
+    ))
 }
 
 /// 在截取的包围盒图上判断门控状态。
@@ -187,7 +192,7 @@ mod tests {
         let mut image = RgbImage::from_pixel(4, 4, image::Rgb([0, 0, 0]));
         image.put_pixel(2, 2, image::Rgb([10, 20, 30]));
         let point = ColorPoint::new(2, 2, [12, 18, 33], 5, 0);
-        let result = evaluate(&image, (0, 0), &[point.clone()], GateMode::All);
+        let result = evaluate(&image, (0, 0), std::slice::from_ref(&point), GateMode::All);
         assert!(result.active);
         assert_eq!(result.sampled[0], Some([10, 20, 30]));
 

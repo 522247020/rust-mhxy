@@ -17,7 +17,21 @@ RUNTIME_TMP="dist/.runtime"
 MODELS_DIR="${HOME}/.oar"
 
 echo "==> 交叉编译（release）"
-cargo xwin build --release --target "${TARGET}"
+cargo xwin build --locked --release --target "${TARGET}"
+
+# 检查实际产物，避免误发仍会弹出命令窗口的控制台程序。
+python3 - "target/${TARGET}/release/rust-mhxy.exe" <<'PY'
+import pathlib, struct, sys
+exe = pathlib.Path(sys.argv[1])
+data = exe.read_bytes()
+pe_offset = struct.unpack_from("<I", data, 0x3c)[0]
+if data[pe_offset:pe_offset + 4] != b"PE\0\0":
+    raise SystemExit("错误：Windows EXE 的 PE 文件头无效")
+subsystem = struct.unpack_from("<H", data, pe_offset + 24 + 68)[0]
+if subsystem != 2:
+    raise SystemExit(f"错误：Windows EXE 不是 GUI 子系统（{subsystem}），启动仍会弹出命令窗口")
+print("==> EXE 已验证为 Windows GUI 子系统（无命令窗口）")
+PY
 
 echo "==> 准备 VC++ 运行库（官方 msvc-runtime wheel）"
 mkdir -p "${RUNTIME_TMP}"
@@ -61,14 +75,15 @@ text = """rust-mhxy - 梦幻西游抓鬼/鬼王任务坐标辅助（Windows 测�
 
 一、运行
   1. 解压整个文件夹到任意目录（assets 目录要一起）。
-  2. 双击 rust-mhxy.exe 运行。
+  2. 双击 rust-mhxy.exe 运行，启动时不会弹出命令窗口。
 
 二、说明
   - 本地 PP-OCR 模型已随包放在 assets/models，离线可用。
   - 远端 PP-OCR：选「远端 PP-OCR」，填服务地址与 Token，可点「测试连接」。
   - 游戏窗口会自动扫描并选中（优先标题含「梦幻西游 / MHXY」），也可手动选择。
   - 左侧栏底部日志常开，分「简单 / 详细」。
-  - 「显示识别区域」按钮会打开独立窗口，可点击截图取点取色（图色门控）。
+  - 「设置识别区域」按钮会打开独立窗口，可点击截图取点取色（图色门控）。
+  - 使用顶部按钮开始或暂停识别；任务状态显示在任务卡片标题右侧。
   - 配置保存到同目录 config.json，可参考 config.example.json。
 
 三、运行库

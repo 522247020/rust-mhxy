@@ -50,6 +50,8 @@
   "log/level": "simple",
 
   // ---- 窗口 ----
+  // 界面缩放：0 = 跟随系统 DPI，0.75~2.5 = 固定缩放（默认 1.0）
+  "window/scale": 1.0,
   // 左侧设置栏是否展开
   "window/sidebar_expanded": true,
   // 窗口置顶
