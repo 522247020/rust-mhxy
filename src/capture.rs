@@ -265,7 +265,7 @@ mod imp {
                 return Err("读取位图失败".into());
             }
             let mut image = RgbImage::new(width as u32, height as u32);
-            for (pixel, source) in image.pixels_mut().zip(buffer.chunks_exact(4)) {
+            for (pixel, source) in image.pixels_mut().zip(buffer.as_chunks::<4>().0) {
                 *pixel = image::Rgb([source[2], source[1], source[0]]);
             }
             Ok(image)
