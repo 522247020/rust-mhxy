@@ -79,7 +79,15 @@ jobs:
         run: python scripts/package-windows.py
 
       - name: Check Clippy
-        run: cargo clippy --locked --all-targets --target x86_64-pc-windows-msvc -- -D warnings
+        run: |
+          cargo clippy --locked --all-targets --target x86_64-pc-windows-msvc -- -D warnings 2>&1 |
+            Tee-Object -FilePath clippy.log
+          if ($LASTEXITCODE -ne 0) {
+            Get-Content clippy.log | Select-String 'error:' | ForEach-Object {
+              Write-Output "::error title=Windows Clippy::$($_.Line)"
+            }
+            exit 1
+          }
 
       - name: Run tests
         run: |
