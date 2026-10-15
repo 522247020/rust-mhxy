@@ -23,6 +23,7 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: '0'
+      PYTHONUTF8: '1'
       ORT_CACHE_DIR: ${{ github.workspace }}/.ort-cache
       OAR_HOME: ${{ github.workspace }}/.ocr-models
     defaults:
@@ -30,10 +31,10 @@ jobs:
         shell: pwsh
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.12'
 
@@ -61,7 +62,7 @@ jobs:
           cache-on-failure: true
 
       - name: Cache ONNX Runtime and OCR models
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             .ort-cache
