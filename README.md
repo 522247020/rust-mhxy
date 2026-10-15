@@ -1,170 +1,177 @@
 # rust-mhxy
 
+梦幻西游抓鬼 / 鬼王任务坐标辅助工具。自动识别任务栏中的地图与坐标，在地图上标记目标位置，让任务信息更直观。
+
+基于 **Rust + egui** 开发，支持本地 PP-OCRv5 和远端 PP-OCR，提供 Windows 10 / 11 64 位桌面应用。
+
 [![Windows build](https://github.com/522247020/rust-mhxy/actions/workflows/windows.yml/badge.svg)](https://github.com/522247020/rust-mhxy/actions/workflows/windows.yml)
+[![Release](https://img.shields.io/github/v/release/522247020/rust-mhxy)](https://github.com/522247020/rust-mhxy/releases/latest)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-梦幻西游任务坐标辅助的 **Rust + egui** 重写版，当前版本 **v0.1.0**。
+## 功能特点
 
-Windows 下载：[GitHub Releases](https://github.com/522247020/rust-mhxy/releases)。
+- **任务坐标识别**：识别抓鬼、捉鬼、鬼王任务文字，提取地图名称与坐标。
+- **地图可视化**：内置 20 张地图，显示目标位置、附近范围和可选的 50 × 50 高概率区域；点击任务坐标即可复制。
+- **本地与远端 OCR**：本地识别使用 PP-OCRv5，远端识别支持 `multipart` 和 `raw` 请求格式，并可直接测试连接。
+- **自定义识别区域**：独立设置窗口支持主区域、备用区域和截图预览，适配不同游戏窗口布局。
+- **图色门控**：按指定点位的颜色判断是否需要识别，未命中时暂停 OCR，减少无效识别。
+- **双任务展示**：抓鬼与鬼王可上下或左右排列；状态提示与标题在同一行，状态变化时地图保持稳定。
+- **桌面使用体验**：深色界面、可折叠设置栏、界面缩放、简单 / 详细日志，设置自动保存。
 
-只保留最基础的两件事：
+## 下载与使用
 
-- **抓鬼 / 鬼王** 任务坐标识别与地图可视化
-- **本地 PP-OCR** 与 **远端 PP-OCR** 两种识图方式
+前往 [GitHub Releases](https://github.com/522247020/rust-mhxy/releases/latest) 下载 Windows 64 位压缩包。
 
-原 Python 版里的降妖伏魔、打宝图、计算器、答题器、计时器、闹钟、资料查询、消耗计算、
-窗口置顶设置等全部砍掉。
+当前版本为 **v0.1.0**，分发包名称为 `rust-mhxy-v0.1.0-windows-x86_64.zip`，同时提供 `.zip.sha256` 校验文件。
 
-## 功能
+1. 将整个压缩包解压到可写目录，保留 `assets` 目录和所有 DLL。
+2. 双击 `rust-mhxy.exe` 启动，程序不会弹出命令窗口。
+3. 打开游戏，在设置栏中确认选中的游戏窗口；也可以通过下拉框手动选择或点击「刷新」。
+4. 选择「本地 PP-OCR」或「远端 PP-OCR」，根据需要设置识别区域。
+5. 点击顶部「开始识别」，在任务卡片中查看地图与坐标；点击「暂停识别」停止。
 
-- 枚举游戏窗口（优先「梦幻西游 / MHXY」，否则取任意可用窗口），自动选中，也可用下拉框手动选、点「刷新」重扫
-- 截取任务栏区域（默认客户区 `70%~99% 宽 / 24%~70% 高`），可选备用区域
-- 本地识图：内置 **PP-OCRv5**（oar-ocr + ONNX Runtime），首次识别才加载模型，远端模式不加载；优先用随包 `assets/models` 里的模型，找不到时自动下载
-- 远端识图：把截图 PNG 直接发给 PP-OCR 服务，支持 `multipart`（`/ocr`）和 `raw`（`/ocr/raw`），界面里有「测试连接」按钮
-- 解析「抓鬼 / 捉鬼 / 鬼王」文字，匹配地图与坐标
-- **图色门控**：每 300ms 比对配置的点位颜色，未命中（战斗 / 任务完成）就跳过 OCR，省 CPU
-- 地图上标出坐标点、附近范围（`附近` 关键字）、捉鬼高概率区域（50×50）
-- 配置写入 `config.json`（支持注释，兼容 Python 版字段）
+Windows 分发包包含本地 OCR 模型、地图、DirectML 和 VC++ 运行库，本地识别可离线使用。截图识别时请保持游戏窗口可见，避免最小化或遮挡任务栏区域。
 
-## 构建与运行
+### 识别方式
 
-Windows 是主要目标平台（窗口客户区截图用 Win32 API 精确实现）。
+| 方式 | 使用说明 |
+| --- | --- |
+| 本地 PP-OCR | 使用 PP-OCRv5，首次识别时加载模型。优先读取 `assets/models/`，缺少模型时自动下载到 `~/.oar/`。 |
+| 远端 PP-OCR | 填写服务地址与可选的 Bearer Token，点击「测试连接」确认服务可用。截图以 PNG 格式发送给服务。 |
+
+远端服务支持两种请求格式：
+
+- `multipart`：请求 `/ocr`，图片字段为 `file`。
+- `raw`：请求 `/ocr/raw`，请求体为 PNG 图片字节。
+
+服务地址填写根地址即可，例如 `http://192.168.1.100:8008`，程序会按请求格式补全接口路径。
+
+### 设置识别区域
+
+点击「设置识别区域」打开独立窗口：
+
+- 点击「更新截图」获取当前游戏客户区预览。
+- 按左、上、右、下调整主区域，单位为客户区百分比；红框表示主区域。
+- 需要识别第二处任务文字时，启用备用区域；蓝框表示备用区域。
+- 勾选「点击预览取点」，可直接从截图中添加颜色采样点。
+
+默认主区域为客户区宽度的 `70%～99%`、高度的 `24%～70%`。若识别不到任务，可先检查截图范围，再切换详细日志查看识别过程。
+
+### 图色门控
+
+图色门控通过少量像素点判断任务栏是否处于可识别状态，适合在战斗或任务完成时跳过 OCR。
+
+在区域设置窗口中取点后启用门控，可选择「全部命中」或「任一命中」，并调整每个点位的颜色容差与采样半径。默认每 `300ms` 检查一次；从未命中恢复为命中时，会立即触发一次识别。未配置点位时默认允许 OCR。
+
+## 配置
+
+大部分设置可直接在界面中调整，程序会自动保存到同目录的 `config.json`，下次启动时恢复。开发运行时，配置保存在项目根目录。
+
+需要手动配置时，可将 [config.example.json](config.example.json) 复制为 `config.json`。配置支持 `//` 和 `/* */` 注释，修改后重启程序生效。
+
+| 配置项 | 说明 |
+| --- | --- |
+| `ocr/mode` | `local` 本地识别，`remote` 远端识别 |
+| `ocr/interval_seconds` | 识别间隔，范围为 1～60 秒 |
+| `ocr/task_region` | 主区域，格式为 `左,上,右,下`，各值为 0～1 |
+| `ocr/extra_task_region` | 备用区域，格式同主区域 |
+| `ocr/extra_region_enabled` | 是否启用备用区域 |
+| `api/url` | 远端 PP-OCR 服务地址 |
+| `api/token` | Bearer Token，可留空 |
+| `api/format` | `multipart` 或 `raw` |
+| `task/option/鬼王` | 是否同时识别鬼王 |
+| `task/high_chance` | 是否显示高概率区域 |
+| `task/horizontal_layout` | `false` 上下排列，`true` 左右排列 |
+| `color_gate/enabled` | 是否启用图色门控 |
+| `color_gate/interval_ms` | 门控采样间隔，默认 300 毫秒 |
+| `color_gate/mode` | `all` 全部命中，`any` 任一命中 |
+| `color_gate/tolerance` | 新增点位的默认颜色容差 |
+| `color_gate/points` | 点位数组，支持坐标、颜色、容差、半径和标签 |
+| `log/level` | `simple` 简单日志，`detailed` 详细日志 |
+| `window/sidebar_expanded` | 是否展开设置栏 |
+| `window/scale` | `0` 跟随系统 DPI，`0.75`～`2.5` 固定缩放，默认 `1.0` |
+| `window/coordinate/on_top` | 是否置顶窗口 |
+
+## 开发与构建
+
+### 从源码运行
+
+安装当前稳定版 [Rust](https://rustup.rs/)，克隆仓库后运行：
 
 ```bash
+git clone https://github.com/522247020/rust-mhxy.git
 cd rust-mhxy
-cargo run
+cargo run --locked
 ```
 
-首次构建时：
+Windows 使用 Win32 API 截取游戏客户区，编译需要 Visual Studio C++ 构建工具。Linux / macOS 使用 `xcap` 提供截图，主要用于开发调试，需具备相应的图形环境与系统依赖。
 
-- `ort` 会下载 ONNX Runtime 二进制
-- 首次执行本地识图时，模型（约 25MB）会下载到 `~/.oar/`
+首次构建时会下载 ONNX Runtime。直接从源码运行时，如果没有本地 OCR 模型，首次本地识别会自动下载；远端模式不会加载本地模型。
 
-Linux/macOS 下会用 `xcap` 做开发期的近似截图，便于调试界面。
-
-## Windows 打包（在 Linux 上交叉编译）
-
-用 [`cargo-xwin`](https://github.com/rust-cross/cargo-xwin) 交叉编译到 `x86_64-pc-windows-msvc`：
+开发检查：
 
 ```bash
-cargo install cargo-xwin --locked
-rustup target add x86_64-pc-windows-msvc
-cargo xwin build --release --target x86_64-pc-windows-msvc
+cargo fmt --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
 ```
 
-可直接使用项目脚本构建并组装完整分发包（还需 Python 3.11+，缺少模型和运行库时会下载并校验 SHA256）：
+需要下载模型或提供真实任务截图的两项 OCR 集成测试默认忽略。
 
-```bash
-bash scripts/package-windows.sh
-```
+### 构建 Windows 分发包
 
-压缩包在 `dist/rust-mhxy-v0.1.0-windows-x86_64.zip`，同时生成 `.zip.sha256` 校验文件。包内包含 20 张地图、本地 PP-OCRv5 模型、DirectML 和 VC++ 运行库；解压整个目录后双击 `rust-mhxy.exe` 即可运行。Windows 程序使用 GUI 子系统，启动时不会弹出命令窗口；打包脚本会检查 EXE 的架构和子系统标记。
+打包脚本需要 **Python 3.11+**，会自动准备并校验离线模型和运行库，检查 EXE 的 x64 架构及 GUI 子系统，生成 ZIP 与 SHA256 校验文件。
 
-单独编译的程序在 `target/x86_64-pc-windows-msvc/release/rust-mhxy.exe`。分发时需要一起带上：
-
-- `assets/`（`maps.json` + `maps/` + 可选的内置 `models/`）
-- `config.example.json`
-- 运行库：`DirectML.dll`、`msvcp140*.dll`、`vcruntime140*.dll` 等（可 app-local 放在 exe 旁边）
-
-本地 OCR 模型想离线可用，把 `pp-ocrv5_mobile_det.onnx` / `pp-ocrv5_mobile_rec.onnx` / `ppocrv5_dict.txt` 放到 `assets/models/` 即可。
-
-## 自动构建与版本发布
-
-[Windows build 工作流](https://github.com/522247020/rust-mhxy/actions/workflows/windows.yml) 在 Windows Server 2022 上原生构建 x64 程序：
-
-- 推送 `main`、提交到 `main` 的 Pull Request，或在 Actions 页面点击 **Run workflow**：检查格式、构建、运行 Clippy 和测试，成功后上传包含 ZIP 与 SHA256 的构建产物，保留 30 天。
-- 推送 `v*` 标签：校验标签与 `Cargo.toml` 的版本一致，构建通过后自动创建 GitHub Release 并附上 Windows ZIP 和 SHA256；重新运行会更新同版本附件。
-- 版本统一取自 `Cargo.toml`，界面状态栏、窗口标题、ZIP 文件名和包内 `VERSION.txt` 均显示相同版本。
-
-发布 `v0.1.0`：
-
-```bash
-git tag -a v0.1.0 -m "Release v0.1.0"
-git push origin main
-git push origin v0.1.0
-```
-
-后续版本先修改 `Cargo.toml` 中的 `package.version` 并更新 `Cargo.lock`，提交后推送对应版本标签。工作流通过 GitHub 自带的 `GITHUB_TOKEN` 发布，无需配置额外凭据。
-
-在 Windows 本地打包可使用 Python 3.11+：
+在 Windows 上构建：
 
 ```powershell
 cargo build --locked --release --target x86_64-pc-windows-msvc
 python scripts/package-windows.py
 ```
 
-## 目录结构
+在 Linux 上交叉编译：
 
+```bash
+cargo install cargo-xwin --locked
+rustup target add x86_64-pc-windows-msvc
+bash scripts/package-windows.sh
 ```
+
+产物保存在 `dist/`，文件名中的版本号自动读取 `Cargo.toml`。
+
+### 自动构建与发布
+
+[Windows build](https://github.com/522247020/rust-mhxy/actions/workflows/windows.yml) 工作流在 GitHub 的 Windows 环境中构建：
+
+- 推送到 `main`、向 `main` 提交 Pull Request，或手动运行工作流：执行格式检查、编译、打包、Clippy 和测试，成功后上传构建产物，保留 30 天。
+- 推送 `v*` 标签：校验标签与 Cargo 版本一致，所有检查通过后自动创建 GitHub Release，上传 Windows ZIP 和 SHA256 文件。
+
+发布新版本时，先更新 `Cargo.toml` 的 `package.version` 和 `Cargo.lock`，提交后推送相应标签。工作流使用 GitHub 自带的 `GITHUB_TOKEN` 发布，无需额外配置凭据。
+
+## 项目结构
+
+```text
 src/
-  main.rs      # eframe 启动 + 中文字体加载
-  app.rs       # egui 界面与识别调度
-  theme.rs     # 全局配色、任务卡片和状态组件
-  core.rs      # 任务解析、地图几何（移植自 Python core.py）
-  capture.rs   # 窗口枚举与截图（Windows 用 Win32，其他用 xcap）
-  gate.rs      # 图色门控：点位颜色匹配
-  ocr.rs       # 本地 PP-OCR 工作线程 + 远端 PP-OCR 请求
-  config.rs    # config.json 读写（支持注释）
+  main.rs       # 应用启动、版本信息与中文字体
+  app.rs        # 界面、任务状态与识别调度
+  theme.rs      # 配色与通用界面组件
+  core.rs       # 任务解析与地图坐标计算
+  capture.rs    # 窗口枚举与截图
+  gate.rs       # 图色门控
+  ocr.rs        # 本地与远端 OCR
+  config.rs     # 配置读写
 assets/
-  maps.json    # 只保留抓鬼/鬼王相关地图
-  maps/*.png   # 地图图片
-  models/      # 可选：随包携带的本地 PP-OCR 模型（缺省时自动下载）
+  maps.json     # 地图定义
+  maps/         # 地图图片
+scripts/
+  package-windows.py  # Windows 分发包组装
+  package-windows.sh  # Linux 交叉编译入口
+.github/workflows/
+  windows.yml   # Windows 自动构建与发布
 config.example.json
+LICENSE
 ```
 
-## 配置
+## 开源协议
 
-把 `config.example.json` 复制成 `config.json` 放在程序（或 `cargo run` 时的项目根目录）下。
-
-| 键 | 说明 |
-| --- | --- |
-| `ocr/mode` | `local` 本地 PP-OCR；`remote` 远端 PP-OCR |
-| `ocr/interval_seconds` | 识别间隔，1~60 秒 |
-| `ocr/task_region` | 主识别区域 `左,上,右,下`（相对客户区百分比 0~1） |
-| `ocr/extra_task_region` | 备用识别区域 |
-| `ocr/extra_region_enabled` | 是否启用备用区域 |
-| `api/format` | 远端请求格式：`multipart` / `raw` |
-| `api/url` | PP-OCR 服务根地址 |
-| `api/token` | Bearer Token，可留空 |
-| `task/option/鬼王` | 是否识别鬼王 |
-| `task/high_chance` | 是否叠加捉鬼高概率区域 |
-| `task/horizontal_layout` | 任务布局：`false` 上下等分 / `true` 左右等分 |
-| `color_gate/enabled` | 是否启用图色门控 |
-| `color_gate/interval_ms` | 图色轮询间隔（毫秒，默认 300） |
-| `color_gate/mode` | 多点逻辑：`all` 全部命中 / `any` 任一命中 |
-| `color_gate/tolerance` | 新增点位的默认容差（每通道 0~255） |
-| `color_gate/points` | 点位数组，每项 `{x, y, color, tolerance, radius, label}` |
-| `log/level` | 日志级别：`simple` / `detailed` |
-| `window/sidebar_expanded` | 左侧设置栏是否展开 |
-| `window/scale` | 界面缩放：`0` 跟随系统 DPI，`0.75`~`2.5` 固定缩放（默认 `1.0`） |
-| `window/coordinate/on_top` | 窗口是否置顶 |
-
-界面里修改设置会在停止操作约 400ms 后自动回写 `config.json`，关闭程序时也会保存待写入的设置；保存失败会在界面提示。
-
-## 界面
-
-- 统一深色界面，抓鬼 / 鬼王使用青绿、金色区分，地图名与坐标突出显示；点击坐标可复制地图与坐标。
-- 顶部「收起设置 / 展开设置」折叠侧栏；通过「开始识别 / 暂停识别」按钮控制识别，运行状态始终可见。
-- 游戏窗口会自动选中（优先「梦幻西游 / MHXY」），也可以用下拉框手动选择、点「刷新」重扫。当前选中窗口可用时保留选择；识别中或尚未找到窗口时每 3 秒重扫，排除程序自己的窗口。
-- 左侧栏按游戏窗口、识别方式、任务显示、界面、日志分组，整栏一起滚动。日志始终开启，简单模式记录启动与任务开始/停止，详细模式额外记录 OCR 过程和错误；仅绘制可见行，长日志悬停可查看全文。
-- 远端连接测试结果直接显示在按钮下方，简单日志模式下也可查看成功或失败原因。
-- 「设置识别区域」在**独立新窗口**里显示主/备用范围与图色门控，打开时更新一次截图，也可点击「更新截图」。设置区可滚动，预览始终保留空间；范围各字段标明左 / 上 / 右 / 下。
-- 预览中红框表示主区域、蓝框表示备用区域，点击图片可取点取色；截图更新时复用纹理。
-- **图色门控**默认每 300ms 轮询点位：命中允许 OCR，从未命中转为命中时立即重新识别；战斗或任务完成导致未命中时暂停 OCR。区域设置窗口打开时也会更新命中状态。
-- 任务默认上下等分，可切换左右等分；关闭鬼王后抓鬼占满地图区。任务卡片标题与状态同一行左右排列：左侧显示任务、地图和坐标，右侧显示「等待识别」「本轮未识别到任务」或更新时间。标题行高度固定，状态变化不会改变地图尺寸；未识别到任务时保留上次地图和坐标。
-- 切换游戏窗口会清除旧坐标；暂停、切换窗口或更改识别设置后，迟到的 OCR 结果会被丢弃。
-- 底部状态栏显示版本号、识别方式、间隔、最近一次耗时和设置保存状态。
-
-开发验证使用 `cargo test`、`cargo clippy --all-targets -- -D warnings` 和 `cargo run`；需要本地模型或真实任务截图的两项 OCR 集成测试默认忽略。
-
-## 说明
-
-- 地图图片按文件内容嗅探格式（仓库里的地图文件其实是 JPEG 但扩展名是 `.png`），不依赖扩展名。
-- 本地 OCR 首次使用若无内置模型会自动下载到 `~/.oar/`。
-
-## 与 Python 版的差异
-
-- 只支持抓鬼 / 鬼王，任务模式与打宝图、降妖伏魔相关逻辑已移除
-- 远端只保留 PP-OCR（移除了 mhxy-api 任务识别接口）
-- 不支持多开窗口同时识别，每次只识别一个选中的游戏窗口
-- 识别区域预览与设置放在独立的新窗口里
-- 本地 OCR 模型为 PP-OCRv5（Python 版依赖 RapidOCR 自带模型）
+本项目采用 [MIT License](LICENSE) 开源协议。

@@ -120,6 +120,7 @@ def package(binary: Path, output: Path, models: Path, ort_cache: Path, version: 
             with wheel.open(member) as source, (stage / name).open("wb") as destination:
                 shutil.copyfileobj(source, destination)
     shutil.copy2(ROOT / "config.example.json", stage)
+    shutil.copy2(ROOT / "LICENSE", stage)
     shutil.copy2(ROOT / "assets" / "maps.json", stage / "assets")
     shutil.copytree(ROOT / "assets" / "maps", stage / "assets" / "maps", ignore=shutil.ignore_patterns(".gitkeep"))
     for name in MODEL_HASHES:
