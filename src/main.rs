@@ -38,6 +38,20 @@ fn main() -> eframe::Result {
     )
 }
 
+/// 把字体文件只读映射到内存。字体页由系统按需调入，属于文件缓存而不是进程私有内存，
+/// 比读入 Vec 再交给 epaint 占用低很多。映射失败时回退到读入内存。
+fn load_font(path: &std::path::Path) -> Option<&'static [u8]> {
+    if let Ok(file) = std::fs::File::open(path) {
+        // SAFETY: 只读映射系统字体文件，仅用于字形渲染，映射保持到进程退出。
+        if let Ok(map) = unsafe { memmap2::Mmap::map(&file) } {
+            let leaked: &'static mut memmap2::Mmap = Box::leak(Box::new(map));
+            return Some(&leaked[..]);
+        }
+    }
+    let bytes = std::fs::read(path).ok()?;
+    Some(Box::leak(bytes.into_boxed_slice()))
+}
+
 /// egui 自带的字体没有中文字形，这里从系统里找一个 CJK 字体装上。
 fn install_fonts(ctx: &egui::Context) {
     const CANDIDATES: &[&str] = &[
@@ -55,14 +69,18 @@ fn install_fonts(ctx: &egui::Context) {
         "/System/Library/Fonts/PingFang.ttc",
         "/System/Library/Fonts/STHeiti Medium.ttc",
     ];
-    let Some(bytes) = CANDIDATES.iter().find_map(|path| std::fs::read(path).ok()) else {
+    let Some(font) = CANDIDATES
+        .iter()
+        .find_map(|path| load_font(std::path::Path::new(path)))
+    else {
         eprintln!("未找到可用的中文字体，界面中文可能显示为方块");
         return;
     };
     let mut fonts = egui::FontDefinitions::default();
+    // epaint 会为 FontData 的字体数据再准备一份 Blob；用 'static 切片可以避免复制。
     fonts.font_data.insert(
         "cjk".to_owned(),
-        Arc::new(egui::FontData::from_owned(bytes)),
+        Arc::new(egui::FontData::from_static(font)),
     );
     fonts
         .families
@@ -75,4 +93,25 @@ fn install_fonts(ctx: &egui::Context) {
         .or_default()
         .push("cjk".to_owned());
     ctx.set_fonts(fonts);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 字体改成零拷贝加载后，中文字形必须仍然可用。
+    #[test]
+    fn bundled_font_covers_ui_and_map_characters() {
+        let ctx = egui::Context::default();
+        install_fonts(&ctx);
+        let sample = "梦幻西游任务坐标辅助抓鬼鬼王长寿村天宫普陀山五庄观附近等待识别";
+        let font_id = egui::FontId::proportional(14.0);
+        // 字体在第一次渲染帧后可用。
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.label(sample);
+        });
+        let covered = ctx.fonts_mut(|fonts| fonts.has_glyphs(&font_id, sample));
+        output.textures_delta.clear();
+        assert!(covered, "界面或地图字符缺字形，字体加载异常");
+    }
 }

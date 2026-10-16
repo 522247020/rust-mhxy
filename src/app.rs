@@ -18,14 +18,18 @@ use std::time::{Duration, Instant};
 
 const TASK_ORDER: [&str; 2] = ["抓鬼", "鬼王"];
 /// 侧栏日志框的最大高度。
-const LOG_PANEL_HEIGHT: f32 = 240.0;
+/// 侧栏日志框的最小高度；实际高度随窗口高度变化。
+const LOG_PANEL_MIN_HEIGHT: f32 = 140.0;
+/// 日志框占窗口可用高度的比例。
+const LOG_PANEL_HEIGHT_RATIO: f32 = 0.34;
+/// 侧栏展开 / 收起时的最小窗口尺寸。
+const MIN_WINDOW_SIZE_EXPANDED: Vec2 = Vec2::new(760.0, 540.0);
+const MIN_WINDOW_SIZE_COLLAPSED: Vec2 = Vec2::new(460.0, 460.0);
 
 #[derive(Default)]
 struct TaskState {
     location: Option<TaskLocation>,
     map_index: Option<usize>,
-    status: Option<String>,
-    captured_at: Option<Instant>,
 }
 
 pub struct MhxyApp {
@@ -44,14 +48,18 @@ pub struct MhxyApp {
     tasks: HashMap<&'static str, TaskState>,
     map_textures: HashMap<String, TextureHandle>,
     map_texture_failed: HashSet<String>,
-    preview_full: Option<egui::ColorImage>,
+    preview_image: Option<image::RgbImage>,
     preview_texture: Option<TextureHandle>,
+    client_size: Option<(u32, u32)>,
+    region_window_pos: Option<egui::Pos2>,
     show_region_window: bool,
     pick_points: bool,
     gate_active: bool,
     last_gate_check: Instant,
     gate_result: Option<gate::GateResult>,
     testing_remote: bool,
+    applied_min_inner_size: Option<Vec2>,
+    applied_on_top: Option<bool>,
     remote_feedback: Option<Result<String, String>>,
     notice: Option<String>,
     last_ocr_secs: Option<f64>,
@@ -109,14 +117,18 @@ impl MhxyApp {
             tasks,
             map_textures: HashMap::new(),
             map_texture_failed: HashSet::new(),
-            preview_full: None,
+            preview_image: None,
             preview_texture: None,
+            client_size: None,
+            region_window_pos: None,
             show_region_window: false,
             pick_points: true,
             gate_active: true,
             last_gate_check: Instant::now(),
             gate_result: None,
             testing_remote: false,
+            applied_min_inner_size: None,
+            applied_on_top: None,
             remote_feedback: None,
             notice: None,
             last_ocr_secs: None,
@@ -186,8 +198,9 @@ impl MhxyApp {
             self.tasks
                 .values_mut()
                 .for_each(|state| *state = TaskState::default());
-            self.preview_full = None;
+            self.preview_image = None;
             self.preview_texture = None;
+            self.client_size = None;
             self.gate_result = None;
             self.gate_active =
                 !self.config.color_gate_enabled || self.config.color_gate_points.is_empty();
@@ -222,18 +235,36 @@ impl MhxyApp {
         }
     }
 
-    fn update_preview(&mut self, image: &image::RgbImage) {
-        let color = to_color_image(image);
+    /// 记录客户区尺寸；仅在打开识别区域窗口时才保留整张截图，避免常驻内存。
+    fn update_preview(&mut self, image: image::RgbImage) {
+        self.client_size = Some(image.dimensions());
+        if !self.show_region_window {
+            return;
+        }
+        let color = to_color_image(&image);
         if let Some(texture) = &mut self.preview_texture {
-            texture.set(color.clone(), egui::TextureOptions::LINEAR);
+            texture.set(color, egui::TextureOptions::LINEAR);
         } else {
             self.preview_texture = Some(self.ctx.load_texture(
                 "client_preview",
-                color.clone(),
+                color,
                 egui::TextureOptions::LINEAR,
             ));
         }
-        self.preview_full = Some(color);
+        self.preview_image = Some(image);
+    }
+
+    /// 关闭取点工具后释放截图和纹理。
+    fn release_preview(&mut self) {
+        self.preview_image = None;
+        self.preview_texture = None;
+    }
+
+    fn set_on_top(&mut self, on: bool, ctx: &egui::Context) {
+        self.config.on_top = on;
+        self.applied_on_top = Some(on);
+        apply_window_level(ctx, on);
+        self.persist();
     }
 
     fn runtime_status(&self) -> (&str, Color32) {
@@ -289,14 +320,6 @@ impl MhxyApp {
         task_type != "鬼王" || self.config.ghost_king_enabled
     }
 
-    fn mark_all_stale(&mut self, message: &str) {
-        for (task, state) in self.tasks.iter_mut() {
-            if *task != "鬼王" || self.config.ghost_king_enabled {
-                state.status = Some(message.to_string());
-            }
-        }
-    }
-
     /// 图色门控：抓一小块屏幕比对点位颜色，判断当前是否有任务。
     fn check_gate(&mut self) {
         if !self.config.color_gate_enabled || self.config.color_gate_points.is_empty() {
@@ -318,9 +341,9 @@ impl MhxyApp {
             self.gate_active = true;
             return;
         };
-        if let Some(image) = &self.preview_full {
-            let client_w = image.width() as i32;
-            let client_h = image.height() as i32;
+        if let Some((client_w, client_h)) = self.client_size {
+            let client_w = client_w as i32;
+            let client_h = client_h as i32;
             x = x.clamp(0, (client_w - 1).max(0));
             y = y.clamp(0, (client_h - 1).max(0));
             width = width.clamp(1, (client_w - x).max(1));
@@ -395,14 +418,13 @@ impl MhxyApp {
                 Err(err) => {
                     self.log_detail(format!("截图失败（{window_title}）：{err}"));
                     self.notice = Some(err.clone());
-                    self.mark_all_stale("本轮截图失败，保留上次坐标");
                     if err.contains("关闭") || err.contains("最小化") {
                         self.set_window(None);
                     }
                     return;
                 }
             };
-        self.update_preview(&full);
+        self.update_preview(full);
         self.notice = None;
 
         let signature = hash_image(&panel);
@@ -475,7 +497,6 @@ impl MhxyApp {
                     self.log_detail(format!("识别失败：{err}"));
                     self.notice = Some(err);
                     self.pending_signature = None;
-                    self.mark_all_stale("本轮识别失败，保留上次坐标");
                 }
                 Ok(text) => {
                     self.last_signature = self.pending_signature.take();
@@ -576,10 +597,6 @@ impl MhxyApp {
                 if task_status.is_none() {
                     state.location = location;
                     state.map_index = map_index;
-                    state.captured_at = Some(Instant::now());
-                    state.status = None;
-                } else {
-                    state.status = task_status;
                 }
             }
         }
@@ -842,7 +859,13 @@ impl MhxyApp {
                     {
                         self.show_region_window = !self.show_region_window;
                         if self.show_region_window {
+                            // 把取点窗口放在主窗口右侧，避免遮住左侧设置栅。
+                            self.region_window_pos =
+                                Some(region_window_position(ui.ctx(), REGION_WINDOW_SIZE));
                             self.capture_preview_once();
+                        } else {
+                            self.region_window_pos = None;
+                            self.release_preview();
                         }
                     }
                 });
@@ -984,6 +1007,15 @@ impl MhxyApp {
                             self.persist();
                         }
                     });
+                    let mut on_top = self.config.on_top;
+                    if ui
+                        .checkbox(&mut on_top, "窗口始终置顶")
+                        .on_hover_text("让本窗口始终显示在游戏窗口前面")
+                        .changed()
+                    {
+                        let ctx = ui.ctx().clone();
+                        self.set_on_top(on_top, &ctx);
+                    }
                 });
                 self.log_ui(ui);
                 ui.add_space(4.0);
@@ -991,6 +1023,8 @@ impl MhxyApp {
     }
 
     fn log_ui(&mut self, ui: &mut egui::Ui) {
+        // 日志高度跟随窗口高度，窗口变高时能显示更多记录。
+        let log_height = log_panel_height(ui.ctx().content_rect().height());
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("日志").strong());
             let mut level = self.config.log_level.clone();
@@ -1022,7 +1056,7 @@ impl MhxyApp {
                     egui::ScrollArea::vertical()
                         .id_salt("log_scroll")
                         .stick_to_bottom(true)
-                        .max_height(LOG_PANEL_HEIGHT)
+                        .max_height(log_height)
                         .auto_shrink([false, true])
                         .show_rows(ui, 15.0, self.logs.len(), |ui, rows| {
                             for index in rows {
@@ -1048,7 +1082,7 @@ impl MhxyApp {
             ui.label(egui::RichText::new("识别区域预览").strong());
             ui.label(egui::RichText::new("红框=主区域，蓝框=备用区域；点击图片可取点").weak());
         });
-        let Some(image) = self.preview_full.as_ref() else {
+        let Some(image) = self.preview_image.as_ref() else {
             ui.centered_and_justified(|ui| {
                 ui.label(
                     egui::RichText::new("暂无截图\n选择游戏窗口后，点击「更新截图」")
@@ -1136,6 +1170,8 @@ impl MhxyApp {
     fn region_window_ui(&mut self, ui: &mut egui::Ui) {
         if ui.ctx().input(|input| input.viewport().close_requested()) {
             self.show_region_window = false;
+            self.region_window_pos = None;
+            self.release_preview();
         }
         egui::Frame::central_panel(ui.style())
             .inner_margin(16)
@@ -1344,7 +1380,7 @@ impl MhxyApp {
             .unwrap_or_else(|| format!("#{handle}"));
         match capture::capture_task_panel(handle, self.config.task_region, extra) {
             Ok((_panel, full)) => {
-                self.update_preview(&full);
+                self.update_preview(full);
                 self.notice = None;
                 self.log_detail(format!("手动截取截图：{title}"));
                 // 立即刷新一次图色门控状态，方便在取点工具里看命中情况。
@@ -1360,15 +1396,11 @@ impl MhxyApp {
         }
     }
 
+    /// 任务区域只显示地图；地图名称、坐标和识别状态不再单独占一行。
     fn task_panel(&mut self, ui: &mut egui::Ui, task_type: &str) {
-        let (location, map_index, status, captured) = {
+        let (location, map_index) = {
             let state = self.tasks.get(task_type).expect("task state");
-            (
-                state.location.clone(),
-                state.map_index,
-                state.status.clone(),
-                state.captured_at,
-            )
+            (state.location.clone(), state.map_index)
         };
         let accent = if task_type == "抓鬼" {
             theme::JADE
@@ -1377,74 +1409,6 @@ impl MhxyApp {
         };
         theme::card().show(ui, |ui| {
             ui.set_min_size(ui.available_size());
-            // 标题与状态左右排列，始终只占固定一行，防止提示变化推挤地图。
-            let (header, _) =
-                ui.allocate_exact_size(vec2(ui.available_width(), 36.0), Sense::hover());
-            let status_width = (header.width() * 0.40).min(240.0);
-            let status_rect = Rect::from_min_max(
-                pos2(header.right() - status_width, header.top()),
-                header.max,
-            );
-            let title_rect =
-                Rect::from_min_max(header.min, pos2(status_rect.left() - 8.0, header.bottom()));
-            let mut title_ui = ui.new_child(
-                egui::UiBuilder::new()
-                    .max_rect(title_rect)
-                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
-            );
-            title_ui.set_clip_rect(title_rect.intersect(ui.clip_rect()));
-            theme::badge(&mut title_ui, task_type, accent);
-            if let Some(location) = &location {
-                let coords = format!("({}, {})", location.x, location.y);
-                let title = format!(
-                    "{} {}{}",
-                    location.map_name,
-                    coords,
-                    if location.nearby { " · 附近" } else { "" }
-                );
-                if title_ui
-                    .add(
-                        egui::Button::new(
-                            egui::RichText::new(&title)
-                                .size(20.0)
-                                .strong()
-                                .color(accent),
-                        )
-                        .frame(false)
-                        .truncate(),
-                    )
-                    .on_hover_text(format!("{title}\n点击复制地图与坐标"))
-                    .clicked()
-                {
-                    ui.ctx()
-                        .copy_text(format!("{} {}", location.map_name, coords));
-                }
-            }
-            let age = captured.map(|time| format!("{} 秒前更新", time.elapsed().as_secs()));
-            let message = status.as_deref().or(age.as_deref()).unwrap_or("等待识别");
-            let tooltip = match (&status, &age) {
-                (Some(status), Some(age)) => format!("{status}\n{age}"),
-                _ => message.to_string(),
-            };
-            let mut status_ui = ui.new_child(
-                egui::UiBuilder::new()
-                    .max_rect(status_rect)
-                    .layout(egui::Layout::right_to_left(egui::Align::Center)),
-            );
-            status_ui.set_clip_rect(status_rect.intersect(ui.clip_rect()));
-            status_ui
-                .add(
-                    egui::Label::new(egui::RichText::new(message).size(12.0).color(
-                        if status.is_some() {
-                            theme::GOLD
-                        } else {
-                            theme::MUTED
-                        },
-                    ))
-                    .truncate(),
-                )
-                .on_hover_text(tooltip);
-            ui.add_space(2.0);
             match (location, map_index) {
                 (Some(location), Some(index)) => {
                     let definition = self.maps[index].clone();
@@ -1455,7 +1419,7 @@ impl MhxyApp {
                     let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
                     let painter = ui.painter_at(rect);
                     painter.rect_filled(rect, CornerRadius::same(8), theme::INSET);
-                    let center = rect.center() - vec2(0.0, 24.0);
+                    let center = rect.center();
                     painter.circle_stroke(center, 18.0, egui::Stroke::new(1.0, theme::BORDER));
                     painter.circle_stroke(
                         center,
@@ -1469,17 +1433,6 @@ impl MhxyApp {
                     painter.line_segment(
                         [center - vec2(0.0, 25.0), center + vec2(0.0, 25.0)],
                         egui::Stroke::new(1.0, theme::BORDER),
-                    );
-                    painter.text(
-                        center + vec2(0.0, 42.0),
-                        Align2::CENTER_CENTER,
-                        if self.running {
-                            "正在等待任务信息"
-                        } else {
-                            "开始识别后，在这里查看地图"
-                        },
-                        FontId::proportional(14.0),
-                        theme::MUTED,
                     );
                 }
             }
@@ -1497,6 +1450,21 @@ impl eframe::App for MhxyApp {
             }
         } else if (ctx.pixels_per_point() - desired_scale).abs() > 0.001 {
             ctx.set_pixels_per_point(desired_scale);
+        }
+        // 收起侧栏后放宽最小宽度，让窗口可以继续缩小。
+        let desired_min_size = if self.config.sidebar_expanded {
+            MIN_WINDOW_SIZE_EXPANDED
+        } else {
+            MIN_WINDOW_SIZE_COLLAPSED
+        };
+        if self.applied_min_inner_size != Some(desired_min_size) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(desired_min_size));
+            self.applied_min_inner_size = Some(desired_min_size);
+        }
+        // 启动首帧也把置顶状态同步给窗口，避免只依赖创建时的参数。
+        if self.applied_on_top != Some(self.config.on_top) {
+            apply_window_level(&ctx, self.config.on_top);
+            self.applied_on_top = Some(self.config.on_top);
         }
         if self
             .config_dirty_since
@@ -1540,6 +1508,7 @@ impl eframe::App for MhxyApp {
                     .inner_margin(egui::Margin::symmetric(16, 12)),
             )
             .show(ui, |ui| {
+                let narrow = ui.available_width() < 560.0;
                 ui.horizontal(|ui| {
                     if ui
                         .button(if self.config.sidebar_expanded {
@@ -1553,7 +1522,9 @@ impl eframe::App for MhxyApp {
                         self.persist();
                     }
                     ui.heading("梦幻西游");
-                    ui.label(egui::RichText::new("任务坐标辅助").color(theme::MUTED));
+                    if !narrow {
+                        ui.label(egui::RichText::new("任务坐标辅助").color(theme::MUTED));
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
                             .add(theme::primary_button(if self.running {
@@ -1565,8 +1536,20 @@ impl eframe::App for MhxyApp {
                         {
                             self.toggle_running();
                         }
+                        let on_top = self.config.on_top;
+                        if ui
+                            .selectable_label(on_top, "置顶")
+                            .on_hover_text("让本窗口始终显示在游戏窗口前面")
+                            .clicked()
+                        {
+                            self.set_on_top(!on_top, &ctx);
+                        }
                         let (label, color) = self.runtime_status();
-                        theme::status(ui, label, color);
+                        if narrow {
+                            theme::status_dot(ui, label, color);
+                        } else {
+                            theme::status(ui, label, color);
+                        }
                     });
                 });
             });
@@ -1630,11 +1613,13 @@ impl eframe::App for MhxyApp {
                 });
             });
         if self.config.sidebar_expanded {
+            // 侧栏最多占可用宽度的一半减一点，保证右侧地图区域不会被挤压。
+            let max_sidebar = (ui.available_width() - 360.0).clamp(240.0, 400.0);
             egui::Panel::left("controls")
                 .resizable(true)
-                .default_size(320.0)
-                .min_size(290.0)
-                .max_size(400.0)
+                .default_size(320.0f32.min(max_sidebar).max(240.0))
+                .min_size(240.0f32.min(max_sidebar))
+                .max_size(max_sidebar)
                 .frame(egui::Frame::new().fill(theme::BACKGROUND).inner_margin(12))
                 .show(ui, |ui| self.controls(ui));
         }
@@ -1671,11 +1656,18 @@ impl eframe::App for MhxyApp {
                     self.task_panel(&mut child, task_type);
                 }
             });
+        if !self.show_region_window {
+            self.release_preview();
+        }
         if self.show_region_window {
-            let builder = egui::ViewportBuilder::default()
+            let mut builder = egui::ViewportBuilder::default()
                 .with_title("识别区域")
-                .with_inner_size([960.0, 760.0])
+                .with_inner_size(REGION_WINDOW_SIZE)
                 .with_min_inner_size([660.0, 480.0]);
+            // 只在建立窗口时定位，之后用户拖动不会被抢回。
+            if let Some(position) = self.region_window_pos {
+                builder = builder.with_position(position);
+            }
             ctx.show_viewport_immediate(
                 egui::ViewportId::from_hash_of("region_window"),
                 builder,
@@ -1735,12 +1727,46 @@ fn region_row(ui: &mut egui::Ui, label: &str, region: &mut crate::core::TaskRegi
     changed
 }
 
+/// 取点窗口的默认尺寸。
+const REGION_WINDOW_SIZE: Vec2 = Vec2::new(900.0, 700.0);
+
+/// 取点窗口放在主窗口右侧；空间不足时贴到屏幕右边缘，保证不遮住左侧设置栅。
+fn region_window_position(ctx: &egui::Context, size: Vec2) -> egui::Pos2 {
+    const GAP: f32 = 8.0;
+    ctx.input(|input| {
+        let viewport = input.viewport();
+        let monitor = viewport
+            .monitor_size
+            .unwrap_or_else(|| Vec2::new(1920.0, 1080.0));
+        let main = viewport.outer_rect;
+        let main_right = main.map(|rect| rect.max.x).unwrap_or(0.0);
+        let main_top = main.map(|rect| rect.min.y).unwrap_or(0.0);
+        let x = (main_right + GAP).min((monitor.x - size.x).max(0.0));
+        let y = main_top.clamp(0.0, (monitor.y - size.y).max(0.0));
+        egui::pos2(x, y)
+    })
+}
+
 fn fit_rect(outer: Rect, size: Vec2) -> Rect {
     if size.x <= 0.0 || size.y <= 0.0 {
         return outer;
     }
     let scale = (outer.width() / size.x).min(outer.height() / size.y);
     Rect::from_center_size(outer.center(), size * scale)
+}
+
+/// 应用窗口置顶状态。
+fn apply_window_level(ctx: &egui::Context, on: bool) {
+    ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(if on {
+        egui::WindowLevel::AlwaysOnTop
+    } else {
+        egui::WindowLevel::Normal
+    }));
+}
+
+/// 日志框高度随窗口高度线性变化，并限制在最小值和最大值之间。
+fn log_panel_height(content_height: f32) -> f32 {
+    (content_height * LOG_PANEL_HEIGHT_RATIO).clamp(LOG_PANEL_MIN_HEIGHT, 620.0)
 }
 
 fn to_color_image(image: &image::RgbImage) -> egui::ColorImage {
@@ -1750,12 +1776,12 @@ fn to_color_image(image: &image::RgbImage) -> egui::ColorImage {
     )
 }
 
-fn sample_image(image: &egui::ColorImage, x: i32, y: i32) -> Option<[u8; 3]> {
-    if x < 0 || y < 0 || x as usize >= image.width() || y as usize >= image.height() {
+fn sample_image(image: &image::RgbImage, x: i32, y: i32) -> Option<[u8; 3]> {
+    if x < 0 || y < 0 || x as u32 >= image.width() || y as u32 >= image.height() {
         return None;
     }
-    let pixel = image.pixels[y as usize * image.width() + x as usize];
-    Some([pixel.r(), pixel.g(), pixel.b()])
+    let pixel = image.get_pixel(x as u32, y as u32);
+    Some([pixel[0], pixel[1], pixel[2]])
 }
 
 fn hash_image(image: &image::RgbImage) -> u64 {
@@ -1837,26 +1863,44 @@ mod tests {
     #[test]
     fn preview_updates_reuse_the_existing_texture() {
         let mut app = app();
-        app.update_preview(&image::RgbImage::from_pixel(
-            100,
-            100,
-            image::Rgb([0, 0, 0]),
-        ));
+        app.show_region_window = true;
+        app.update_preview(image::RgbImage::from_pixel(100, 100, image::Rgb([0, 0, 0])));
         let texture_id = app.preview_texture.as_ref().unwrap().id();
-        app.update_preview(&image::RgbImage::from_pixel(
+        app.update_preview(image::RgbImage::from_pixel(
             120,
             100,
             image::Rgb([255, 0, 0]),
         ));
         assert_eq!(app.preview_texture.as_ref().unwrap().id(), texture_id);
         assert_eq!(
-            sample_image(app.preview_full.as_ref().unwrap(), 119, 99),
+            sample_image(app.preview_image.as_ref().unwrap(), 119, 99),
             Some([255, 0, 0])
         );
     }
 
     #[test]
-    fn task_status_changes_do_not_move_or_resize_the_map() {
+    fn preview_is_released_when_region_window_is_closed() {
+        let mut app = app();
+        app.show_region_window = true;
+        app.update_preview(image::RgbImage::from_pixel(64, 64, image::Rgb([1, 2, 3])));
+        assert!(app.preview_image.is_some());
+        assert!(app.preview_texture.is_some());
+        assert_eq!(app.client_size, Some((64, 64)));
+
+        app.show_region_window = false;
+        app.release_preview();
+        assert!(app.preview_image.is_none());
+        assert!(app.preview_texture.is_none());
+        assert_eq!(app.client_size, Some((64, 64)), "客户区尺寸仍用于图色取点");
+
+        app.update_preview(image::RgbImage::from_pixel(80, 60, image::Rgb([4, 5, 6])));
+        assert!(app.preview_image.is_none());
+        assert!(app.preview_texture.is_none());
+        assert_eq!(app.client_size, Some((80, 60)));
+    }
+
+    #[test]
+    fn failed_recognition_keeps_previous_map_and_bounds() {
         fn map_bounds(shape: &egui::Shape, texture: egui::TextureId) -> Option<Rect> {
             match shape {
                 egui::Shape::Mesh(mesh) if mesh.texture_id == texture => Some(mesh.calc_bounds()),
@@ -1874,22 +1918,14 @@ mod tests {
         };
         for width in [700.0, 320.0] {
             let mut expected = None;
-            for message in [
-                None,
-                Some("等待识别"),
-                Some("本轮未识别到任务"),
-                None,
-                Some("本轮识别失败，保留上次坐标"),
-                None,
-            ] {
-                app.apply_ocr(&success);
-                if message == Some("本轮未识别到任务") {
+            for recognized in [true, false, true, false] {
+                if recognized {
+                    app.apply_ocr(&success);
+                } else {
                     app.apply_ocr(&OcrText {
                         text: String::new(),
                         elapsed_secs: 0.1,
                     });
-                } else {
-                    app.tasks.get_mut("抓鬼").unwrap().status = message.map(str::to_string);
                 }
                 let mut output = ctx.run_ui(
                     egui::RawInput {
@@ -1904,9 +1940,12 @@ mod tests {
                     .iter()
                     .find_map(|shape| map_bounds(&shape.shape, texture))
                     .unwrap();
-                assert!(app.tasks["抓鬼"].location.is_some());
+                assert!(
+                    app.tasks["抓鬼"].location.is_some(),
+                    "未识别到任务时应保留上次坐标"
+                );
                 if let Some(expected) = expected {
-                    assert_eq!(bounds, expected, "宽度：{width}，状态：{message:?}");
+                    assert_eq!(bounds, expected, "宽度：{width}，本轮识别：{recognized}");
                 }
                 expected = Some(bounds);
                 output.textures_delta.clear();
@@ -1915,7 +1954,89 @@ mod tests {
     }
 
     #[test]
+    fn log_panel_height_grows_with_window() {
+        assert_eq!(log_panel_height(200.0), LOG_PANEL_MIN_HEIGHT);
+        assert!(log_panel_height(900.0) > log_panel_height(700.0));
+        assert_eq!(log_panel_height(5000.0), 620.0);
+    }
+
+    #[test]
+    fn window_controls_send_viewport_commands() {
+        let mut app = app();
+        let ctx = app.ctx.clone();
+        let mut frame = eframe::Frame::_new_kittest();
+        let input = || egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1120.0, 800.0))),
+            ..Default::default()
+        };
+
+        app.config.on_top = false;
+        app.set_on_top(true, &ctx);
+        assert!(app.config.on_top);
+        assert!(app.config_dirty_since.is_some(), "切换置顶后应触发配置保存");
+        let mut output = ctx.run_ui(input(), |ui| app.ui(ui, &mut frame));
+        assert!(output.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .contains(&egui::ViewportCommand::WindowLevel(
+                egui::WindowLevel::AlwaysOnTop
+            )));
+        output.textures_delta.clear();
+
+        app.config.on_top = true;
+        app.set_on_top(false, &ctx);
+        let mut output = ctx.run_ui(input(), |ui| app.ui(ui, &mut frame));
+        assert!(output.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .contains(&egui::ViewportCommand::WindowLevel(
+                egui::WindowLevel::Normal
+            )));
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn collapsing_sidebar_lowers_minimum_window_size() {
+        let mut app = app();
+        let ctx = app.ctx.clone();
+        let mut frame = eframe::Frame::_new_kittest();
+        let input = || egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1120.0, 800.0))),
+            ..Default::default()
+        };
+        let min_size = |output: &egui::FullOutput| {
+            output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .iter()
+                .find_map(|command| match command {
+                    egui::ViewportCommand::MinInnerSize(size) => Some(*size),
+                    _ => None,
+                })
+        };
+
+        app.config.sidebar_expanded = true;
+        let mut output = ctx.run_ui(input(), |ui| app.ui(ui, &mut frame));
+        assert_eq!(min_size(&output), Some(MIN_WINDOW_SIZE_EXPANDED));
+        output.textures_delta.clear();
+
+        app.config.sidebar_expanded = false;
+        let mut output = ctx.run_ui(input(), |ui| app.ui(ui, &mut frame));
+        let collapsed = min_size(&output).expect("收起侧栏后应放宽最小尺寸");
+        assert_eq!(collapsed, MIN_WINDOW_SIZE_COLLAPSED);
+        assert!(collapsed.x < MIN_WINDOW_SIZE_EXPANDED.x);
+        output.textures_delta.clear();
+    }
+
+    #[test]
     fn renders_local_remote_and_map_layouts_at_supported_sizes() {
+        /// 找到地图纹理的绘制区域。
+        fn map_bounds(shape: &egui::Shape, texture: egui::TextureId) -> Option<Rect> {
+            match shape {
+                egui::Shape::Mesh(mesh) if mesh.texture_id == texture => Some(mesh.calc_bounds()),
+                egui::Shape::Vec(shapes) => {
+                    shapes.iter().find_map(|shape| map_bounds(shape, texture))
+                }
+                _ => None,
+            }
+        }
         let mut app = app();
         let ctx = app.ctx.clone();
         let mut frame = eframe::Frame::_new_kittest();
@@ -1946,6 +2067,21 @@ mod tests {
                 .shapes
                 .iter()
                 .all(|shape| shape.clip_rect.is_finite()));
+            if sidebar {
+                // 地图必须在侧栏右侧绘制，不能被侧栏区域覆盖。
+                for texture in app.map_textures.values().map(|handle| handle.id()) {
+                    if let Some(bounds) = output
+                        .shapes
+                        .iter()
+                        .find_map(|shape| map_bounds(&shape.shape, texture))
+                    {
+                        assert!(
+                            bounds.min.x >= 240.0,
+                            "地图绘到了侧栏区域：{bounds:?}（窗口 {size:?}）"
+                        );
+                    }
+                }
+            }
             output.textures_delta.clear();
         }
         assert_eq!(app.map_textures.len(), 2);

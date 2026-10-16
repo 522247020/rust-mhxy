@@ -4217,6 +4217,7 @@ dependencies = [
  "eframe",
  "egui",
  "image",
+ "memmap2",
  "oar-ocr",
  "serde",
  "serde_json",
