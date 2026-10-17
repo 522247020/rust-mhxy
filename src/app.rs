@@ -2,9 +2,8 @@
 use crate::capture::{self, WindowInfo};
 use crate::config::{assets_dir, Config};
 use crate::core::{
-    clamp_to_map, coordinate_in_map, find_map_definition, high_chance_areas, map_area,
-    map_coordinate, map_point, map_rect, parse_tasks, MapDefinition, TaskLocation,
-    HIGH_CHANCE_SIZE, MAP_COORDINATE_TOLERANCE,
+    clamp_to_map, coordinate_in_map, find_map_definition, map_area, map_coordinate, map_point,
+    parse_tasks, MapDefinition, TaskFilter, TaskLocation, MAP_COORDINATE_TOLERANCE,
 };
 use crate::gate::{self, ColorPoint, GateMode};
 use crate::ocr::{self, LocalWorker, OcrEvent, OcrText};
@@ -16,7 +15,7 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const TASK_ORDER: [&str; 2] = ["抓鬼", "鬼王"];
+const TASK_ORDER: [&str; 3] = ["抓鬼", "鬼王", "通用"];
 /// 侧栏日志框的最大高度。
 /// 侧栏日志框的最小高度；实际高度随窗口高度变化。
 const LOG_PANEL_MIN_HEIGHT: f32 = 140.0;
@@ -60,6 +59,9 @@ pub struct MhxyApp {
     testing_remote: bool,
     applied_min_inner_size: Option<Vec2>,
     applied_on_top: Option<bool>,
+    /// 取点窗口自己的置顶状态。子视口默认不会被父窗口的置顶带上，
+    /// 不同步的话主窗口置顶时会把取点窗口整个压住。
+    applied_region_on_top: Option<bool>,
     remote_feedback: Option<Result<String, String>>,
     notice: Option<String>,
     last_ocr_secs: Option<f64>,
@@ -129,6 +131,7 @@ impl MhxyApp {
             testing_remote: false,
             applied_min_inner_size: None,
             applied_on_top: None,
+            applied_region_on_top: None,
             remote_feedback: None,
             notice: None,
             last_ocr_secs: None,
@@ -267,20 +270,6 @@ impl MhxyApp {
         self.persist();
     }
 
-    fn runtime_status(&self) -> (&str, Color32) {
-        if self.busy {
-            ("正在识别", theme::JADE)
-        } else if !self.running {
-            ("已暂停", theme::MUTED)
-        } else if self.selected_handle.is_none() {
-            ("等待游戏窗口", theme::GOLD)
-        } else if self.config.color_gate_enabled && !self.gate_active {
-            ("图色未命中 · 等待任务", theme::GOLD)
-        } else {
-            ("自动识别中", theme::JADE)
-        }
-    }
-
     /// 扫描游戏窗口并自动选中一个（优先梦幻西游，其次任意可用窗口）。
     fn refresh_windows(&mut self, log_always: bool) {
         match capture::list_windows() {
@@ -317,7 +306,20 @@ impl MhxyApp {
     }
 
     fn task_active(&self, task_type: &str) -> bool {
-        task_type != "鬼王" || self.config.ghost_king_enabled
+        match task_type {
+            "抓鬼" => self.config.zhuagui_enabled,
+            "鬼王" => self.config.ghost_king_enabled,
+            "通用" => self.config.generic_enabled,
+            _ => true,
+        }
+    }
+
+    fn task_filter(&self) -> TaskFilter {
+        TaskFilter {
+            zhuagui: self.config.zhuagui_enabled,
+            ghost_king: self.config.ghost_king_enabled,
+            generic: self.config.generic_enabled,
+        }
     }
 
     /// 图色门控：抓一小块屏幕比对点位颜色，判断当前是否有任务。
@@ -541,7 +543,7 @@ impl MhxyApp {
     }
 
     fn apply_ocr(&mut self, ocr_text: &OcrText) {
-        let locations = parse_tasks(&ocr_text.text, &self.maps, self.config.ghost_king_enabled);
+        let locations = parse_tasks(&ocr_text.text, &self.maps, self.task_filter());
         for task_type in TASK_ORDER {
             if !self.task_active(task_type) {
                 continue;
@@ -718,41 +720,6 @@ impl MhxyApp {
             );
         }
 
-        if self.config.high_chance {
-            for (chance_x, chance_y) in high_chance_areas(
-                &definition.name,
-                location.x as f32,
-                location.y as f32,
-                HIGH_CHANCE_SIZE,
-            ) {
-                let (left, top, right, bottom) = map_rect(
-                    definition,
-                    chance_x,
-                    chance_y,
-                    chance_x + HIGH_CHANCE_SIZE,
-                    chance_y + HIGH_CHANCE_SIZE,
-                    texture_size.x,
-                    texture_size.y,
-                );
-                let chance = Rect::from_min_max(to_screen((left, top)), to_screen((right, bottom)))
-                    .intersect(image_rect);
-                if chance.width() <= 0.0 || chance.height() <= 0.0 {
-                    continue;
-                }
-                painter.rect_filled(
-                    chance,
-                    CornerRadius::ZERO,
-                    Color32::from_rgba_unmultiplied(255, 0, 0, 112),
-                );
-                painter.rect_stroke(
-                    chance,
-                    CornerRadius::ZERO,
-                    egui::Stroke::new(2.0, Color32::from_rgba_unmultiplied(255, 0, 0, 180)),
-                    egui::StrokeKind::Inside,
-                );
-            }
-        }
-
         if let Some(point) = map_point(definition, point_x, point_y, texture_size.x, texture_size.y)
         {
             let center = to_screen(point);
@@ -807,18 +774,30 @@ impl MhxyApp {
                         .unwrap_or_else(|| "未找到游戏窗口".into());
                     let mut selected = self.selected_handle;
                     ui.horizontal(|ui| {
-                        egui::ComboBox::from_id_salt("window")
-                            .selected_text(current)
-                            .width((ui.available_width() - 66.0).max(100.0))
-                            .show_ui(ui, |ui| {
-                                for window in &self.windows {
-                                    ui.selectable_value(
-                                        &mut selected,
-                                        Some(window.handle),
-                                        &window.title,
-                                    );
-                                }
-                            });
+                        // ComboBox::width() 只是「最小宽度」：egui 用父 Ui 的 available_width
+                        // 作为文本换行宽度，默认 Extend 模式下选中项文本多长它就有多宽。
+                        // 游戏窗口标题很长时，它会撑破卡片右缘并把「刷新」按钮挤出可视区，
+                        // 所以这里用一个限宽的子 Ui 把可用宽度钉死，并让选中项文本截断。
+                        let combo_width = (ui.available_width() - 66.0).max(100.0);
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(combo_width, ui.spacing().interact_size.y),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                egui::ComboBox::from_id_salt("window")
+                                    .selected_text(current)
+                                    .width(combo_width)
+                                    .truncate()
+                                    .show_ui(ui, |ui| {
+                                        for window in &self.windows {
+                                            ui.selectable_value(
+                                                &mut selected,
+                                                Some(window.handle),
+                                                &window.title,
+                                            );
+                                        }
+                                    });
+                            },
+                        );
                         if ui.button("刷新").clicked() {
                             self.refresh_windows(true);
                             selected = self.selected_handle;
@@ -859,12 +838,15 @@ impl MhxyApp {
                     {
                         self.show_region_window = !self.show_region_window;
                         if self.show_region_window {
-                            // 把取点窗口放在主窗口右侧，避免遮住左侧设置栅。
+                            // 取点窗口优先放在主窗口右侧；右侧不够就放左侧，
+                            // 两边都放不下才贴屏幕右缘（此时靠置顶层级保证不被主窗口压住）。
                             self.region_window_pos =
                                 Some(region_window_position(ui.ctx(), REGION_WINDOW_SIZE));
+                            self.applied_region_on_top = None;
                             self.capture_preview_once();
                         } else {
                             self.region_window_pos = None;
+                            self.applied_region_on_top = None;
                             self.release_preview();
                         }
                     }
@@ -962,6 +944,17 @@ impl MhxyApp {
                     }
                 });
                 theme::section(ui, "任务显示", |ui| {
+                    // 抓鬼 / 鬼王 按任务名解析；通用任务不看任务类型，两边互斥。
+                    if ui
+                        .checkbox(&mut self.config.zhuagui_enabled, "识别抓鬼任务")
+                        .changed()
+                    {
+                        if self.config.zhuagui_enabled {
+                            self.config.generic_enabled = false;
+                        }
+                        self.invalidate_scan();
+                        self.persist();
+                    }
                     if ui
                         .checkbox(&mut self.config.ghost_king_enabled, "同时识别鬼王任务")
                         .changed()
@@ -970,9 +963,24 @@ impl MhxyApp {
                         self.persist();
                     }
                     if ui
-                        .checkbox(&mut self.config.high_chance, "叠加高概率区域（50 × 50）")
+                        .checkbox(&mut self.config.generic_enabled, "通用任务（只看地图名和坐标）")
+                        .on_hover_text(
+                            "不识别任务类型，只按地图名和坐标标注；坐标不一定在第一个截图区域里，勾选后会自动启用备用区域",
+                        )
                         .changed()
                     {
+                        if self.config.generic_enabled {
+                            // 通用任务与抓鬼/鬼王互斥；坐标可能落在第二块截图里，顺手打开备用区域。
+                            self.config.zhuagui_enabled = false;
+                            self.config.ghost_king_enabled = false;
+                            if !self.config.extra_region_enabled {
+                                self.config.extra_region_enabled = true;
+                            }
+                        } else if !self.config.zhuagui_enabled && !self.config.ghost_king_enabled {
+                            // 关掉通用任务后一个任务都不剩，就把抓鬼打开，免得没有面板。
+                            self.config.zhuagui_enabled = true;
+                        }
+                        self.invalidate_scan();
                         self.persist();
                     }
                     let previous = self.config.horizontal_layout;
@@ -983,38 +991,6 @@ impl MhxyApp {
                     });
                     if previous != self.config.horizontal_layout {
                         self.persist();
-                    }
-                });
-                theme::section(ui, "界面", |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("缩放");
-                        let mut follow_system = self.config.window_scale == 0.0;
-                        if ui.checkbox(&mut follow_system, "跟随系统").changed() {
-                            self.config.window_scale = if follow_system { 0.0 } else { 1.0 };
-                            self.persist();
-                        }
-                        if !follow_system
-                            && ui
-                                .add(
-                                    egui::DragValue::new(&mut self.config.window_scale)
-                                        .speed(0.05)
-                                        .range(0.75..=2.5)
-                                        .fixed_decimals(2)
-                                        .suffix(" ×"),
-                                )
-                                .changed()
-                        {
-                            self.persist();
-                        }
-                    });
-                    let mut on_top = self.config.on_top;
-                    if ui
-                        .checkbox(&mut on_top, "窗口始终置顶")
-                        .on_hover_text("让本窗口始终显示在游戏窗口前面")
-                        .changed()
-                    {
-                        let ctx = ui.ctx().clone();
-                        self.set_on_top(on_top, &ctx);
                     }
                 });
                 self.log_ui(ui);
@@ -1443,14 +1419,6 @@ impl MhxyApp {
 impl eframe::App for MhxyApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        let desired_scale = self.config.window_scale;
-        if desired_scale == 0.0 {
-            if (ctx.zoom_factor() - 1.0).abs() > 0.001 {
-                ctx.set_zoom_factor(1.0);
-            }
-        } else if (ctx.pixels_per_point() - desired_scale).abs() > 0.001 {
-            ctx.set_pixels_per_point(desired_scale);
-        }
         // 收起侧栏后放宽最小宽度，让窗口可以继续缩小。
         let desired_min_size = if self.config.sidebar_expanded {
             MIN_WINDOW_SIZE_EXPANDED
@@ -1543,12 +1511,6 @@ impl eframe::App for MhxyApp {
                             .clicked()
                         {
                             self.set_on_top(!on_top, &ctx);
-                        }
-                        let (label, color) = self.runtime_status();
-                        if narrow {
-                            theme::status_dot(ui, label, color);
-                        } else {
-                            theme::status(ui, label, color);
                         }
                     });
                 });
@@ -1660,10 +1622,15 @@ impl eframe::App for MhxyApp {
             self.release_preview();
         }
         if self.show_region_window {
+            let on_top = self.config.on_top;
             let mut builder = egui::ViewportBuilder::default()
                 .with_title("识别区域")
                 .with_inner_size(REGION_WINDOW_SIZE)
                 .with_min_inner_size([660.0, 480.0]);
+            if on_top {
+                // 主窗口置顶时取点窗口也必须置顶，否则会被主窗口整个盖住。
+                builder = builder.with_always_on_top();
+            }
             // 只在建立窗口时定位，之后用户拖动不会被抢回。
             if let Some(position) = self.region_window_pos {
                 builder = builder.with_position(position);
@@ -1673,10 +1640,22 @@ impl eframe::App for MhxyApp {
                 builder,
                 |ui, _class| {
                     if ui.ctx().viewport_id() == egui::ViewportId::ROOT {
+                        // 独立视口还没建好，先画在主窗口里（只出现在第一帧）。
                         egui::Window::new("识别区域")
                             .default_size([800.0, 640.0])
                             .show(ui.ctx(), |ui| self.region_window_ui(ui));
                     } else {
+                        // 跟随「置顶」开关同步取点窗口的层级，开着置顶时它才不会被主窗口压住。
+                        if self.applied_region_on_top != Some(on_top) {
+                            let level = if on_top {
+                                egui::WindowLevel::AlwaysOnTop
+                            } else {
+                                egui::WindowLevel::Normal
+                            };
+                            ui.ctx()
+                                .send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
+                            self.applied_region_on_top = Some(on_top);
+                        }
                         self.region_window_ui(ui);
                     }
                 },
@@ -1730,21 +1709,41 @@ fn region_row(ui: &mut egui::Ui, label: &str, region: &mut crate::core::TaskRegi
 /// 取点窗口的默认尺寸。
 const REGION_WINDOW_SIZE: Vec2 = Vec2::new(900.0, 700.0);
 
-/// 取点窗口放在主窗口右侧；空间不足时贴到屏幕右边缘，保证不遮住左侧设置栅。
+/// 取点窗口优先放在主窗口右侧，右侧空间不够就改放左侧；两边都放不下时才贴屏幕右缘，
+/// 此时不可避免会和主窗口重叠，靠窗口层级（置顶）保证它显示在主窗口之上。
 fn region_window_position(ctx: &egui::Context, size: Vec2) -> egui::Pos2 {
-    const GAP: f32 = 8.0;
     ctx.input(|input| {
         let viewport = input.viewport();
         let monitor = viewport
             .monitor_size
             .unwrap_or_else(|| Vec2::new(1920.0, 1080.0));
-        let main = viewport.outer_rect;
-        let main_right = main.map(|rect| rect.max.x).unwrap_or(0.0);
-        let main_top = main.map(|rect| rect.min.y).unwrap_or(0.0);
-        let x = (main_right + GAP).min((monitor.x - size.x).max(0.0));
-        let y = main_top.clamp(0.0, (monitor.y - size.y).max(0.0));
-        egui::pos2(x, y)
+        match viewport.outer_rect {
+            Some(main) => place_region_window(main, monitor, size),
+            // 拿不到主窗口位置时退化成屏幕右上角，至少保证整窗可见。
+            None => egui::pos2((monitor.x - size.x).max(0.0), 0.0),
+        }
     })
+}
+
+/// [`region_window_position`] 的纯计算部分：主窗口外框 + 显示器尺寸 → 取点窗口外框左上角。
+fn place_region_window(main: Rect, monitor: Vec2, size: Vec2) -> egui::Pos2 {
+    const GAP: f32 = 8.0;
+    // with_position 给的是窗口外框左上角，多留一个标题栏高度，免得下沿出屏。
+    const TITLE_BAR: f32 = 32.0;
+    let outer = size + Vec2::new(0.0, TITLE_BAR);
+    let max_x = (monitor.x - outer.x).max(0.0);
+    let max_y = (monitor.y - outer.y).max(0.0);
+    let right = main.max.x + GAP;
+    let left = main.min.x - GAP - outer.x;
+    let x = if right <= max_x {
+        right
+    } else if left >= 0.0 {
+        left
+    } else {
+        max_x
+    };
+    let y = main.min.y.clamp(0.0, max_y);
+    egui::pos2(x, y)
 }
 
 fn fit_rect(outer: Rect, size: Vec2) -> Rect {
@@ -1958,6 +1957,100 @@ mod tests {
         assert_eq!(log_panel_height(200.0), LOG_PANEL_MIN_HEIGHT);
         assert!(log_panel_height(900.0) > log_panel_height(700.0));
         assert_eq!(log_panel_height(5000.0), 620.0);
+    }
+
+    #[test]
+    fn region_window_stays_on_screen_and_prefers_the_free_side() {
+        let size = vec2(900.0, 700.0);
+        let monitor = vec2(1920.0, 1080.0);
+
+        // 主窗口靠左、右侧放得下：贴主窗口右缘。
+        let left_half = Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 800.0));
+        assert_eq!(
+            place_region_window(left_half, monitor, size),
+            pos2(908.0, 0.0)
+        );
+
+        // 主窗口靠右、右侧放不下但左侧放得下：改放主窗口左侧，两边都不重叠。
+        let right_half = Rect::from_min_size(pos2(1000.0, 0.0), vec2(900.0, 800.0));
+        assert_eq!(
+            place_region_window(right_half, monitor, size),
+            pos2(92.0, 0.0)
+        );
+
+        // 两侧都放不下（默认窗口尺寸 + 1080p 正是这种情况）：贴屏幕右缘，整窗仍在屏内。
+        let wide = Rect::from_min_size(pos2(0.0, 0.0), vec2(1120.0, 800.0));
+        assert_eq!(place_region_window(wide, monitor, size), pos2(1020.0, 0.0));
+
+        // 主窗口贴近屏幕下沿时整体上移，底边不越出屏幕（算上了标题栏高度）。
+        let low = Rect::from_min_size(pos2(0.0, 900.0), vec2(1120.0, 180.0));
+        assert_eq!(place_region_window(low, monitor, size), pos2(1020.0, 348.0));
+    }
+
+    #[test]
+    fn generic_task_panel_follows_config() {
+        let mut app = app();
+        assert!(app.task_active("抓鬼"), "抓鬼默认开启");
+        assert!(!app.task_active("通用"), "默认不显示通用任务面板");
+        app.config.generic_enabled = true;
+        assert!(app.task_active("通用"), "勾选后应显示通用任务面板");
+        assert_eq!(TASK_ORDER, ["抓鬼", "鬼王", "通用"]);
+
+        // 通用任务与抓鬼互斥：切到通用后抓鬼不再显示。
+        app.config.zhuagui_enabled = false;
+        assert!(!app.task_active("抓鬼"));
+        assert!(app.task_active("通用"));
+    }
+
+    #[test]
+    fn long_window_titles_do_not_push_sidebar_controls_out_of_the_card() {
+        /// 在绘制出来的图元里按文本找控件的实际位置。
+        fn text_bounds(shapes: &[egui::epaint::ClippedShape], needle: &str) -> Option<Rect> {
+            fn walk(shape: &egui::Shape, needle: &str) -> Option<Rect> {
+                match shape {
+                    egui::Shape::Text(text) if text.galley.text().contains(needle) => {
+                        Some(text.visual_bounding_rect())
+                    }
+                    egui::Shape::Vec(shapes) => shapes.iter().find_map(|shape| walk(shape, needle)),
+                    _ => None,
+                }
+            }
+            shapes
+                .iter()
+                .find_map(|clipped| walk(&clipped.shape, needle))
+        }
+
+        let mut app = app();
+        let ctx = app.ctx.clone();
+        let mut frame = eframe::Frame::_new_kittest();
+        app.config.sidebar_expanded = true;
+        app.selected_handle = Some(7);
+        app.windows = vec![WindowInfo {
+            handle: 7,
+            title: "梦幻西游 ONLINE - (山东1区[东海崂山]) - 守^一座空城[41] - 再补一段很长的标题"
+                .into(),
+        }];
+
+        // 侧栏展开时的最小窗口：此时侧栏取到上限 400，最容易挤掉右侧控件。
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(760.0, 540.0))),
+                ..Default::default()
+            },
+            |ui| app.ui(ui, &mut frame),
+        );
+        output.textures_delta.clear();
+
+        // ComboBox::width() 只是最小宽度，长标题曾把「刷新」整个挤出卡片。
+        // 注意：被挤出侧栏的控件会被 egui 按 clip_rect 剔除，所以「找不到」也算失败。
+        for control in ["刷新", "设置识别区域"] {
+            let bounds = text_bounds(&output.shapes, control)
+                .unwrap_or_else(|| panic!("「{control}」没有绘制在侧栏可见区域内"));
+            assert!(
+                bounds.max.x <= 400.0,
+                "「{control}」超出了侧栏右缘：{bounds:?}"
+            );
+        }
     }
 
     #[test]

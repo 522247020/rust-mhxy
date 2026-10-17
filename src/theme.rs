@@ -80,21 +80,6 @@ pub fn section(ui: &mut egui::Ui, title: &str, content: impl FnOnce(&mut egui::U
     });
 }
 
-pub fn status(ui: &mut egui::Ui, text: &str, color: Color32) {
-    ui.horizontal(|ui| {
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
-        ui.painter().circle_filled(rect.center(), 3.0, color);
-        ui.label(RichText::new(text).size(12.0).color(color));
-    });
-}
-
-/// 窄窗口下只显示状态圆点，悬停查看文字。
-pub fn status_dot(ui: &mut egui::Ui, text: &str, color: Color32) {
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
-    ui.painter().circle_filled(rect.center(), 4.0, color);
-    response.on_hover_text(text);
-}
-
 pub fn primary_button(text: &str) -> egui::Button<'_> {
     egui::Button::new(RichText::new(text).color(INSET).strong())
         .fill(JADE)

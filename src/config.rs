@@ -18,8 +18,9 @@ pub struct Config {
     pub api_format: String,
     pub api_url: String,
     pub api_token: String,
+    pub zhuagui_enabled: bool,
     pub ghost_king_enabled: bool,
-    pub high_chance: bool,
+    pub generic_enabled: bool,
     pub horizontal_layout: bool,
     pub sidebar_expanded: bool,
     pub log_level: String,
@@ -28,7 +29,6 @@ pub struct Config {
     pub color_gate_mode: String,
     pub color_gate_tolerance: u8,
     pub color_gate_points: Vec<ColorPoint>,
-    pub window_scale: f32,
     pub on_top: bool,
 }
 
@@ -43,8 +43,9 @@ impl Default for Config {
             api_format: "multipart".into(),
             api_url: String::new(),
             api_token: String::new(),
+            zhuagui_enabled: true,
             ghost_king_enabled: true,
-            high_chance: false,
+            generic_enabled: false,
             horizontal_layout: false,
             sidebar_expanded: true,
             log_level: "simple".into(),
@@ -53,7 +54,6 @@ impl Default for Config {
             color_gate_mode: "all".into(),
             color_gate_tolerance: 12,
             color_gate_points: Vec::new(),
-            window_scale: 1.0,
             on_top: true,
         }
     }
@@ -90,8 +90,14 @@ impl Config {
         };
         config.api_url = get_string(map, "api/url", "");
         config.api_token = get_string(map, "api/token", "");
+        config.zhuagui_enabled = get_bool(map, "task/option/抓鬼", true);
         config.ghost_king_enabled = get_bool(map, "task/option/鬼王", true);
-        config.high_chance = get_bool(map, "task/high_chance", false);
+        // 通用任务原来的键是 task/option/降妖伏魔，读旧配置时兼容一下。
+        config.generic_enabled = get_bool(
+            map,
+            "task/option/通用",
+            get_bool(map, "task/option/降妖伏魔", false),
+        );
         config.horizontal_layout = get_bool(map, "task/horizontal_layout", false);
         config.sidebar_expanded = get_bool(map, "window/sidebar_expanded", true);
         config.log_level = match get_string(map, "log/level", &config.log_level).as_str() {
@@ -110,8 +116,12 @@ impl Config {
             .map(|value| value.min(255) as u8)
             .unwrap_or(12);
         config.color_gate_points = get_points(map, "color_gate/points");
-        config.window_scale = normalize_window_scale(get_f32(map, "window/scale", 1.0));
         config.on_top = get_bool(map, "window/coordinate/on_top", true);
+        // 通用任务与抓鬼/鬼王互斥；手改配置或旧配置里同时为真时，以通用任务为准。
+        if config.generic_enabled {
+            config.zhuagui_enabled = false;
+            config.ghost_king_enabled = false;
+        }
         config
     }
 
@@ -137,8 +147,9 @@ impl Config {
         insert("api/format", Value::String(self.api_format.clone()));
         insert("api/url", Value::String(self.api_url.clone()));
         insert("api/token", Value::String(self.api_token.clone()));
+        insert("task/option/抓鬼", Value::Bool(self.zhuagui_enabled));
         insert("task/option/鬼王", Value::Bool(self.ghost_king_enabled));
-        insert("task/high_chance", Value::Bool(self.high_chance));
+        insert("task/option/通用", Value::Bool(self.generic_enabled));
         insert(
             "task/horizontal_layout",
             Value::Bool(self.horizontal_layout),
@@ -165,7 +176,6 @@ impl Config {
             "color_gate/points",
             points_to_value(&self.color_gate_points),
         );
-        insert("window/scale", Value::from(self.window_scale as f64));
         insert("window/coordinate/on_top", Value::Bool(self.on_top));
 
         if let Some(parent) = path
@@ -208,25 +218,6 @@ fn get_u32(map: &Map<String, Value>, key: &str, default: u32) -> u32 {
             .unwrap_or(default),
         Some(Value::String(value)) => value.trim().parse().unwrap_or(default),
         _ => default,
-    }
-}
-
-fn get_f32(map: &Map<String, Value>, key: &str, default: f32) -> f32 {
-    match map.get(key) {
-        Some(Value::Number(value)) => value.as_f64().map(|v| v as f32).unwrap_or(default),
-        Some(Value::String(value)) => value.trim().parse().unwrap_or(default),
-        _ => default,
-    }
-}
-
-/// 0 表示系统 DPI；固定缩放至少为 75%，避免错误配置让界面无法操作。
-fn normalize_window_scale(scale: f32) -> f32 {
-    if !scale.is_finite() || scale < 0.0 {
-        1.0
-    } else if scale == 0.0 {
-        0.0
-    } else {
-        scale.clamp(0.75, 2.5)
     }
 }
 
@@ -419,16 +410,6 @@ mod tests {
     }
 
     #[test]
-    fn invalid_scales_remain_usable() {
-        for scale in [f32::NAN, f32::INFINITY, -1.0] {
-            assert_eq!(normalize_window_scale(scale), 1.0);
-        }
-        assert_eq!(normalize_window_scale(0.0), 0.0);
-        assert_eq!(normalize_window_scale(0.01), 0.75);
-        assert_eq!(normalize_window_scale(100.0), 2.5);
-    }
-
-    #[test]
     fn round_trips_config() {
         let dir = std::env::temp_dir().join("rust-mhxy-config-test");
         let _ = std::fs::create_dir_all(&dir);
@@ -437,7 +418,6 @@ mod tests {
             api_url: "http://192.168.3.207:8008".into(),
             ghost_king_enabled: false,
             log_level: "detailed".into(),
-            window_scale: 1.25,
             color_gate_enabled: true,
             color_gate_points: vec![ColorPoint::new(100, 200, [0xd4, 0xa0, 0x17], 15, 1)],
             ..Default::default()
@@ -447,10 +427,40 @@ mod tests {
         assert_eq!(loaded.api_url, "http://192.168.3.207:8008");
         assert!(!loaded.ghost_king_enabled);
         assert_eq!(loaded.log_level, "detailed");
-        assert_eq!(loaded.window_scale, 1.25);
         assert!(loaded.color_gate_enabled);
         assert_eq!(loaded.color_gate_points.len(), 1);
         assert_eq!(loaded.color_gate_points[0].color, [0xd4, 0xa0, 0x17]);
         assert_eq!(loaded.color_gate_points[0].tolerance, 15);
+    }
+
+    #[test]
+    fn generic_task_wins_over_zhuagui_in_config() {
+        let dir = std::env::temp_dir().join("rust-mhxy-config-exclusive-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("config.json");
+        Config {
+            zhuagui_enabled: true,
+            ghost_king_enabled: true,
+            generic_enabled: true,
+            ..Default::default()
+        }
+        .save(&path)
+        .unwrap();
+        // 手改配置把互斥的任务都写成 true 时，加载后以通用任务为准。
+        let loaded = Config::load(&path);
+        assert!(loaded.generic_enabled);
+        assert!(!loaded.zhuagui_enabled);
+        assert!(!loaded.ghost_king_enabled);
+    }
+
+    #[test]
+    fn reads_legacy_jiangyao_fumo_key_as_generic() {
+        let dir = std::env::temp_dir().join("rust-mhxy-config-legacy-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("config.json");
+        std::fs::write(&path, "{\n  \"task/option/降妖伏魔\": true\n}\n").unwrap();
+        // 旧配置里的 task/option/降妖伏魔 仍然按通用任务读取。
+        let loaded = Config::load(&path);
+        assert!(loaded.generic_enabled);
     }
 }

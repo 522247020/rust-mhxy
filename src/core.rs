@@ -3,11 +3,57 @@
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
-pub const TASK_TYPES: &[&str] = &["抓鬼", "鬼王"];
-/// 捉鬼省眼的高概率区域开关只对这两类任务有意义。
-pub const HIGH_CHANCE_SHARED_MAPS: &[&str] = &["普陀山", "五庄观"];
-/// 捉鬼省眼的 50×50 格子。
-pub const HIGH_CHANCE_SIZE: f32 = 50.0;
+pub const TASK_TYPES: &[&str] = &["抓鬼", "鬼王", "通用"];
+
+/// 通用任务：不看任务类型，只按「地图名 + 坐标」定位。
+pub const GENERIC_TASK: &str = "通用";
+
+/// 解析时允许出现的任务类型。
+#[derive(Clone, Copy, Debug)]
+pub struct TaskFilter {
+    pub zhuagui: bool,
+    pub ghost_king: bool,
+    pub generic: bool,
+}
+
+impl Default for TaskFilter {
+    /// 只解析抓鬼（历史默认行为）。
+    fn default() -> Self {
+        Self {
+            zhuagui: true,
+            ghost_king: false,
+            generic: false,
+        }
+    }
+}
+
+impl TaskFilter {
+    /// 抓鬼 + 鬼王（按关键字解析）。
+    #[cfg(test)]
+    pub const KEYWORD_TASKS: TaskFilter = TaskFilter {
+        zhuagui: true,
+        ghost_king: true,
+        generic: false,
+    };
+
+    /// 只启用通用任务。
+    #[cfg(test)]
+    pub const GENERIC_ONLY: TaskFilter = TaskFilter {
+        zhuagui: false,
+        ghost_king: false,
+        generic: true,
+    };
+
+    pub fn enabled(&self, task_type: &str) -> bool {
+        match task_type {
+            "抓鬼" => self.zhuagui,
+            "鬼王" => self.ghost_king,
+            GENERIC_TASK => self.generic,
+            _ => false,
+        }
+    }
+}
+
 /// 坐标最多允许超出地图范围的比例，超出后仍贴边绘制。
 pub const MAP_COORDINATE_TOLERANCE: f32 = 0.1;
 
@@ -31,6 +77,10 @@ pub struct MapDefinition {
 
 impl MapDefinition {
     pub fn supports_task(&self, task_type: &str) -> bool {
+        // 通用任务不看任务类型，任何地图都能用。
+        if task_type == GENERIC_TASK {
+            return true;
+        }
         self.tasks.is_empty() || self.tasks.iter().any(|task| task == task_type)
     }
 }
@@ -316,12 +366,15 @@ fn infer_map_name(before: &str) -> Option<String> {
     None
 }
 
-/// 解析任务文字，返回识别到的抓鬼 / 鬼王坐标。
-pub fn parse_tasks(
-    text: &str,
-    maps: &[MapDefinition],
-    include_ghost_king: bool,
-) -> Vec<TaskLocation> {
+/// 任务关键字 → 归一化后的任务类型。长的写在前面，同一位置优先匹配更长的关键字。
+/// 通用任务不参与关键字匹配，它只看地图名和坐标。
+const TASK_KEYWORDS: &[(&str, &[char])] = &[
+    ("抓鬼", &['抓', '鬼']),
+    ("抓鬼", &['捉', '鬼']),
+    ("鬼王", &['鬼', '王']),
+];
+
+pub fn parse_tasks(text: &str, maps: &[MapDefinition], filter: TaskFilter) -> Vec<TaskLocation> {
     let normalized = collapse_whitespace(text);
     let chars: Vec<char> = normalized.chars().collect();
 
@@ -329,17 +382,15 @@ pub fn parse_tasks(
     let mut matches: Vec<(usize, usize, &str)> = Vec::new();
     let mut index = 0;
     while index < chars.len() {
-        let keyword = [
-            ("抓鬼", ['抓', '鬼']),
-            ("捉鬼", ['捉', '鬼']),
-            ("鬼王", ['鬼', '王']),
-        ]
-        .into_iter()
-        .find_map(|(keyword, prefix)| chars[index..].starts_with(&prefix).then_some(keyword));
-        match keyword {
-            Some(keyword) if index == 0 || !is_cjk(chars[index - 1]) => {
-                matches.push((index, index + keyword.chars().count(), keyword));
-                index += keyword.chars().count();
+        let hit = TASK_KEYWORDS.iter().find_map(|(task, prefix)| {
+            chars[index..]
+                .starts_with(prefix)
+                .then_some((*task, prefix.len()))
+        });
+        match hit {
+            Some((task, len)) if index == 0 || !is_cjk(chars[index - 1]) => {
+                matches.push((index, index + len, task));
+                index += len;
             }
             _ => index += 1,
         }
@@ -355,57 +406,58 @@ pub fn parse_tasks(
     byte_of_char.push(offset);
 
     let mut tasks: Vec<TaskLocation> = Vec::new();
-    for (position, (start, end, keyword)) in matches.iter().enumerate() {
-        let task_type = if *keyword == "捉鬼" {
-            "抓鬼"
-        } else {
-            *keyword
-        };
-        if task_type == "鬼王" && !include_ghost_king {
-            continue;
+
+    // 通用任务不看任务类型：直接拿整段文字找「地图名 + 坐标」。
+    if filter.generic {
+        if let Some(location) = locate_in_text(&normalized, maps, GENERIC_TASK) {
+            tasks.push(location);
         }
-        if tasks.iter().any(|task| task.task_type == task_type) {
+    }
+
+    for (position, (_start, end, task_type)) in matches.iter().enumerate() {
+        if !filter.enabled(task_type) || tasks.iter().any(|task| task.task_type == *task_type) {
             continue;
         }
         let block_end = matches.get(position + 1).map_or(chars.len(), |next| next.0);
-        let _ = start;
-        let block_bytes = &normalized[byte_of_char[*end]..byte_of_char[block_end]];
-        let coordinate = find_coordinate(block_bytes);
-        let compact_block = compact(block_bytes);
-        let candidates: Vec<&MapDefinition> = maps
-            .iter()
-            .filter(|map| map.supports_task(task_type))
-            .collect();
-        let mut definition = candidates.iter().copied().find(|map| {
-            map.aliases.iter().any(|alias| {
-                let alias = compact(alias);
-                !alias.is_empty() && compact_block.contains(&alias)
-            })
-        });
-        let mut inferred_map: Option<String> = None;
-        if let Some((coordinate_start, _, _)) = coordinate {
-            let before = compact(&block_bytes[..coordinate_start]);
-            inferred_map = infer_map_name(&before);
-        }
-        if definition.is_none() {
-            if let Some(inferred) = &inferred_map {
-                definition = match_map(inferred, candidates.iter().copied());
-            }
-        }
-        let map_name = definition
-            .map(|map| map.name.clone())
-            .or_else(|| inferred_map.clone());
-        if let (Some((_, x, y)), Some(map_name)) = (coordinate, map_name) {
-            tasks.push(TaskLocation {
-                task_type: task_type.to_string(),
-                map_name,
-                x,
-                y,
-                nearby: compact_block.contains("附近"),
-            });
+        let block = &normalized[byte_of_char[*end]..byte_of_char[block_end]];
+        if let Some(location) = locate_in_text(block, maps, task_type) {
+            tasks.push(location);
         }
     }
+
     tasks
+}
+
+/// 在一段文字里找「地图名 + 坐标」，返回指定任务类型的定位结果。
+fn locate_in_text(block: &str, maps: &[MapDefinition], task_type: &str) -> Option<TaskLocation> {
+    let (coordinate_start, x, y) = find_coordinate(block)?;
+    let compact_block = compact(block);
+    let candidates: Vec<&MapDefinition> = maps
+        .iter()
+        .filter(|map| map.supports_task(task_type))
+        .collect();
+    let mut definition = candidates.iter().copied().find(|map| {
+        map.aliases.iter().any(|alias| {
+            let alias = compact(alias);
+            !alias.is_empty() && compact_block.contains(&alias)
+        })
+    });
+    let inferred_map = infer_map_name(&compact(&block[..coordinate_start]));
+    if definition.is_none() {
+        if let Some(inferred) = &inferred_map {
+            definition = match_map(inferred, candidates.iter().copied());
+        }
+    }
+    let map_name = definition
+        .map(|map| map.name.clone())
+        .or_else(|| inferred_map.clone())?;
+    Some(TaskLocation {
+        task_type: task_type.to_string(),
+        map_name,
+        x,
+        y,
+        nearby: compact_block.contains("附近"),
+    })
 }
 
 pub fn coordinate_in_map(definition: &MapDefinition, x: f32, y: f32, tolerance: f32) -> bool {
@@ -437,28 +489,6 @@ pub fn clamp_to_map(definition: &MapDefinition, x: f32, y: f32) -> (f32, f32) {
         (definition.bottom_y, definition.top_y)
     };
     (x.clamp(min_x, max_x), y.clamp(min_y, max_y))
-}
-
-/// 捉鬼省眼的高概率区域，返回 50×50 格子的左下角坐标。
-pub fn high_chance_areas(map_name: &str, x: f32, y: f32, size: f32) -> Vec<(f32, f32)> {
-    let mut corners: Vec<(f32, f32)> = Vec::new();
-    if x < y {
-        corners.push((x - size, y + size));
-    }
-    if x > 150.0 && y > 150.0 {
-        corners.push((x, y + size));
-    }
-    if (x < 150.0 && y < 150.0) || HIGH_CHANCE_SHARED_MAPS.contains(&map_name) {
-        corners.push((x - size, y));
-    }
-    if x > y || (x > 150.0 && y < 50.0) {
-        corners.push((x, y));
-    }
-    // 上面算出来的是格子左上角（游戏 y 越大越靠上）；换成左下角绘制。
-    corners
-        .into_iter()
-        .map(|(cx, cy)| (cx, cy - size))
-        .collect()
 }
 
 pub fn map_point(
@@ -610,7 +640,7 @@ mod tests {
 
     #[test]
     fn parses_ghost_task() {
-        let tasks = parse_tasks("抓鬼 长寿村 123,45", &maps(), true);
+        let tasks = parse_tasks("抓鬼 长寿村 123,45", &maps(), TaskFilter::default());
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].task_type, "抓鬼");
         assert_eq!(tasks[0].map_name, "长寿村");
@@ -618,19 +648,35 @@ mod tests {
     }
 
     #[test]
+    fn parses_generic_task_by_map_and_coordinate_only() {
+        let maps = maps();
+        // 通用任务完全不看任务类型：没有任务名、写着别的任务名，都只按「地图名 + 坐标」定位。
+        for text in ["长寿村 88,66", "降妖伏魔 长寿村 88 66", "抓鬼 长寿村 88,66"] {
+            let tasks = parse_tasks(text, &maps, TaskFilter::GENERIC_ONLY);
+            assert_eq!(tasks.len(), 1, "{text}");
+            assert_eq!(tasks[0].task_type, GENERIC_TASK, "{text}");
+            assert_eq!(tasks[0].map_name, "长寿村", "{text}");
+            assert_eq!((tasks[0].x, tasks[0].y), (88, 66), "{text}");
+        }
+        // 没勾选通用任务时不解析。
+        let tasks = parse_tasks("长寿村 88,66", &maps, TaskFilter::default());
+        assert!(tasks.is_empty());
+    }
+
+    #[test]
     fn separates_ghost_and_king() {
         let text = "抓鬼 长寿村 12,34 鬼王 天宫 56 78";
-        let tasks = parse_tasks(text, &maps(), true);
+        let tasks = parse_tasks(text, &maps(), TaskFilter::KEYWORD_TASKS);
         assert_eq!(tasks.len(), 2);
         assert_eq!(tasks[0].map_name, "长寿村");
         assert_eq!(tasks[1].map_name, "天宫");
-        let without_king = parse_tasks(text, &maps(), false);
+        let without_king = parse_tasks(text, &maps(), TaskFilter::default());
         assert_eq!(without_king.len(), 1);
     }
 
     #[test]
     fn ignores_embedded_king() {
-        let tasks = parse_tasks("嗜血鬼王 天宫 10,20", &maps(), true);
+        let tasks = parse_tasks("嗜血鬼王 天宫 10,20", &maps(), TaskFilter::KEYWORD_TASKS);
         assert!(tasks.is_empty());
     }
 

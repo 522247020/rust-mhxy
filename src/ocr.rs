@@ -379,7 +379,8 @@ mod tests {
             "/assets/maps.json"
         )))
         .expect("加载 maps.json");
-        let tasks = crate::core::parse_tasks(&result.text, &maps, true);
+        let tasks =
+            crate::core::parse_tasks(&result.text, &maps, crate::core::TaskFilter::KEYWORD_TASKS);
         println!("解析结果：{tasks:?}");
         assert!(tasks
             .iter()
