@@ -6,8 +6,12 @@
   // ---- 识图（OCR）----
   // "local" 用内置本地 PP-OCR；"remote" 走远端 PP-OCR 服务
   "ocr/mode": "local",
-  // 识别间隔（秒），范围 1~60
+  // 识别间隔（秒），范围 1~60（仅自动模式使用）
   "ocr/interval_seconds": 5,
+  // 识别触发方式："auto" 按间隔自动识别；"manual" 按快捷键手动触发一次
+  "ocr/trigger": "auto",
+  // 手动模式的快捷键，例如 F8、Ctrl+F8；Windows 下全局生效
+  "ocr/hotkey": "F8",
   // 任务栏截图区域，格式「左,上,右,下」，相对游戏客户区的百分比（0~1）
   "ocr/task_region": "0.70,0.24,0.99,0.70",
   // 第二个截图区域
@@ -31,6 +35,10 @@
   "task/option/通用": false,
   // 任务面板布局：false 上下等分，true 左右等分（只有一个任务时占满整个区域）
   "task/horizontal_layout": false,
+  // 捉鬼高概率区域：在抓鬼任务卡片顶部勾选后，地图上叠加 50×50 的高概率格子
+  "task/high_chance": false,
+  // 鬼王的高概率区域开关（独立于抓鬼）
+  "task/high_chance/鬼王": false,
 
   // ---- 图色门控 ----
   // 用少量点位的颜色快速判断「当前有没有任务」：未命中（战斗 / 任务完成）就跳过 OCR。

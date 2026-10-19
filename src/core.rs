@@ -57,6 +57,11 @@ impl TaskFilter {
 /// 坐标最多允许超出地图范围的比例，超出后仍贴边绘制。
 pub const MAP_COORDINATE_TOLERANCE: f32 = 0.1;
 
+/// 捉鬼省眼的高概率区域：50×50 格子。
+pub const HIGH_CHANCE_SIZE: f32 = 50.0;
+/// 这些地图无论象限都额外画左上角格子。
+pub const HIGH_CHANCE_SHARED_MAPS: &[&str] = &["普陀山", "五庄观"];
+
 pub type TaskRegion = (f32, f32, f32, f32);
 pub const DEFAULT_TASK_REGION: TaskRegion = (0.70, 0.24, 0.99, 0.70);
 /// 个别任务会在第二处再显示一次坐标，备用区域放在任务栏下方。
@@ -648,6 +653,31 @@ pub fn map_area(
     )
 }
 
+/// 捉鬼省眼的「高概率区域」，返回 50×50 格子的左下角坐标（供 `map_rect` 使用）。
+///
+/// 按任务坐标所在象限推算鬼可能出现的格子：坐标偏左下时取右上方，
+/// 整体在左上角（或普陀山、五庄观这类小图）时取左上方，其余情况取右下方。
+pub fn high_chance_areas(map_name: &str, x: f32, y: f32, size: f32) -> Vec<(f32, f32)> {
+    let mut corners: Vec<(f32, f32)> = Vec::new();
+    if x < y {
+        corners.push((x - size, y + size));
+    }
+    if x > 150.0 && y > 150.0 {
+        corners.push((x, y + size));
+    }
+    if (x < 150.0 && y < 150.0) || HIGH_CHANCE_SHARED_MAPS.contains(&map_name) {
+        corners.push((x - size, y));
+    }
+    if x > y || (x > 150.0 && y < 50.0) {
+        corners.push((x, y));
+    }
+    // 上面算的是格子左上角（游戏 y 越大越靠上），换成左下角。
+    corners
+        .into_iter()
+        .map(|(cx, cy)| (cx, cy - size))
+        .collect()
+}
+
 /// 把百分比区域换算成图片像素区域。
 pub fn task_region(width: f32, height: f32, region: TaskRegion) -> (f32, f32, f32, f32) {
     (
@@ -811,6 +841,25 @@ mod tests {
         assert_eq!(
             parse_region_setting("0.7,0.2,0.99,0.7", DEFAULT_TASK_REGION),
             (0.7, 0.2, 0.99, 0.7)
+        );
+    }
+
+    #[test]
+    fn high_chance_areas_follow_quadrants() {
+        // 左上角小坐标 → 右上角格子（最终换成左下角）
+        assert_eq!(
+            high_chance_areas("某某地图", 100.0, 100.0, 50.0),
+            vec![(50.0, 50.0)]
+        );
+        // 右下角大坐标 → 左下方格子
+        assert_eq!(
+            high_chance_areas("某某地图", 200.0, 200.0, 50.0),
+            vec![(200.0, 200.0)]
+        );
+        // 普陀山 / 五庄观无论象限都补左上角
+        assert_eq!(
+            high_chance_areas("普陀山", 50.0, 50.0, 50.0),
+            vec![(0.0, 0.0)]
         );
     }
 

@@ -18,9 +18,13 @@ pub struct Config {
     pub api_format: String,
     pub api_url: String,
     pub api_token: String,
+    pub trigger_mode: String,
+    pub ocr_hotkey: String,
     pub zhuagui_enabled: bool,
     pub ghost_king_enabled: bool,
     pub generic_enabled: bool,
+    pub high_chance: bool,
+    pub ghost_king_high_chance: bool,
     pub horizontal_layout: bool,
     pub sidebar_expanded: bool,
     pub log_level: String,
@@ -43,9 +47,13 @@ impl Default for Config {
             api_format: "multipart".into(),
             api_url: String::new(),
             api_token: String::new(),
+            trigger_mode: "auto".into(),
+            ocr_hotkey: "F8".into(),
             zhuagui_enabled: true,
             ghost_king_enabled: true,
             generic_enabled: false,
+            high_chance: false,
+            ghost_king_high_chance: false,
             horizontal_layout: false,
             sidebar_expanded: true,
             log_level: "simple".into(),
@@ -90,6 +98,11 @@ impl Config {
         };
         config.api_url = get_string(map, "api/url", "");
         config.api_token = get_string(map, "api/token", "");
+        config.trigger_mode = match get_string(map, "ocr/trigger", &config.trigger_mode).as_str() {
+            "manual" => "manual".into(),
+            _ => "auto".into(),
+        };
+        config.ocr_hotkey = get_string(map, "ocr/hotkey", "F8");
         config.zhuagui_enabled = get_bool(map, "task/option/抓鬼", true);
         config.ghost_king_enabled = get_bool(map, "task/option/鬼王", true);
         // 通用任务原来的键是 task/option/降妖伏魔，读旧配置时兼容一下。
@@ -98,6 +111,9 @@ impl Config {
             "task/option/通用",
             get_bool(map, "task/option/降妖伏魔", false),
         );
+        config.high_chance = get_bool(map, "task/high_chance", false);
+        // 旧配置只有 task/high_chance，鬼王默认跟随抓鬼的设置。
+        config.ghost_king_high_chance = get_bool(map, "task/high_chance/鬼王", config.high_chance);
         config.horizontal_layout = get_bool(map, "task/horizontal_layout", false);
         config.sidebar_expanded = get_bool(map, "window/sidebar_expanded", true);
         config.log_level = match get_string(map, "log/level", &config.log_level).as_str() {
@@ -147,9 +163,16 @@ impl Config {
         insert("api/format", Value::String(self.api_format.clone()));
         insert("api/url", Value::String(self.api_url.clone()));
         insert("api/token", Value::String(self.api_token.clone()));
+        insert("ocr/trigger", Value::String(self.trigger_mode.clone()));
+        insert("ocr/hotkey", Value::String(self.ocr_hotkey.clone()));
         insert("task/option/抓鬼", Value::Bool(self.zhuagui_enabled));
         insert("task/option/鬼王", Value::Bool(self.ghost_king_enabled));
         insert("task/option/通用", Value::Bool(self.generic_enabled));
+        insert("task/high_chance", Value::Bool(self.high_chance));
+        insert(
+            "task/high_chance/鬼王",
+            Value::Bool(self.ghost_king_high_chance),
+        );
         insert(
             "task/horizontal_layout",
             Value::Bool(self.horizontal_layout),
@@ -419,6 +442,8 @@ mod tests {
             ghost_king_enabled: false,
             log_level: "detailed".into(),
             color_gate_enabled: true,
+            high_chance: true,
+            ghost_king_high_chance: false,
             color_gate_points: vec![ColorPoint::new(100, 200, [0xd4, 0xa0, 0x17], 15, 1)],
             ..Default::default()
         };
@@ -428,6 +453,8 @@ mod tests {
         assert!(!loaded.ghost_king_enabled);
         assert_eq!(loaded.log_level, "detailed");
         assert!(loaded.color_gate_enabled);
+        assert!(loaded.high_chance);
+        assert!(!loaded.ghost_king_high_chance);
         assert_eq!(loaded.color_gate_points.len(), 1);
         assert_eq!(loaded.color_gate_points[0].color, [0xd4, 0xa0, 0x17]);
         assert_eq!(loaded.color_gate_points[0].tolerance, 15);

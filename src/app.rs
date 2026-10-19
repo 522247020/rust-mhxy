@@ -2,10 +2,12 @@
 use crate::capture::{self, WindowInfo};
 use crate::config::{assets_dir, Config};
 use crate::core::{
-    clamp_to_map, coordinate_in_map, find_map_definition, map_area, map_coordinate, map_point,
-    parse_tasks, MapDefinition, TaskFilter, TaskLocation, MAP_COORDINATE_TOLERANCE,
+    clamp_to_map, coordinate_in_map, find_map_definition, high_chance_areas, map_area,
+    map_coordinate, map_point, map_rect, parse_tasks, MapDefinition, TaskFilter, TaskLocation,
+    HIGH_CHANCE_SIZE, MAP_COORDINATE_TOLERANCE,
 };
 use crate::gate::{self, ColorPoint, GateMode};
+use crate::hotkey::{self, GlobalHotkey, Hotkey};
 use crate::ocr::{self, LocalWorker, OcrEvent, OcrText};
 use crate::theme;
 use egui::{pos2, vec2, Align2, Color32, CornerRadius, FontId, Rect, Sense, TextureHandle, Vec2};
@@ -74,6 +76,12 @@ pub struct MhxyApp {
     worker: LocalWorker,
     receiver: Receiver<OcrEvent>,
     sender: Sender<OcrEvent>,
+    hotkey_tx: Sender<()>,
+    hotkey_rx: Receiver<()>,
+    hotkey_listener: Option<GlobalHotkey>,
+    hotkey_attempted: Option<String>,
+    recording_hotkey: bool,
+    last_manual_trigger: Option<Instant>,
     logs: Vec<String>,
 }
 
@@ -98,6 +106,7 @@ impl MhxyApp {
         let windows = Vec::new();
         let (sender, receiver) = channel::<OcrEvent>();
         let worker = LocalWorker::spawn(sender.clone(), ctx.clone());
+        let (hotkey_tx, hotkey_rx) = channel::<()>();
         let mut tasks = HashMap::new();
         for task in TASK_ORDER {
             tasks.insert(task, TaskState::default());
@@ -142,6 +151,12 @@ impl MhxyApp {
             worker,
             receiver,
             sender,
+            hotkey_tx,
+            hotkey_rx,
+            hotkey_listener: None,
+            hotkey_attempted: None,
+            recording_hotkey: false,
+            last_manual_trigger: None,
             logs: Vec::new(),
         };
         app.log(format!("程序启动，加载 {} 张地图", app.maps.len()));
@@ -216,7 +231,13 @@ impl MhxyApp {
         if self.running {
             self.running = false;
             self.invalidate_scan();
-            self.log("已暂停识别");
+            self.hotkey_listener = None;
+            self.hotkey_attempted = None;
+            self.log(if self.manual_mode() {
+                "已停止监听快捷键"
+            } else {
+                "已暂停识别"
+            });
         } else {
             if self.selected_handle.is_none() {
                 self.refresh_windows(false);
@@ -234,7 +255,12 @@ impl MhxyApp {
             self.check_gate();
             self.last_gate_check = Instant::now();
             self.notice = None;
-            self.log("开始自动识别");
+            self.sync_hotkey();
+            self.log(if self.manual_mode() {
+                "开始监听快捷键"
+            } else {
+                "开始自动识别"
+            });
         }
     }
 
@@ -380,7 +406,62 @@ impl MhxyApp {
         }
     }
 
-    fn trigger_scan(&mut self) {
+    fn manual_mode(&self) -> bool {
+        self.config.trigger_mode == "manual"
+    }
+
+    /// 快捷键 / 「识别一次」触发：手动模式下一次只识别一次，忽略图色门控。
+    fn manual_trigger(&mut self) {
+        if !self.running || !self.manual_mode() || self.busy {
+            return;
+        }
+        if let Some(last) = self.last_manual_trigger {
+            if last.elapsed() < Duration::from_millis(400) {
+                return;
+            }
+        }
+        self.last_manual_trigger = Some(Instant::now());
+        self.log_detail("手动触发识别");
+        self.trigger_scan(true);
+    }
+
+    fn poll_hotkey(&mut self) {
+        while self.hotkey_rx.try_recv().is_ok() {
+            self.manual_trigger();
+        }
+    }
+
+    /// 按当前运行状态 / 模式 / 快捷键字符串同步全局快捷键注册。
+    fn sync_hotkey(&mut self) {
+        let desired = if self.running && self.manual_mode() {
+            Hotkey::parse(&self.config.ocr_hotkey)
+                .ok()
+                .map(|hotkey| (hotkey, hotkey.display()))
+        } else {
+            None
+        };
+        let desired_label = desired.as_ref().map(|(_, label)| label.clone());
+        if desired_label == self.hotkey_attempted {
+            return;
+        }
+        self.hotkey_attempted = desired_label;
+        self.hotkey_listener = None;
+        let Some((hotkey, label)) = desired else {
+            return;
+        };
+        match hotkey::spawn(hotkey, self.hotkey_tx.clone()) {
+            Ok(listener) => {
+                self.hotkey_listener = Some(listener);
+                self.log_detail(format!("已注册全局快捷键：{label}"));
+            }
+            Err(err) => {
+                self.hotkey_listener = None;
+                self.log_detail(format!("{err}，窗口聚焦时仍可使用 {label}"));
+            }
+        }
+    }
+
+    fn trigger_scan(&mut self, force: bool) {
         if self.busy {
             return;
         }
@@ -392,7 +473,7 @@ impl MhxyApp {
             self.log_detail("未找到游戏窗口，等待下次扫描");
             return;
         };
-        if self.config.color_gate_enabled && !self.gate_active {
+        if !force && self.config.color_gate_enabled && !self.gate_active {
             let title = self
                 .windows
                 .iter()
@@ -640,6 +721,7 @@ impl MhxyApp {
         ui: &mut egui::Ui,
         definition: &MapDefinition,
         location: &TaskLocation,
+        show_high_chance: bool,
     ) {
         let Some(texture) = self.map_texture(ui.ctx(), definition) else {
             ui.colored_label(Color32::from_rgb(240, 180, 80), "地图图片未配置");
@@ -674,7 +756,35 @@ impl MhxyApp {
         };
         let (point_x, point_y) = clamp_to_map(definition, location.x as f32, location.y as f32);
 
-        if location.nearby {
+        // 高概率格子：相对任务坐标偏移的 50×50 区域。
+        let high_chance_rects: Vec<Rect> = if show_high_chance {
+            high_chance_areas(
+                &definition.name,
+                location.x as f32,
+                location.y as f32,
+                HIGH_CHANCE_SIZE,
+            )
+            .into_iter()
+            .filter_map(|(chance_x, chance_y)| {
+                let (left, top, right, bottom) = map_rect(
+                    definition,
+                    chance_x,
+                    chance_y,
+                    chance_x + HIGH_CHANCE_SIZE,
+                    chance_y + HIGH_CHANCE_SIZE,
+                    texture_size.x,
+                    texture_size.y,
+                );
+                let chance = Rect::from_min_max(to_screen((left, top)), to_screen((right, bottom)))
+                    .intersect(image_rect);
+                (chance.width() > 0.0 && chance.height() > 0.0).then_some(chance)
+            })
+            .collect()
+        } else {
+            Vec::new()
+        };
+
+        let nearby_area: Option<Rect> = if location.nearby {
             let (left, top, right, bottom) = map_area(
                 definition,
                 point_x,
@@ -683,8 +793,15 @@ impl MhxyApp {
                 texture_size.x,
                 texture_size.y,
             );
-            let area = Rect::from_min_max(to_screen((left, top)), to_screen((right, bottom)))
-                .intersect(image_rect);
+            Some(
+                Rect::from_min_max(to_screen((left, top)), to_screen((right, bottom)))
+                    .intersect(image_rect),
+            )
+        } else {
+            None
+        };
+
+        if let Some(area) = nearby_area {
             let shade = Color32::from_rgba_unmultiplied(0, 0, 0, 150);
             painter.rect_filled(
                 Rect::from_min_max(image_rect.min, pos2(image_rect.max.x, area.min.y)),
@@ -716,6 +833,28 @@ impl MhxyApp {
                 area,
                 CornerRadius::ZERO,
                 egui::Stroke::new(2.0, Color32::from_rgb(255, 209, 102)),
+                egui::StrokeKind::Inside,
+            );
+        }
+
+        for chance in &high_chance_rects {
+            // 只显示落在黄色「附近」框内的部分，避免红框超出黄框。
+            let chance = match nearby_area {
+                Some(area) => (*chance).intersect(area),
+                None => *chance,
+            };
+            if chance.width() <= 0.0 || chance.height() <= 0.0 {
+                continue;
+            }
+            painter.rect_filled(
+                chance,
+                CornerRadius::ZERO,
+                Color32::from_rgba_unmultiplied(255, 40, 40, 48),
+            );
+            painter.rect_stroke(
+                chance,
+                CornerRadius::ZERO,
+                egui::Stroke::new(2.0, Color32::from_rgba_unmultiplied(255, 40, 40, 170)),
                 egui::StrokeKind::Inside,
             );
         }
@@ -851,6 +990,77 @@ impl MhxyApp {
                         }
                     }
                 });
+                theme::section(ui, "识别模式", |ui| {
+                    let previous = self.config.trigger_mode.clone();
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(
+                            &mut self.config.trigger_mode,
+                            "auto".into(),
+                            "自动（按间隔）",
+                        );
+                        ui.selectable_value(
+                            &mut self.config.trigger_mode,
+                            "manual".into(),
+                            "手动（快捷键）",
+                        );
+                    });
+                    if previous != self.config.trigger_mode {
+                        self.invalidate_scan();
+                        self.sync_hotkey();
+                        self.persist();
+                    }
+                    if self.manual_mode() {
+                        ui.horizontal(|ui| {
+                            ui.label("快捷键");
+                            let response = ui.add(
+                                egui::TextEdit::singleline(&mut self.config.ocr_hotkey)
+                                    .desired_width(96.0)
+                                    .hint_text("F8"),
+                            );
+                            if response.lost_focus() {
+                                self.sync_hotkey();
+                                self.persist();
+                            }
+                            let record_label =
+                                if self.recording_hotkey { "按键…" } else { "录制" };
+                            if ui.button(record_label).clicked() {
+                                self.recording_hotkey = !self.recording_hotkey;
+                            }
+                        });
+                        match Hotkey::parse(&self.config.ocr_hotkey) {
+                            Ok(hotkey) => {
+                                let status = if self.hotkey_listener.is_some() {
+                                    "全局快捷键已注册"
+                                } else if self.running {
+                                    "窗口聚焦时可用"
+                                } else {
+                                    "开始监听后生效"
+                                };
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{} · {status}",
+                                        hotkey.display()
+                                    ))
+                                    .small()
+                                    .weak(),
+                                );
+                            }
+                            Err(err) => {
+                                ui.colored_label(theme::GOLD, format!("快捷键无效：{err}"));
+                            }
+                        }
+                        ui.horizontal(|ui| {
+                            if ui.button("立即识别一次").clicked() {
+                                self.manual_trigger();
+                            }
+                            ui.label(
+                                egui::RichText::new("手动模式下按键触发一次 OCR")
+                                    .small()
+                                    .weak(),
+                            );
+                        });
+                    }
+                });
                 theme::section(ui, "识别方式", |ui| {
                     let previous = self.config.ocr_mode.clone();
                     ui.horizontal(|ui| {
@@ -955,12 +1165,41 @@ impl MhxyApp {
                         self.invalidate_scan();
                         self.persist();
                     }
+                    if self.config.zhuagui_enabled {
+                        ui.indent("high_chance", |ui| {
+                            if ui
+                                .checkbox(&mut self.config.high_chance, "显示高概率区域")
+                                .on_hover_text(
+                                    "按 175LG 捉鬼省眼规则，在抓鬼地图上叠加 50×50 的高概率格子",
+                                )
+                                .changed()
+                            {
+                                self.persist();
+                            }
+                        });
+                    }
                     if ui
                         .checkbox(&mut self.config.ghost_king_enabled, "同时识别鬼王任务")
                         .changed()
                     {
                         self.invalidate_scan();
                         self.persist();
+                    }
+                    if self.config.ghost_king_enabled {
+                        ui.indent("high_chance_king", |ui| {
+                            if ui
+                                .checkbox(
+                                    &mut self.config.ghost_king_high_chance,
+                                    "显示高概率区域",
+                                )
+                                .on_hover_text(
+                                    "按 175LG 捉鬼省眼规则，在鬼王地图上叠加 50×50 的高概率格子",
+                                )
+                                .changed()
+                            {
+                                self.persist();
+                            }
+                        });
                     }
                     if ui
                         .checkbox(&mut self.config.generic_enabled, "通用任务（只看地图名和坐标）")
@@ -1385,10 +1624,35 @@ impl MhxyApp {
         };
         theme::card().show(ui, |ui| {
             ui.set_min_size(ui.available_size());
+            if task_type == "抓鬼" || task_type == "鬼王" {
+                let mut high = if task_type == "抓鬼" {
+                    self.config.high_chance
+                } else {
+                    self.config.ghost_king_high_chance
+                };
+                ui.horizontal(|ui| {
+                    if ui
+                        .checkbox(&mut high, egui::RichText::new("高概率区域").small())
+                        .changed()
+                    {
+                        if task_type == "抓鬼" {
+                            self.config.high_chance = high;
+                        } else {
+                            self.config.ghost_king_high_chance = high;
+                        }
+                        self.persist();
+                    }
+                });
+            }
+            let show_high_chance = match task_type {
+                "抓鬼" => self.config.high_chance,
+                "鬼王" => self.config.ghost_king_high_chance,
+                _ => false,
+            };
             match (location, map_index) {
                 (Some(location), Some(index)) => {
                     let definition = self.maps[index].clone();
-                    self.render_map(ui, &definition, &location);
+                    self.render_map(ui, &definition, &location, show_high_chance);
                 }
                 _ => {
                     let size = ui.available_size().max(vec2(1.0, 1.0));
@@ -1441,6 +1705,25 @@ impl eframe::App for MhxyApp {
             self.flush_config();
         }
         self.poll_events();
+        self.poll_hotkey();
+        if self.recording_hotkey {
+            if let Some(captured) = hotkey::capture_egui(&ctx) {
+                self.recording_hotkey = false;
+                if captured != "Escape" {
+                    self.config.ocr_hotkey = captured;
+                    self.persist();
+                }
+            }
+        }
+        self.sync_hotkey();
+        // 非 Windows 或全局注册失败时，窗口聚焦也能用快捷键。
+        if self.running && self.manual_mode() && self.hotkey_listener.is_none() && !self.busy {
+            if let Ok(hotkey) = Hotkey::parse(&self.config.ocr_hotkey) {
+                if hotkey.matches_egui(&ctx) {
+                    self.manual_trigger();
+                }
+            }
+        }
         // 定时重新扫描游戏窗口（游戏可能后开 / 关掉）。
         if (self.running || self.selected_handle.is_none())
             && self.last_window_refresh.elapsed() >= Duration::from_secs(3)
@@ -1448,7 +1731,9 @@ impl eframe::App for MhxyApp {
             self.refresh_windows(false);
             self.last_window_refresh = Instant::now();
         }
-        if (self.running || self.show_region_window) && self.config.color_gate_enabled {
+        if (self.show_region_window || (self.running && !self.manual_mode()))
+            && self.config.color_gate_enabled
+        {
             let gate_interval =
                 Duration::from_millis(self.config.color_gate_interval_ms.max(50) as u64);
             if self.last_gate_check.elapsed() >= gate_interval {
@@ -1457,11 +1742,11 @@ impl eframe::App for MhxyApp {
             }
             ctx.request_repaint_after(gate_interval);
         }
-        if self.running && !self.busy {
+        if self.running && !self.manual_mode() && !self.busy {
             let interval = Duration::from_secs(self.config.interval_seconds.max(1) as u64);
             let due = self.last_scan.is_none_or(|last| last.elapsed() >= interval);
             if due {
-                self.trigger_scan();
+                self.trigger_scan(false);
             }
         }
         // 即使暂停也定时唤醒：刷新窗口列表、连接测试结果和坐标更新时间。
@@ -1496,7 +1781,13 @@ impl eframe::App for MhxyApp {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
                             .add(theme::primary_button(if self.running {
-                                "暂停识别"
+                                if self.manual_mode() {
+                                    "暂停监听"
+                                } else {
+                                    "暂停识别"
+                                }
+                            } else if self.manual_mode() {
+                                "开始监听"
                             } else {
                                 "开始识别"
                             }))

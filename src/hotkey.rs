@@ -1,0 +1,502 @@
+//! 手动识别用的快捷键：解析、Windows 全局注册、窗口内回退。
+use std::sync::mpsc::Sender;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Key {
+    /// F1~F24
+    F(u8),
+    /// 字母或数字主键（大写）
+    Char(char),
+    Space,
+    Enter,
+    Tab,
+    Escape,
+    Backspace,
+    Insert,
+    Delete,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Hotkey {
+    pub ctrl: bool,
+    pub shift: bool,
+    pub alt: bool,
+    pub win: bool,
+    pub key: Key,
+}
+
+impl Hotkey {
+    /// 解析形如 `F8`、`Ctrl+F8`、`Alt+Shift+1` 的写法。
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let text = text.trim();
+        if text.is_empty() {
+            return Err("快捷键为空".into());
+        }
+        let (mut ctrl, mut shift, mut alt, mut win) = (false, false, false, false);
+        let mut key = None;
+        for part in text.split('+') {
+            let part = part.trim();
+            if part.is_empty() {
+                return Err(format!("快捷键格式无效：{text}"));
+            }
+            match part.to_ascii_lowercase().as_str() {
+                "ctrl" | "control" => ctrl = true,
+                "shift" => shift = true,
+                "alt" => alt = true,
+                "win" | "super" | "meta" | "cmd" | "command" => win = true,
+                _ => {
+                    if key.is_some() {
+                        return Err("只能有一个主键".into());
+                    }
+                    key = Some(parse_key(part)?);
+                }
+            }
+        }
+        let key = key.ok_or_else(|| "缺少主键".to_string())?;
+        Ok(Hotkey {
+            ctrl,
+            shift,
+            alt,
+            win,
+            key,
+        })
+    }
+
+    pub fn display(&self) -> String {
+        let mut parts = Vec::new();
+        if self.ctrl {
+            parts.push("Ctrl".to_string());
+        }
+        if self.shift {
+            parts.push("Shift".to_string());
+        }
+        if self.alt {
+            parts.push("Alt".to_string());
+        }
+        if self.win {
+            parts.push("Win".to_string());
+        }
+        parts.push(key_name(self.key).to_string());
+        parts.join("+")
+    }
+
+    /// 窗口聚焦时的回退匹配（非 Windows 或全局注册失败时使用）。
+    pub fn matches_egui(&self, ctx: &egui::Context) -> bool {
+        let Some(egui_key) = to_egui_key(self.key) else {
+            return false;
+        };
+        ctx.input(|input| {
+            input.key_pressed(egui_key)
+                && input.modifiers.ctrl == self.ctrl
+                && input.modifiers.shift == self.shift
+                && input.modifiers.alt == self.alt
+        })
+    }
+}
+
+impl Key {
+    #[cfg(windows)]
+    pub fn vk(self) -> u32 {
+        match self {
+            Key::F(n) => 0x70 + u32::from(n) - 1,
+            Key::Char(c) => c.to_ascii_uppercase() as u32,
+            Key::Space => 0x20,
+            Key::Enter => 0x0D,
+            Key::Tab => 0x09,
+            Key::Escape => 0x1B,
+            Key::Backspace => 0x08,
+            Key::Insert => 0x2D,
+            Key::Delete => 0x2E,
+            Key::Home => 0x24,
+            Key::End => 0x23,
+            Key::PageUp => 0x21,
+            Key::PageDown => 0x22,
+            Key::Left => 0x25,
+            Key::Right => 0x27,
+            Key::Up => 0x26,
+            Key::Down => 0x28,
+        }
+    }
+}
+
+fn parse_key(text: &str) -> Result<Key, String> {
+    let lower = text.to_ascii_lowercase();
+    if let Some(number) = lower.strip_prefix('f') {
+        if let Ok(index) = number.parse::<u8>() {
+            if (1..=24).contains(&index) {
+                return Ok(Key::F(index));
+            }
+        }
+    }
+    if text.chars().count() == 1 {
+        let ch = text.chars().next().unwrap();
+        if ch.is_ascii_alphanumeric() {
+            return Ok(Key::Char(ch.to_ascii_uppercase()));
+        }
+    }
+    Ok(match lower.as_str() {
+        "space" => Key::Space,
+        "enter" | "return" => Key::Enter,
+        "tab" => Key::Tab,
+        "esc" | "escape" => Key::Escape,
+        "backspace" => Key::Backspace,
+        "insert" | "ins" => Key::Insert,
+        "delete" | "del" => Key::Delete,
+        "home" => Key::Home,
+        "end" => Key::End,
+        "pageup" | "pgup" => Key::PageUp,
+        "pagedown" | "pgdn" => Key::PageDown,
+        "left" => Key::Left,
+        "right" => Key::Right,
+        "up" => Key::Up,
+        "down" => Key::Down,
+        _ => return Err(format!("不支持的按键：{text}")),
+    })
+}
+
+fn key_name(key: Key) -> String {
+    match key {
+        Key::F(n) => format!("F{n}"),
+        Key::Char(c) => c.to_string(),
+        Key::Space => "Space".into(),
+        Key::Enter => "Enter".into(),
+        Key::Tab => "Tab".into(),
+        Key::Escape => "Escape".into(),
+        Key::Backspace => "Backspace".into(),
+        Key::Insert => "Insert".into(),
+        Key::Delete => "Delete".into(),
+        Key::Home => "Home".into(),
+        Key::End => "End".into(),
+        Key::PageUp => "PageUp".into(),
+        Key::PageDown => "PageDown".into(),
+        Key::Left => "Left".into(),
+        Key::Right => "Right".into(),
+        Key::Up => "Up".into(),
+        Key::Down => "Down".into(),
+    }
+}
+
+fn to_egui_key(key: Key) -> Option<egui::Key> {
+    use egui::Key as K;
+    Some(match key {
+        Key::F(n) => match n {
+            1 => K::F1,
+            2 => K::F2,
+            3 => K::F3,
+            4 => K::F4,
+            5 => K::F5,
+            6 => K::F6,
+            7 => K::F7,
+            8 => K::F8,
+            9 => K::F9,
+            10 => K::F10,
+            11 => K::F11,
+            12 => K::F12,
+            13 => K::F13,
+            14 => K::F14,
+            15 => K::F15,
+            16 => K::F16,
+            17 => K::F17,
+            18 => K::F18,
+            19 => K::F19,
+            20 => K::F20,
+            21 => K::F21,
+            22 => K::F22,
+            23 => K::F23,
+            24 => K::F24,
+            _ => return None,
+        },
+        Key::Char(c) => match c.to_ascii_uppercase() {
+            'A' => K::A,
+            'B' => K::B,
+            'C' => K::C,
+            'D' => K::D,
+            'E' => K::E,
+            'F' => K::F,
+            'G' => K::G,
+            'H' => K::H,
+            'I' => K::I,
+            'J' => K::J,
+            'K' => K::K,
+            'L' => K::L,
+            'M' => K::M,
+            'N' => K::N,
+            'O' => K::O,
+            'P' => K::P,
+            'Q' => K::Q,
+            'R' => K::R,
+            'S' => K::S,
+            'T' => K::T,
+            'U' => K::U,
+            'V' => K::V,
+            'W' => K::W,
+            'X' => K::X,
+            'Y' => K::Y,
+            'Z' => K::Z,
+            '0' => K::Num0,
+            '1' => K::Num1,
+            '2' => K::Num2,
+            '3' => K::Num3,
+            '4' => K::Num4,
+            '5' => K::Num5,
+            '6' => K::Num6,
+            '7' => K::Num7,
+            '8' => K::Num8,
+            '9' => K::Num9,
+            _ => return None,
+        },
+        Key::Space => K::Space,
+        Key::Enter => K::Enter,
+        Key::Tab => K::Tab,
+        Key::Escape => K::Escape,
+        Key::Backspace => K::Backspace,
+        Key::Insert => K::Insert,
+        Key::Delete => K::Delete,
+        Key::Home => K::Home,
+        Key::End => K::End,
+        Key::PageUp => K::PageUp,
+        Key::PageDown => K::PageDown,
+        Key::Left => K::ArrowLeft,
+        Key::Right => K::ArrowRight,
+        Key::Up => K::ArrowUp,
+        Key::Down => K::ArrowDown,
+    })
+}
+
+fn egui_key_name(key: egui::Key) -> Option<&'static str> {
+    use egui::Key as K;
+    Some(match key {
+        K::F1 => "F1",
+        K::F2 => "F2",
+        K::F3 => "F3",
+        K::F4 => "F4",
+        K::F5 => "F5",
+        K::F6 => "F6",
+        K::F7 => "F7",
+        K::F8 => "F8",
+        K::F9 => "F9",
+        K::F10 => "F10",
+        K::F11 => "F11",
+        K::F12 => "F12",
+        K::F13 => "F13",
+        K::F14 => "F14",
+        K::F15 => "F15",
+        K::F16 => "F16",
+        K::F17 => "F17",
+        K::F18 => "F18",
+        K::F19 => "F19",
+        K::F20 => "F20",
+        K::F21 => "F21",
+        K::F22 => "F22",
+        K::F23 => "F23",
+        K::F24 => "F24",
+        K::A => "A",
+        K::B => "B",
+        K::C => "C",
+        K::D => "D",
+        K::E => "E",
+        K::F => "F",
+        K::G => "G",
+        K::H => "H",
+        K::I => "I",
+        K::J => "J",
+        K::K => "K",
+        K::L => "L",
+        K::M => "M",
+        K::N => "N",
+        K::O => "O",
+        K::P => "P",
+        K::Q => "Q",
+        K::R => "R",
+        K::S => "S",
+        K::T => "T",
+        K::U => "U",
+        K::V => "V",
+        K::W => "W",
+        K::X => "X",
+        K::Y => "Y",
+        K::Z => "Z",
+        K::Num0 => "0",
+        K::Num1 => "1",
+        K::Num2 => "2",
+        K::Num3 => "3",
+        K::Num4 => "4",
+        K::Num5 => "5",
+        K::Num6 => "6",
+        K::Num7 => "7",
+        K::Num8 => "8",
+        K::Num9 => "9",
+        K::Space => "Space",
+        K::Enter => "Enter",
+        K::Tab => "Tab",
+        K::Escape => "Escape",
+        K::Backspace => "Backspace",
+        K::Insert => "Insert",
+        K::Delete => "Delete",
+        K::Home => "Home",
+        K::End => "End",
+        K::PageUp => "PageUp",
+        K::PageDown => "PageDown",
+        K::ArrowLeft => "Left",
+        K::ArrowRight => "Right",
+        K::ArrowUp => "Up",
+        K::ArrowDown => "Down",
+        _ => return None,
+    })
+}
+
+/// 录制快捷键：返回 egui 里刚按下的组合键，例如 `Ctrl+F8`。
+pub fn capture_egui(ctx: &egui::Context) -> Option<String> {
+    let mut captured = None;
+    ctx.input(|input| {
+        for event in &input.events {
+            if let egui::Event::Key {
+                key,
+                pressed: true,
+                modifiers,
+                ..
+            } = event
+            {
+                let Some(name) = egui_key_name(*key) else {
+                    continue;
+                };
+                let mut parts = Vec::new();
+                if modifiers.ctrl {
+                    parts.push("Ctrl".to_string());
+                }
+                if modifiers.shift {
+                    parts.push("Shift".to_string());
+                }
+                if modifiers.alt {
+                    parts.push("Alt".to_string());
+                }
+                parts.push(name.to_string());
+                captured = Some(parts.join("+"));
+                break;
+            }
+        }
+    });
+    captured
+}
+
+/// 全局快捷键监听器。Drop 时通知线程退出并注销快捷键。
+pub struct GlobalHotkey {
+    #[cfg(windows)]
+    thread_id: u32,
+    #[allow(dead_code)]
+    handle: std::thread::JoinHandle<()>,
+}
+
+/// 注册全局快捷键（目前仅 Windows）。成功时按下快捷键会向 `sender` 发送事件。
+pub fn spawn(hotkey: Hotkey, sender: Sender<()>) -> Result<GlobalHotkey, String> {
+    #[cfg(windows)]
+    {
+        windows_impl::spawn(hotkey, sender)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (hotkey, sender);
+        Err("全局快捷键目前仅支持 Windows".to_string())
+    }
+}
+
+#[cfg(windows)]
+mod windows_impl {
+    use super::{GlobalHotkey, Hotkey};
+    use std::sync::mpsc::{channel, Sender};
+    use std::thread;
+    use std::time::Duration;
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
+    use windows::Win32::System::Threading::GetCurrentThreadId;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_SHIFT,
+        MOD_WIN,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetMessageW, PeekMessageW, PostThreadMessageW, MSG, PM_NOREMOVE, WM_HOTKEY, WM_QUIT,
+    };
+
+    pub fn spawn(hotkey: Hotkey, sender: Sender<()>) -> Result<GlobalHotkey, String> {
+        let (ready_tx, ready_rx) = channel::<Result<u32, String>>();
+        let handle = thread::spawn(move || unsafe {
+            // 先创建线程消息队列，RegisterHotKey(NULL) 的 WM_HOTKEY 会投递到这里。
+            let mut msg = MSG::default();
+            let _ = PeekMessageW(&mut msg, None, 0, 0, PM_NOREMOVE);
+
+            let mut bits = 0u32;
+            if hotkey.ctrl {
+                bits |= MOD_CONTROL.0;
+            }
+            if hotkey.shift {
+                bits |= MOD_SHIFT.0;
+            }
+            if hotkey.alt {
+                bits |= MOD_ALT.0;
+            }
+            if hotkey.win {
+                bits |= MOD_WIN.0;
+            }
+            if let Err(err) = RegisterHotKey(None, 1, HOT_KEY_MODIFIERS(bits), hotkey.key.vk()) {
+                let _ = ready_tx.send(Err(format!("注册全局快捷键失败：{err}")));
+                return;
+            }
+            let thread_id = GetCurrentThreadId();
+            let _ = ready_tx.send(Ok(thread_id));
+
+            loop {
+                let mut msg = MSG::default();
+                let result = GetMessageW(&mut msg, None, 0, 0);
+                if result.0 == 0 || result.0 == -1 {
+                    break;
+                }
+                if msg.message == WM_HOTKEY {
+                    let _ = sender.send(());
+                }
+            }
+            let _ = UnregisterHotKey(None, 1);
+        });
+
+        match ready_rx.recv_timeout(Duration::from_secs(3)) {
+            Ok(Ok(thread_id)) => Ok(GlobalHotkey { thread_id, handle }),
+            Ok(Err(err)) => Err(err),
+            Err(_) => Err("注册全局快捷键超时".to_string()),
+        }
+    }
+
+    impl Drop for GlobalHotkey {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = PostThreadMessageW(self.thread_id, WM_QUIT, WPARAM(0), LPARAM(0));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_and_displays_hotkeys() {
+        let hotkey = Hotkey::parse("Ctrl+Shift+F8").unwrap();
+        assert!(hotkey.ctrl && hotkey.shift && !hotkey.alt);
+        assert_eq!(hotkey.key, Key::F(8));
+        assert_eq!(hotkey.display(), "Ctrl+Shift+F8");
+
+        let single = Hotkey::parse("f9").unwrap();
+        assert!(!single.ctrl && single.key == Key::F(9));
+        assert_eq!(single.display(), "F9");
+
+        assert!(Hotkey::parse("Ctrl+").is_err());
+        assert!(Hotkey::parse("").is_err());
+        assert!(Hotkey::parse("Ctrl+Unknown").is_err());
+    }
+}
