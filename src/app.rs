@@ -879,10 +879,12 @@ impl MhxyApp {
         };
 
         let nearby_area: Option<Rect> = if location.nearby {
+            // 用实际任务坐标算范围框（不是贴边后的 point_x/point_y），
+            // 超出地图的部分由 map_rect 裁到地图边缘，这样黄框位置才和真实坐标对应。
             let (left, top, right, bottom) = map_area(
                 definition,
-                point_x,
-                point_y,
+                location.x as f32,
+                location.y as f32,
                 NEARBY_RADIUS * 2.0,
                 texture_size.x,
                 texture_size.y,
