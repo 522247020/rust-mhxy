@@ -127,6 +127,7 @@ Windows 分发包包含本地 OCR 模型、地图、DirectML 和 VC++ 运行库�
 | `task/horizontal_layout` | `false` 上下排列，`true` 左右排列 |
 | `task/high_chance` | 抓鬼地图是否叠加 50×50 高概率区域 |
 | `task/high_chance/鬼王` | 鬼王地图是否叠加 50×50 高概率区域 |
+| `task/large_font_mode` | 大字体模式：抑制 OCR 截断造成的 y 轴抖动（默认关闭） |
 | `color_gate/enabled` | 是否启用图色门控 |
 | `color_gate/interval_ms` | 门控采样间隔，默认 300 毫秒 |
 | `color_gate/mode` | `all` 全部命中，`any` 任一命中 |
@@ -185,12 +186,13 @@ bash scripts/package-windows.sh
 
 ### 自动构建与发布
 
-[Windows build](https://github.com/522247020/rust-mhxy/actions/workflows/windows.yml) 工作流在 GitHub 的 Windows 环境中构建：
+[Windows build](https://github.com/522247020/rust-mhxy/actions/workflows/windows.yml) 工作流**只在推送 `v*` 标签时触发**（普通 `main` 推送和 Pull Request 不会构建）：
 
-- 推送到 `main`、向 `main` 提交 Pull Request，或手动运行工作流：执行格式检查、编译、打包、Clippy 和测试，成功后上传构建产物，保留 30 天。
-- 推送 `v*` 标签：校验标签与 Cargo 版本一致，所有检查通过后自动创建 GitHub Release，上传 Windows ZIP 和 SHA256 文件。
+- 校验标签与 `Cargo.toml` 版本一致；
+- 执行格式检查、Windows 编译、打包、Clippy 和测试；
+- 全部通过后自动创建 GitHub Release，上传 Windows ZIP 和 SHA256 文件。
 
-发布新版本时，先更新 `Cargo.toml` 的 `package.version` 和 `Cargo.lock`，提交后推送相应标签。工作流使用 GitHub 自带的 `GITHUB_TOKEN` 发布，无需额外配置凭据。
+发布新版本时，先更新 `Cargo.toml` 的 `package.version` 和 `Cargo.lock`，提交并推送 `main`，再推送同名的 `vX.Y.Z` 标签。工作流使用 GitHub 自带的 `GITHUB_TOKEN` 发布，无需额外配置凭据。
 
 ## 项目结构
 

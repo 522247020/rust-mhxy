@@ -31,6 +31,60 @@ const MIN_WINDOW_SIZE_COLLAPSED: Vec2 = Vec2::new(460.0, 460.0);
 struct TaskState {
     location: Option<TaskLocation>,
     map_index: Option<usize>,
+    stabilizer: YStabilizer,
+}
+
+/// 抑制 OCR 把多位 y 截断造成的抖动（如 79,26 偶尔识别成 79,2）。
+/// 同一地图、同一 x 下：大 y 每次 +3，小 y 每次 +1；分数持平取较大的 y。
+/// 地图或 x 变化视为新点位，直接重置。
+#[derive(Default)]
+struct YStabilizer {
+    valid: bool,
+    map_name: String,
+    x: i32,
+    scores: HashMap<i32, i32>,
+    displayed_y: i32,
+}
+
+impl YStabilizer {
+    fn stable_y(&mut self, map_name: &str, x: i32, y: i32) -> i32 {
+        if !self.valid || self.map_name != map_name || self.x != x {
+            self.valid = true;
+            self.map_name = map_name.to_string();
+            self.x = x;
+            self.scores.clear();
+            self.scores.insert(y, 1);
+            self.displayed_y = y;
+            return y;
+        }
+
+        let max_other = self
+            .scores
+            .keys()
+            .copied()
+            .filter(|known| *known != y)
+            .max();
+        let has_other = max_other.is_some();
+        // 只有一个候选时先按 +1，避免先出现的较小值靠 +3 快速堆分。
+        let is_largest = max_other.is_some_and(|max| y > max);
+        let weight = if has_other && is_largest { 3 } else { 1 };
+        *self.scores.entry(y).or_insert(0) += weight;
+        // 避免长时间运行后分数无限增长，导致新点位很难追上来。
+        if self.scores.values().copied().max().unwrap_or(0) > 60 {
+            for score in self.scores.values_mut() {
+                *score /= 2;
+            }
+        }
+
+        let best = self
+            .scores
+            .iter()
+            .max_by(|a, b| a.1.cmp(b.1).then(a.0.cmp(b.0)))
+            .map(|(candidate, _)| *candidate)
+            .unwrap_or(y);
+        self.displayed_y = best;
+        best
+    }
 }
 
 pub struct MhxyApp {
@@ -66,6 +120,7 @@ pub struct MhxyApp {
     applied_region_on_top: Option<bool>,
     remote_feedback: Option<Result<String, String>>,
     notice: Option<String>,
+    show_help: bool,
     last_ocr_secs: Option<f64>,
     config_dirty_since: Option<Instant>,
     save_error: Option<String>,
@@ -143,6 +198,7 @@ impl MhxyApp {
             applied_region_on_top: None,
             remote_feedback: None,
             notice: None,
+            show_help: false,
             last_ocr_secs: None,
             config_dirty_since: None,
             save_error: None,
@@ -207,6 +263,13 @@ impl MhxyApp {
         self.pending_signature = None;
         self.last_signature = None;
         self.last_scan = None;
+    }
+
+    /// 清空所有任务的 y 轴加权历史（切换大字体模式时调用）。
+    fn reset_stabilizers(&mut self) {
+        for state in self.tasks.values_mut() {
+            state.stabilizer = YStabilizer::default();
+        }
     }
 
     fn set_window(&mut self, handle: Option<i64>) {
@@ -629,7 +692,7 @@ impl MhxyApp {
             if !self.task_active(task_type) {
                 continue;
             }
-            let location = locations
+            let mut location = locations
                 .iter()
                 .find(|location| location.task_type == task_type)
                 .cloned();
@@ -667,6 +730,24 @@ impl MhxyApp {
                     }
                 }
             };
+            let mut y_note = None;
+            if self.config.large_font_mode && task_status.is_none() {
+                if let Some(loc) = location.as_mut() {
+                    if let Some(state) = self.tasks.get_mut(task_type) {
+                        let raw_y = loc.y;
+                        let stable_y = state.stabilizer.stable_y(&loc.map_name, loc.x, raw_y);
+                        if stable_y != raw_y {
+                            y_note = Some((raw_y, stable_y));
+                        }
+                        loc.y = stable_y;
+                    }
+                }
+            }
+            if let Some((raw_y, stable_y)) = y_note {
+                self.log_detail(format!(
+                    "{task_type} y 抖动 {raw_y} -> {stable_y}（同 x 加权）"
+                ));
+            }
             let summary = match (&task_status, &location) {
                 (None, Some(location)) => format!(
                     "{task_type} {} ({}, {})",
@@ -1060,6 +1141,17 @@ impl MhxyApp {
                             );
                         });
                     }
+                    ui.add_space(2.0);
+                    if ui
+                        .checkbox(&mut self.config.large_font_mode, "大字体模式")
+                        .on_hover_text(
+                            "OCR 把多位坐标截断导致 y 轴抖动时开启：同一 x 下大数字权重 3、小数字权重 1，持平显示大数字；x 或地图变化会重新绘制",
+                        )
+                        .changed()
+                    {
+                        self.reset_stabilizers();
+                        self.persist();
+                    }
                 });
                 theme::section(ui, "识别方式", |ui| {
                     let previous = self.config.ocr_mode.clone();
@@ -1235,6 +1327,53 @@ impl MhxyApp {
                 self.log_ui(ui);
                 ui.add_space(4.0);
             });
+    }
+
+    fn help_contents(&self, ui: &mut egui::Ui) {
+        ui.label(egui::RichText::new("基本流程").strong());
+        for line in [
+            "1. 打开游戏，程序会自动扫描并选中游戏窗口（也可用下拉框选择、点「刷新」）。",
+            "2. 顶部「开始识别」/「开始监听」启动，「暂停」停止。",
+            "3. 「识别方式」选择本地 PP-OCRv5 或远端 PP-OCR；远端可点「测试连接」。",
+            "4. 「设置识别区域」打开独立窗口，可调整任务栏截图区域并点击取点配置图色门控。",
+        ] {
+            ui.label(egui::RichText::new(line).small());
+        }
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new("识别模式").strong());
+        for line in [
+            "自动（按间隔）：按设定间隔定时识别。",
+            "手动（快捷键）：点「开始监听」后，按快捷键触发一次识别；快捷键可填写或点「录制」。",
+            "大字体模式：OCR 把多位坐标截断导致 y 轴抖动时开启。",
+        ] {
+            ui.label(egui::RichText::new(line).small());
+        }
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new("图色门控").strong());
+        for line in [
+            "在「设置识别区域」窗口里点「手动截图一次」，再点击预览图取点取色。",
+            "默认每 300ms 比对一次点位颜色：命中（有任务）才允许 OCR，未命中（战斗 / 任务完成）暂停 OCR。",
+            "支持全部命中 / 任一命中，并可调每个点的容差与半径；未配置点位时默认允许 OCR。",
+            "手动模式下手动触发会忽略图色门控。",
+        ] {
+            ui.label(egui::RichText::new(line).small());
+        }
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new("其它").strong());
+        for line in [
+            "任务显示：勾选抓鬼 / 鬼王 / 通用任务；高概率区域可分别开关。",
+            "日志：简单只记启动 / 任务开始 / 停止，详细额外记录 OCR 过程与错误。",
+            "设置会自动保存到程序目录的 config.json。",
+        ] {
+            ui.label(egui::RichText::new(line).small());
+        }
+        ui.add_space(6.0);
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("项目地址").small().weak());
+            ui.hyperlink_to("GitHub", crate::APP_REPO_URL)
+                .on_hover_text(crate::APP_REPO_URL);
+        });
     }
 
     fn log_ui(&mut self, ui: &mut egui::Ui) {
@@ -1803,6 +1942,13 @@ impl eframe::App for MhxyApp {
                         {
                             self.set_on_top(!on_top, &ctx);
                         }
+                        if ui
+                            .selectable_label(self.show_help, "说明")
+                            .on_hover_text("使用说明")
+                            .clicked()
+                        {
+                            self.show_help = !self.show_help;
+                        }
                     });
                 });
             });
@@ -1834,6 +1980,16 @@ impl eframe::App for MhxyApp {
                             .truncate(),
                         )
                         .on_hover_text(message);
+                    } else if self.manual_mode() {
+                        let hotkey = Hotkey::parse(&self.config.ocr_hotkey)
+                            .map(|hotkey| hotkey.display())
+                            .unwrap_or_else(|_| self.config.ocr_hotkey.clone());
+                        let text = if self.running {
+                            format!("手动识别 · 按 {hotkey} 触发")
+                        } else {
+                            format!("手动识别 · 快捷键 {hotkey}（未开始监听）")
+                        };
+                        ui.label(egui::RichText::new(text).small().weak());
                     } else {
                         ui.label(
                             egui::RichText::new(format!(
@@ -1862,6 +2018,9 @@ impl eframe::App for MhxyApp {
                         };
                         ui.label(egui::RichText::new(text).small().color(color))
                             .on_hover_text(self.save_error.as_deref().unwrap_or(text));
+                        ui.separator();
+                        ui.hyperlink_to(egui::RichText::new("GitHub").small(), crate::APP_REPO_URL)
+                            .on_hover_text(crate::APP_REPO_URL);
                     });
                 });
             });
@@ -1909,6 +2068,18 @@ impl eframe::App for MhxyApp {
                     self.task_panel(&mut child, task_type);
                 }
             });
+        if self.show_help {
+            let mut open = true;
+            egui::Window::new("使用说明")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(true)
+                .default_width(480.0)
+                .show(&ctx, |ui| self.help_contents(ui));
+            if !open {
+                self.show_help = false;
+            }
+        }
         if !self.show_region_window {
             self.release_preview();
         }
@@ -2101,6 +2272,19 @@ mod tests {
                 elapsed_secs: 0.25,
             }),
         }
+    }
+
+    #[test]
+    fn y_stabilizer_prefers_larger_value_and_resets() {
+        let mut stabilizer = YStabilizer::default();
+        assert_eq!(stabilizer.stable_y("普陀山", 79, 2), 2);
+        assert_eq!(stabilizer.stable_y("普陀山", 79, 26), 26);
+        assert_eq!(stabilizer.stable_y("普陀山", 79, 2), 26);
+        assert_eq!(stabilizer.stable_y("普陀山", 79, 26), 26);
+        // x 变化 → 视为新点位
+        assert_eq!(stabilizer.stable_y("普陀山", 80, 10), 10);
+        // 地图变化 → 重置
+        assert_eq!(stabilizer.stable_y("天宫", 80, 10), 10);
     }
 
     #[test]

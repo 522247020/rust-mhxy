@@ -1,12 +1,9 @@
 name: Windows build
 
+# 只在推送 v* 标签时构建并发布；普通 main 推送和 PR 不再触发。
 on:
   push:
-    branches: [main]
     tags: ['v*']
-  pull_request:
-    branches: [main]
-  workflow_dispatch:
 
 permissions:
   contents: read

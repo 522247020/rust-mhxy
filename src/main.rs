@@ -14,6 +14,7 @@ mod theme;
 use std::sync::Arc;
 
 pub const APP_VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"));
+pub const APP_REPO_URL: &str = "https://github.com/522247020/rust-mhxy";
 
 fn main() -> eframe::Result {
     let config = config::Config::load(&config::default_config_path());

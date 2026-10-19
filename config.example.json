@@ -39,6 +39,8 @@
   "task/high_chance": false,
   // 鬼王的高概率区域开关（独立于抓鬼）
   "task/high_chance/鬼王": false,
+  // 大字体模式：OCR 把多位坐标截断导致 y 轴抖动时开启；同一 x 下大数字权重 3、小数字权重 1
+  "task/large_font_mode": false,
 
   // ---- 图色门控 ----
   // 用少量点位的颜色快速判断「当前有没有任务」：未命中（战斗 / 任务完成）就跳过 OCR。
