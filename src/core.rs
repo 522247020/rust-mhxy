@@ -330,6 +330,21 @@ fn find_coordinate(block: &str) -> Option<(usize, i32, i32)> {
         if second.is_empty() {
             continue;
         }
+        // OCR 可能把坐标的第二个数字换行拆开（例如 "79,2" + "6"）。
+        // 如果后面隔了空格还有数字，就接上去（最多 3 位）。
+        let mut probe = index;
+        while second.len() < 3 {
+            let mut next = probe;
+            while next < chars.len() && chars[next] == ' ' {
+                next += 1;
+            }
+            if next > probe && next < chars.len() && chars[next].is_ascii_digit() {
+                second.push(chars[next]);
+                probe = next + 1;
+            } else {
+                break;
+            }
+        }
         if let (Ok(x), Ok(y)) = (first.parse::<i32>(), second.parse::<i32>()) {
             return Some((byte_offsets[start], x, y));
         }
@@ -635,7 +650,28 @@ mod tests {
                 bottom_y: 0.0,
                 tasks: vec!["鬼王".into()],
             },
+            MapDefinition {
+                name: "普陀山".into(),
+                aliases: vec!["普陀山".into()],
+                image: PathBuf::from("maps/普陀山.png"),
+                left_x: 0.0,
+                right_x: 95.0,
+                top_y: 71.0,
+                bottom_y: 0.0,
+                tasks: vec!["抓鬼".into()],
+            },
         ]
+    }
+
+    #[test]
+    fn rejoins_coordinate_split_across_lines() {
+        // 实际 OCR 结果：坐标 79,26 被换行拆成了 "79.2" 和 "6"。
+        let text = "捉鬼\n：去普陀山79.2\n6附近抓已时四刻";
+        let tasks = parse_tasks(text, &maps(), TaskFilter::default());
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].task_type, "抓鬼");
+        assert_eq!(tasks[0].map_name, "普陀山");
+        assert_eq!((tasks[0].x, tasks[0].y), (79, 26));
     }
 
     #[test]
