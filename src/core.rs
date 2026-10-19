@@ -443,8 +443,69 @@ pub fn parse_tasks(text: &str, maps: &[MapDefinition], filter: TaskFilter) -> Ve
     tasks
 }
 
-/// 在一段文字里找「地图名 + 坐标」，返回指定任务类型的定位结果。
+/// 二次校验：优先解析「去 … 附近 / 去 … 处」中间的连续文字。
+/// 游戏里这段（地图名 + 坐标）本来就是一个整体，OCR 的换行/空格都是噪声，
+/// 去掉空白后再取坐标，可以避免把 "79,26" 拆成 "79,2" + "6"。
 fn locate_in_text(block: &str, maps: &[MapDefinition], task_type: &str) -> Option<TaskLocation> {
+    let nearby = compact(block).contains("附近");
+    let mut location =
+        travel_segment(block).and_then(|segment| locate_at(&segment, maps, task_type));
+    if location.is_none() {
+        location = locate_at(block, maps, task_type);
+    }
+    if let Some(location) = &mut location {
+        location.nearby = nearby;
+    }
+    location
+}
+
+/// 取「去 / 前往」到「附近 / 处」之间的文字，并去掉所有空白。
+fn travel_segment(block: &str) -> Option<String> {
+    let chars: Vec<char> = block.chars().collect();
+    let mut start = None;
+    let mut index = 0;
+    while index < chars.len() {
+        if chars[index] == '去' {
+            start = Some(index + 1);
+            break;
+        }
+        if chars[index] == '前' && index + 1 < chars.len() && chars[index + 1] == '往' {
+            start = Some(index + 2);
+            break;
+        }
+        index += 1;
+    }
+    let start = start?;
+    let mut end = start;
+    while end < chars.len() {
+        let is_nearby = chars[end] == '附' && end + 1 < chars.len() && chars[end + 1] == '近';
+        // 「处」必须紧跟在数字后面，避免把「处理」之类的词当成任务定位词。
+        let is_place = chars[end] == '处' && prev_char_is_digit(&chars, end);
+        if is_nearby || is_place {
+            let segment: String = chars[start..end]
+                .iter()
+                .filter(|ch| !ch.is_whitespace())
+                .collect();
+            return (!segment.is_empty()).then_some(segment);
+        }
+        end += 1;
+    }
+    None
+}
+
+fn prev_char_is_digit(chars: &[char], index: usize) -> bool {
+    let mut cursor = index;
+    while cursor > 0 {
+        cursor -= 1;
+        if !chars[cursor].is_whitespace() {
+            return chars[cursor].is_ascii_digit();
+        }
+    }
+    false
+}
+
+/// 在一段（已归一化的）文字里找「地图名 + 坐标」。
+fn locate_at(block: &str, maps: &[MapDefinition], task_type: &str) -> Option<TaskLocation> {
     let (coordinate_start, x, y) = find_coordinate(block)?;
     let compact_block = compact(block);
     let candidates: Vec<&MapDefinition> = maps
@@ -672,6 +733,24 @@ mod tests {
         assert_eq!(tasks[0].task_type, "抓鬼");
         assert_eq!(tasks[0].map_name, "普陀山");
         assert_eq!((tasks[0].x, tasks[0].y), (79, 26));
+        assert!(tasks[0].nearby);
+    }
+
+    #[test]
+    fn secondary_check_handles_qu_chu_form() {
+        // 鬼王常见写法：「去天宫56,78处」，中间连续；换行拆开也能拼回。
+        let text = "鬼王\n：去天宫56.7\n8处";
+        let filter = TaskFilter {
+            zhuagui: false,
+            ghost_king: true,
+            generic: false,
+        };
+        let tasks = parse_tasks(text, &maps(), filter);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].task_type, "鬼王");
+        assert_eq!(tasks[0].map_name, "天宫");
+        assert_eq!((tasks[0].x, tasks[0].y), (56, 78));
+        assert!(!tasks[0].nearby);
     }
 
     #[test]
