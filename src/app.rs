@@ -18,6 +18,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const TASK_ORDER: [&str; 3] = ["抓鬼", "鬼王", "通用"];
+/// 「附近」范围框的半径（游戏坐标），所以框的边长是 2 倍。
+const NEARBY_RADIUS: f32 = 50.0;
 /// 侧栏日志框的最大高度。
 /// 侧栏日志框的最小高度；实际高度随窗口高度变化。
 const LOG_PANEL_MIN_HEIGHT: f32 = 140.0;
@@ -696,6 +698,7 @@ impl MhxyApp {
                 .iter()
                 .find(|location| location.task_type == task_type)
                 .cloned();
+            let mut clamp_note = None;
             let (map_index, task_status) = match &location {
                 None => (None, Some("本轮未识别到任务".to_string())),
                 Some(location) => {
@@ -706,14 +709,21 @@ impl MhxyApp {
                             Some(definition) => {
                                 let index =
                                     self.maps.iter().position(|map| map.name == definition.name);
-                                if !coordinate_in_map(
-                                    definition,
-                                    location.x as f32,
-                                    location.y as f32,
-                                    MAP_COORDINATE_TOLERANCE,
-                                ) {
+                                let x = location.x as f32;
+                                let y = location.y as f32;
+                                let strict =
+                                    coordinate_in_map(definition, x, y, MAP_COORDINATE_TOLERANCE);
+                                // 地图截图可能只截了地图的一部分，坐标超出较多时仍贴边显示；
+                                // 超出 50% 以上才当作 OCR 噪声丢弃。
+                                if !coordinate_in_map(definition, x, y, 0.5) {
                                     (None, Some("本轮坐标无效，忽略".to_string()))
                                 } else {
+                                    if !strict {
+                                        clamp_note = Some(format!(
+                                            "{task_type} 坐标 ({}, {}) 超出地图范围，已贴边显示",
+                                            location.x, location.y
+                                        ));
+                                    }
                                     (index, None)
                                 }
                             }
@@ -747,6 +757,9 @@ impl MhxyApp {
                 self.log_detail(format!(
                     "{task_type} y 抖动 {raw_y} -> {stable_y}（同 x 加权）"
                 ));
+            }
+            if let Some(note) = clamp_note {
+                self.log_detail(note);
             }
             let summary = match (&task_status, &location) {
                 (None, Some(location)) => format!(
@@ -870,7 +883,7 @@ impl MhxyApp {
                 definition,
                 point_x,
                 point_y,
-                50.0,
+                NEARBY_RADIUS * 2.0,
                 texture_size.x,
                 texture_size.y,
             );

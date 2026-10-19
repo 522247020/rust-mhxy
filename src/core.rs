@@ -845,21 +845,46 @@ mod tests {
     }
 
     #[test]
+    fn half_tolerance_accepts_cropped_map_coordinates() {
+        let maps = maps();
+        let putuo = maps.iter().find(|map| map.name == "普陀山").unwrap();
+        // 任务文字里出现 57,94，但地图标定只到 y=71（截图可能只截了地图的一部分）。
+        assert!(!coordinate_in_map(
+            putuo,
+            57.0,
+            94.0,
+            MAP_COORDINATE_TOLERANCE
+        ));
+        assert!(coordinate_in_map(putuo, 57.0, 94.0, 0.5));
+    }
+
+    #[test]
     fn high_chance_areas_follow_quadrants() {
-        // 左上角小坐标 → 右上角格子（最终换成左下角）
+        // 小坐标（x<150 && y<150）在所有地图上都多画一个左上方格子。
+        // 北俱芦洲 73,74：右上方 + 左上方。
         assert_eq!(
-            high_chance_areas("某某地图", 100.0, 100.0, 50.0),
-            vec![(50.0, 50.0)]
+            high_chance_areas("北俱芦洲", 73.0, 74.0, 50.0),
+            vec![(23.0, 74.0), (23.0, 24.0)]
         );
-        // 右下角大坐标 → 左下方格子
+        // 长寿村 32,61：右上方 + 左上方。
         assert_eq!(
-            high_chance_areas("某某地图", 200.0, 200.0, 50.0),
-            vec![(200.0, 200.0)]
+            high_chance_areas("长寿村", 32.0, 61.0, 50.0),
+            vec![(-18.0, 61.0), (-18.0, 11.0)]
         );
-        // 普陀山 / 五庄观无论象限都补左上角
+        // 大坐标只取左上方一格。
         assert_eq!(
-            high_chance_areas("普陀山", 50.0, 50.0, 50.0),
-            vec![(0.0, 0.0)]
+            high_chance_areas("麒麟山", 175.0, 175.0, 50.0),
+            vec![(175.0, 175.0)]
+        );
+        // 右下角只取自己那一格。
+        assert_eq!(
+            high_chance_areas("北俱芦洲", 200.0, 40.0, 50.0),
+            vec![(200.0, -10.0)]
+        );
+        // 普陀山 / 五庄观 x==y 时补左上格。
+        assert_eq!(
+            high_chance_areas("普陀山", 30.0, 30.0, 50.0),
+            vec![(-20.0, -20.0)]
         );
     }
 
