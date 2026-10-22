@@ -109,6 +109,32 @@ jobs:
             echo "安装 cargo-xwin"
             cargo install cargo-xwin --locked
           fi
+          if ! command -v cargo-xwin >/dev/null 2>&1; then
+            echo "安装 cargo-xwin"
+            cargo install cargo-xwin --locked
+          fi
+
+          # cargo-xwin 编译 C 依赖需要 clang；lld-link/llvm-lib 由 rust 的 llvm-tools 提供
+          if ! command -v clang >/dev/null 2>&1; then
+            echo "安装 clang / lld / llvm"
+            if command -v sudo >/dev/null 2>&1; then
+              sudo apt-get update && sudo apt-get install -y clang lld llvm
+            else
+              apt-get update && apt-get install -y clang lld llvm
+            fi
+          fi
+          if ! command -v clang-cl >/dev/null 2>&1; then
+            echo "生成 clang-cl 兼容入口"
+            printf '#!/bin/sh\nexec clang --driver-mode=cl "$@"\n' > "$CARGO_HOME/bin/clang-cl"
+            chmod +x "$CARGO_HOME/bin/clang-cl"
+          fi
+          if ! command -v lld-link >/dev/null 2>&1; then
+            lld_bin="$(ls /usr/bin/lld-link* 2>/dev/null | head -1)"
+            if [ -n "$lld_bin" ]; then
+              ln -sf "$lld_bin" "$CARGO_HOME/bin/lld-link"
+            fi
+          fi
+          rustup component add llvm-tools >/dev/null 2>&1 || true
           command -v rsync >/dev/null 2>&1 || {
             echo "安装 rsync"
             (command -v sudo >/dev/null 2>&1 && sudo apt-get update && sudo apt-get install -y rsync) ||
