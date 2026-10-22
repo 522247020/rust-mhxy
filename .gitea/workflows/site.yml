@@ -1,0 +1,70 @@
+name: Build and deploy download site
+
+# Gitea Actions：推送 v* 标签或手动运行时，构建 Windows 包并同步下载站。
+# Runner 要求（自建、Linux）：Rust + x86_64-pc-windows-msvc target、cargo-xwin、
+# Python 3.11+、rsync、能访问 crates.io / 模型源，以及下面的 site secrets。
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Prepare source
+        run: |
+          if [ ! -f Cargo.toml ]; then
+            git clone --depth 1 --branch "${GITHUB_REF_NAME}" "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" .
+          fi
+          git log -1 --oneline
+
+      - name: Check toolchain
+        run: |
+          python3 --version
+          if ! command -v cargo >/dev/null 2>&1; then
+            echo "::error::runner 需要预装 Rust（含 x86_64-pc-windows-msvc target 和 cargo-xwin）"
+            exit 1
+          fi
+          cargo --version
+          rustup target list --installed | grep -q x86_64-pc-windows-msvc || \
+            rustup target add x86_64-pc-windows-msvc
+          command -v cargo-xwin >/dev/null 2>&1 || cargo install cargo-xwin --locked
+
+      - name: Build Windows package
+        run: bash scripts/package-windows.sh
+
+      - name: Build download site
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          notes_file=""
+          if [ -s site/notes.txt ]; then
+            notes_file="site/notes.txt"
+          fi
+          if [ -n "$notes_file" ]; then
+            python3 scripts/build-site.py --notes-file "$notes_file"
+          else
+            python3 scripts/build-site.py --notes "${VERSION:-手动部署}"
+          fi
+
+      - name: Deploy to website
+        env:
+          SITE_SSH_HOST: ${{ secrets.SITE_SSH_HOST }}
+          SITE_SSH_USER: ${{ secrets.SITE_SSH_USER }}
+          SITE_SSH_PORT: ${{ secrets.SITE_SSH_PORT }}
+          SITE_SSH_KEY: ${{ secrets.SITE_SSH_KEY }}
+          SITE_PATH: ${{ secrets.SITE_PATH }}
+        run: |
+          if [ -z "$SITE_SSH_HOST" ]; then
+            echo "::warning::未配置 SITE_SSH_HOST，跳过部署（站点在 dist/site）"
+            exit 0
+          fi
+          if [ -n "$SITE_SSH_KEY" ]; then
+            install -m 700 -d ~/.ssh
+            printf '%s\n' "$SITE_SSH_KEY" > ~/.ssh/deploy_key
+            chmod 600 ~/.ssh/deploy_key
+            export SITE_SSH_KEY="$HOME/.ssh/deploy_key"
+          fi
+          bash scripts/deploy-site.sh dist/site

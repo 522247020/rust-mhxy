@@ -57,6 +57,30 @@ fn stack_panels(panels: &[RgbImage]) -> RgbImage {
     combined
 }
 
+/// 从已截取的客户区里切出主区域（以及可选的备用区域），纵向拼接为一张。
+pub fn task_panels(full: &RgbImage, region: TaskRegion, extra: Option<TaskRegion>) -> RgbImage {
+    let mut panels = vec![crop_region(full, region)];
+    if let Some(extra) = extra {
+        panels.push(crop_region(full, extra));
+    }
+    stack_panels(&panels)
+}
+
+/// 截取完整客户区（不做裁剪），供分区预处理使用。
+pub fn capture_client(handle: i64, region: TaskRegion) -> Result<RgbImage, String> {
+    imp::capture_client(handle, region)
+}
+
+/// 把多张图纵向拼接（区域之间留白），用于送一次 OCR。
+pub fn stack_images(panels: &[RgbImage]) -> RgbImage {
+    stack_panels(panels)
+}
+
+/// 从整张客户区截图中裁剪出一个识别区域。
+pub fn crop_task_region(full: &RgbImage, region: TaskRegion) -> RgbImage {
+    crop_region(full, region)
+}
+
 /// 截图并切出主区域（以及可选的备用区域），返回 (拼接后的面板, 完整客户区截图)。
 pub fn capture_task_panel(
     handle: i64,
@@ -64,11 +88,7 @@ pub fn capture_task_panel(
     extra: Option<TaskRegion>,
 ) -> Result<(RgbImage, RgbImage), String> {
     let full = imp::capture_client(handle, region)?;
-    let mut panels = vec![crop_region(&full, region)];
-    if let Some(extra) = extra {
-        panels.push(crop_region(&full, extra));
-    }
-    Ok((stack_panels(&panels), full))
+    Ok((task_panels(&full, region, extra), full))
 }
 
 pub fn list_windows() -> Result<Vec<WindowInfo>, String> {

@@ -9,25 +9,51 @@ use crate::core::{
 use crate::gate::{self, ColorPoint, GateMode};
 use crate::hotkey::{self, GlobalHotkey, Hotkey};
 use crate::ocr::{self, LocalWorker, OcrEvent, OcrText};
+use crate::preprocess;
 use crate::theme;
+use crate::update::{self, UpdateInfo};
 use egui::{pos2, vec2, Align2, Color32, CornerRadius, FontId, Rect, Sense, TextureHandle, Vec2};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 const TASK_ORDER: [&str; 3] = ["抓鬼", "鬼王", "通用"];
 /// 「附近」范围框的半径（游戏坐标），所以框的边长是 2 倍。
 const NEARBY_RADIUS: f32 = 50.0;
-/// 侧栏日志框的最大高度。
-/// 侧栏日志框的最小高度；实际高度随窗口高度变化。
+/// 日志框的最小高度；实际高度随窗口高度变化。
 const LOG_PANEL_MIN_HEIGHT: f32 = 140.0;
 /// 日志框占窗口可用高度的比例。
 const LOG_PANEL_HEIGHT_RATIO: f32 = 0.34;
 /// 侧栏展开 / 收起时的最小窗口尺寸。
 const MIN_WINDOW_SIZE_EXPANDED: Vec2 = Vec2::new(760.0, 540.0);
 const MIN_WINDOW_SIZE_COLLAPSED: Vec2 = Vec2::new(460.0, 460.0);
+/// 定时检查更新的间隔。
+const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(30 * 60);
+/// 说明 / 更新窗口的默认尺寸。
+const HELP_WINDOW_SIZE: Vec2 = Vec2::new(560.0, 640.0);
+const UPDATE_WINDOW_SIZE: Vec2 = Vec2::new(480.0, 540.0);
+/// 检查结果在按钮上停留的时间。
+const UPDATE_FLASH_DURATION: Duration = Duration::from_secs(4);
+
+/// 自动更新的进度阶段。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UpdatePhase {
+    Idle,
+    Checking,
+    Available,
+    Downloading,
+    Downloaded,
+    Failed,
+}
+
+enum UpdateEvent {
+    Checked(Result<Option<UpdateInfo>, String>),
+    Downloaded(Result<PathBuf, String>),
+}
 
 #[derive(Default)]
 struct TaskState {
@@ -107,10 +133,20 @@ pub struct MhxyApp {
     map_texture_failed: HashSet<String>,
     preview_image: Option<image::RgbImage>,
     preview_texture: Option<TextureHandle>,
+    /// 预处理后的任务区域缩略图（只在取点窗口打开时存在）。
+    preprocess_preview: Option<TextureHandle>,
+    preprocess_preview_extra: Option<TextureHandle>,
+    /// 预处理设置当前编辑主区域（false）还是备用区域（true）。
+    preprocess_target_extra: bool,
     client_size: Option<(u32, u32)>,
     region_window_pos: Option<egui::Pos2>,
     show_region_window: bool,
     pick_points: bool,
+    /// 开启后点击预览取的是“文字颜色”而不是图色点位。
+    pick_text_color: bool,
+    /// 取点窗口「测试 OCR」的状态与结果。
+    ocr_test_running: bool,
+    ocr_test_result: Option<Result<String, String>>,
     gate_active: bool,
     last_gate_check: Instant,
     gate_result: Option<gate::GateResult>,
@@ -130,6 +166,28 @@ pub struct MhxyApp {
     last_window_refresh: Instant,
     api_url_edit: String,
     api_token_edit: String,
+    /// 预处理文字颜色的十六进制输入框。
+    preprocess_color_edit: String,
+    extra_preprocess_color_edit: String,
+    update_tx: Sender<UpdateEvent>,
+    update_rx: Receiver<UpdateEvent>,
+    update_phase: UpdatePhase,
+    update_info: Option<UpdateInfo>,
+    update_progress: Arc<AtomicU64>,
+    update_cancel: Arc<AtomicBool>,
+    update_zip: Option<PathBuf>,
+    update_message: Option<String>,
+    update_message_at: Option<Instant>,
+    update_error: Option<String>,
+    last_update_check: Option<Instant>,
+    show_update_dialog: bool,
+    profile_saving: bool,
+    profile_name_edit: String,
+    help_window_pos: Option<egui::Pos2>,
+    update_window_pos: Option<egui::Pos2>,
+    applied_help_on_top: Option<bool>,
+    applied_update_on_top: Option<bool>,
+    started_at: Instant,
     worker: LocalWorker,
     receiver: Receiver<OcrEvent>,
     sender: Sender<OcrEvent>,
@@ -164,6 +222,7 @@ impl MhxyApp {
         let (sender, receiver) = channel::<OcrEvent>();
         let worker = LocalWorker::spawn(sender.clone(), ctx.clone());
         let (hotkey_tx, hotkey_rx) = channel::<()>();
+        let (update_tx, update_rx) = channel::<UpdateEvent>();
         let mut tasks = HashMap::new();
         for task in TASK_ORDER {
             tasks.insert(task, TaskState::default());
@@ -171,6 +230,27 @@ impl MhxyApp {
         let mut app = Self {
             api_url_edit: config.api_url.clone(),
             api_token_edit: config.api_token.clone(),
+            preprocess_color_edit: gate::to_hex(config.preprocess_color),
+            extra_preprocess_color_edit: gate::to_hex(config.extra_preprocess_color),
+            update_tx: update_tx.clone(),
+            update_rx,
+            update_phase: UpdatePhase::Idle,
+            update_info: None,
+            update_progress: Arc::new(AtomicU64::new(0)),
+            update_cancel: Arc::new(AtomicBool::new(false)),
+            update_zip: None,
+            update_message: None,
+            update_message_at: None,
+            update_error: None,
+            last_update_check: None,
+            show_update_dialog: false,
+            profile_saving: false,
+            profile_name_edit: String::new(),
+            help_window_pos: None,
+            update_window_pos: None,
+            applied_help_on_top: None,
+            applied_update_on_top: None,
+            started_at: Instant::now(),
             config,
             config_path,
             maps,
@@ -187,10 +267,16 @@ impl MhxyApp {
             map_texture_failed: HashSet::new(),
             preview_image: None,
             preview_texture: None,
+            preprocess_preview: None,
+            preprocess_preview_extra: None,
+            preprocess_target_extra: false,
             client_size: None,
             region_window_pos: None,
             show_region_window: false,
             pick_points: true,
+            pick_text_color: false,
+            ocr_test_running: false,
+            ocr_test_result: None,
             gate_active: true,
             last_gate_check: Instant::now(),
             gate_result: None,
@@ -247,7 +333,265 @@ impl MhxyApp {
         }
     }
 
-    /// 拖动和连续输入只在停顿后落盘，避免每一帧都重写配置。
+    // ---- 自动更新 ----
+
+    fn start_update_check(&mut self, manual: bool) {
+        if matches!(
+            self.update_phase,
+            UpdatePhase::Checking | UpdatePhase::Downloading
+        ) {
+            return;
+        }
+        self.last_update_check = Some(Instant::now());
+        self.update_error = None;
+        if manual {
+            self.update_message = None;
+        }
+        if !self.config.update_enabled && !manual {
+            return;
+        }
+        if self.config.update_manifest_url.trim().is_empty() {
+            if manual {
+                self.update_phase = UpdatePhase::Failed;
+                self.update_error =
+                    Some("更新地址为空，请在 config.json 设置 update/manifest_url".into());
+            }
+            return;
+        }
+        self.update_phase = UpdatePhase::Checking;
+        let url = self.config.update_manifest_url.clone();
+        let sender = self.update_tx.clone();
+        let ctx = self.ctx.clone();
+        thread::spawn(move || {
+            let result = update::check(&url, crate::APP_VERSION);
+            let _ = sender.send(UpdateEvent::Checked(result));
+            ctx.request_repaint();
+        });
+    }
+
+    fn start_update_download(&mut self) {
+        let Some(info) = self.update_info.clone() else {
+            return;
+        };
+        self.update_phase = UpdatePhase::Downloading;
+        self.update_error = None;
+        self.update_progress.store(0, Ordering::Relaxed);
+        self.update_cancel.store(false, Ordering::Relaxed);
+        let destination = update::temp_package(&info.version);
+        let sender = self.update_tx.clone();
+        let ctx = self.ctx.clone();
+        let progress = self.update_progress.clone();
+        let cancel = self.update_cancel.clone();
+        thread::spawn(move || {
+            let result =
+                update::download_to(&info.url, &destination, &info.sha256, &progress, &cancel)
+                    .map(|()| destination);
+            let _ = sender.send(UpdateEvent::Downloaded(result));
+            ctx.request_repaint();
+        });
+    }
+
+    fn update_dialog_ui(&mut self, ui: &mut egui::Ui) {
+        let Some(info) = self.update_info.clone() else {
+            ui.label("暂时没有可用的更新信息。");
+            return;
+        };
+        ui.label(
+            egui::RichText::new(format!(
+                "当前 {} → 最新 {}",
+                crate::APP_VERSION,
+                info.version
+            ))
+            .strong(),
+        );
+        ui.label(
+            egui::RichText::new(format!("安装包 {:.1} MB", info.size as f64 / 1_048_576.0))
+                .small()
+                .weak(),
+        );
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new("更新内容").strong());
+        egui::Frame::new()
+            .fill(theme::inset())
+            .corner_radius(6)
+            .inner_margin(8)
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                egui::ScrollArea::vertical()
+                    .id_salt("update_notes")
+                    .max_height(200.0)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        let notes = info.notes.trim();
+                        if notes.is_empty() {
+                            ui.label("本次更新以修复和优化为主。");
+                        } else {
+                            for line in notes.lines() {
+                                let line = line.trim();
+                                if !line.is_empty() {
+                                    ui.label(format!("• {line}"));
+                                }
+                            }
+                        }
+                    });
+            });
+        if let Some(err) = &self.update_error {
+            ui.label(egui::RichText::new(err).small().color(theme::red()));
+        }
+        ui.label(
+            egui::RichText::new(format!("清单：{}", self.config.update_manifest_url))
+                .small()
+                .weak(),
+        );
+        ui.add_space(6.0);
+        match self.update_phase {
+            UpdatePhase::Downloading => {
+                let total = info.size;
+                let downloaded = self.update_progress.load(Ordering::Relaxed);
+                let ratio = if total > 0 {
+                    (downloaded as f32 / total as f32).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                ui.add(egui::ProgressBar::new(ratio).text(format!(
+                    "下载中 {:.0}% · {:.1}/{:.1} MB",
+                    ratio * 100.0,
+                    downloaded as f64 / 1_048_576.0,
+                    total as f64 / 1_048_576.0
+                )));
+                if ui.button("取消下载").clicked() {
+                    self.update_cancel.store(true, Ordering::Relaxed);
+                }
+            }
+            UpdatePhase::Downloaded => {
+                ui.horizontal(|ui| {
+                    if ui.add(theme::primary_button("立即重启并更新")).clicked() {
+                        self.install_update();
+                    }
+                    if ui.button("稍后").clicked() {
+                        self.show_update_dialog = false;
+                    }
+                });
+            }
+            _ => {
+                ui.horizontal(|ui| {
+                    if ui.add(theme::primary_button("下载并更新")).clicked() {
+                        self.start_update_download();
+                    }
+                    if ui.button("稍后").clicked() {
+                        self.show_update_dialog = false;
+                    }
+                    ui.hyperlink_to(egui::RichText::new("打开发布页").small(), update::HOME_URL);
+                });
+            }
+        }
+    }
+
+    fn install_update(&mut self) {
+        let Some(zip) = self.update_zip.clone() else {
+            return;
+        };
+        self.show_update_dialog = false;
+        self.flush_config();
+        match update::apply_and_restart(&zip) {
+            Ok(()) => {
+                self.notice = Some("正在重启以完成更新…".to_string());
+                self.ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            Err(err) => {
+                self.update_phase = UpdatePhase::Failed;
+                self.update_error = Some(err);
+            }
+        }
+    }
+
+    fn poll_updates(&mut self) {
+        while let Ok(event) = self.update_rx.try_recv() {
+            match event {
+                UpdateEvent::Checked(Ok(Some(info))) => {
+                    self.update_message = Some(format!("发现新版本 {}", info.version));
+                    self.update_message_at = Some(Instant::now());
+                    self.log(format!(
+                        "发现新版本 {}，可在右上角「检查更新」按钮更新",
+                        info.version
+                    ));
+                    self.update_info = Some(info);
+                    self.update_phase = UpdatePhase::Available;
+                    self.update_error = None;
+                    if self
+                        .notice
+                        .as_deref()
+                        .is_some_and(|notice| notice.starts_with("检查更新失败"))
+                    {
+                        self.notice = None;
+                    }
+                }
+                UpdateEvent::Checked(Ok(None)) => {
+                    self.update_message = Some("已是最新版本".to_string());
+                    self.update_message_at = Some(Instant::now());
+                    self.log_detail(format!("已是最新版本（{}）", crate::APP_VERSION));
+                    self.update_info = None;
+                    self.update_phase = UpdatePhase::Idle;
+                    self.update_error = None;
+                    if self
+                        .notice
+                        .as_deref()
+                        .is_some_and(|notice| notice.starts_with("检查更新失败"))
+                    {
+                        self.notice = None;
+                    }
+                }
+                UpdateEvent::Checked(Err(err)) => {
+                    self.update_phase = UpdatePhase::Failed;
+                    self.update_message = Some("检查失败".to_string());
+                    self.update_message_at = Some(Instant::now());
+                    let url = self.config.update_manifest_url.clone();
+                    let message = format!("检查更新失败：{err}（{url}）");
+                    self.log_detail(message.clone());
+                    self.notice = Some(message);
+                    self.update_error = Some(err);
+                }
+                UpdateEvent::Downloaded(Ok(path)) => {
+                    self.update_zip = Some(path);
+                    self.update_phase = UpdatePhase::Downloaded;
+                    self.update_message = Some("安装包已就绪".to_string());
+                    self.update_message_at = Some(Instant::now());
+                    self.update_error = None;
+                }
+                UpdateEvent::Downloaded(Err(err)) => {
+                    self.update_phase = UpdatePhase::Failed;
+                    self.update_error = Some(err);
+                }
+            }
+        }
+    }
+
+    fn sidebar_section_open(&self, id: &str) -> bool {
+        !self
+            .config
+            .sidebar_folded
+            .split(',')
+            .any(|item| item.trim() == id)
+    }
+
+    fn set_sidebar_section_open(&mut self, id: &str, open: bool) {
+        let mut folded: Vec<String> = self
+            .config
+            .sidebar_folded
+            .split(',')
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(str::to_string)
+            .collect();
+        if open {
+            folded.retain(|item| item != id);
+        } else if !folded.iter().any(|item| item == id) {
+            folded.push(id.to_string());
+        }
+        self.config.sidebar_folded = folded.join(",");
+        self.persist();
+    }
+
     fn persist(&mut self) {
         self.config_dirty_since = Some(Instant::now());
         self.ctx.request_repaint_after(Duration::from_millis(500));
@@ -346,12 +690,235 @@ impl MhxyApp {
             ));
         }
         self.preview_image = Some(image);
+        self.refresh_preprocess_preview();
     }
 
     /// 关闭取点工具后释放截图和纹理。
     fn release_preview(&mut self) {
         self.preview_image = None;
         self.preview_texture = None;
+        self.preprocess_preview = None;
+        self.preprocess_preview_extra = None;
+    }
+
+    /// 用当前截图和预处理设置生成小预览，方便在取点窗口里确认效果。
+    fn refresh_preprocess_preview(&mut self) {
+        let Some(full) = self.preview_image.as_ref() else {
+            self.preprocess_preview = None;
+            self.preprocess_preview_extra = None;
+            return;
+        };
+        let main = capture::crop_task_region(full, self.config.task_region);
+        let main = preprocess::apply(
+            main,
+            self.preprocess_pipeline_for(false),
+            self.config.preprocess_color,
+            self.config.preprocess_tolerance,
+        );
+        let main_color = to_color_image(&main);
+        if let Some(texture) = &mut self.preprocess_preview {
+            texture.set(main_color, egui::TextureOptions::LINEAR);
+        } else {
+            self.preprocess_preview = Some(self.ctx.load_texture(
+                "preprocess_preview_main",
+                main_color,
+                egui::TextureOptions::LINEAR,
+            ));
+        }
+
+        if self.config.extra_region_enabled {
+            let extra = capture::crop_task_region(full, self.config.extra_task_region);
+            let extra = preprocess::apply(
+                extra,
+                self.preprocess_pipeline_for(true),
+                self.config.extra_preprocess_color,
+                self.config.extra_preprocess_tolerance,
+            );
+            let extra_color = to_color_image(&extra);
+            if let Some(texture) = &mut self.preprocess_preview_extra {
+                texture.set(extra_color, egui::TextureOptions::LINEAR);
+            } else {
+                self.preprocess_preview_extra = Some(self.ctx.load_texture(
+                    "preprocess_preview_extra",
+                    extra_color,
+                    egui::TextureOptions::LINEAR,
+                ));
+            }
+        } else {
+            self.preprocess_preview_extra = None;
+        }
+    }
+
+    fn profile_dirty(&self) -> bool {
+        let current = Config::profile_from_current(&self.config);
+        self.config
+            .profiles
+            .iter()
+            .find(|profile| profile.name == self.config.active_profile)
+            .is_none_or(|profile| *profile != current)
+    }
+
+    fn apply_profile(&mut self, name: &str) {
+        let Some(profile) = self
+            .config
+            .profiles
+            .iter()
+            .find(|profile| profile.name == name)
+            .cloned()
+        else {
+            return;
+        };
+        self.config.active_profile = profile.name.clone();
+        self.config.color_gate_enabled = profile.gate_enabled;
+        self.config.color_gate_interval_ms = profile.gate_interval_ms;
+        self.config.color_gate_mode = profile.gate_mode;
+        self.config.color_gate_tolerance = profile.gate_tolerance;
+        self.config.color_gate_points = profile.gate_points;
+        self.config.preprocess_mode = profile.preprocess_mode;
+        self.config.preprocess_color = profile.preprocess_color;
+        self.config.preprocess_tolerance = profile.preprocess_tolerance;
+        self.config.extra_preprocess_mode = profile.extra_preprocess_mode;
+        self.config.extra_preprocess_color = profile.extra_preprocess_color;
+        self.config.extra_preprocess_tolerance = profile.extra_preprocess_tolerance;
+        self.preprocess_color_edit = gate::to_hex(self.config.preprocess_color);
+        self.extra_preprocess_color_edit = gate::to_hex(self.config.extra_preprocess_color);
+        self.invalidate_scan();
+        self.check_gate();
+        self.refresh_preprocess_preview();
+        self.persist();
+        self.log_detail(format!("切换识别方案：{name}"));
+    }
+
+    fn save_active_profile(&mut self) {
+        let current = Config::profile_from_current(&self.config);
+        if let Some(profile) = self
+            .config
+            .profiles
+            .iter_mut()
+            .find(|profile| profile.name == self.config.active_profile)
+        {
+            *profile = current;
+            self.persist();
+            self.notice = Some(format!("已保存方案「{}」", self.config.active_profile));
+        }
+    }
+
+    fn create_profile(&mut self) {
+        let mut name = self.profile_name_edit.trim().to_string();
+        if name.is_empty() {
+            name = format!("方案 {}", self.config.profiles.len() + 1);
+        }
+        let mut unique = name.clone();
+        let mut index = 2;
+        while self
+            .config
+            .profiles
+            .iter()
+            .any(|profile| profile.name == unique)
+        {
+            unique = format!("{name} {index}");
+            index += 1;
+        }
+        self.config.active_profile = unique.clone();
+        let profile = Config::profile_from_current(&self.config);
+        self.config.profiles.push(profile);
+        self.profile_saving = false;
+        self.persist();
+        self.notice = Some(format!("已新建方案「{unique}」"));
+    }
+
+    fn delete_active_profile(&mut self) {
+        if self.config.profiles.len() <= 1 {
+            return;
+        }
+        let name = self.config.active_profile.clone();
+        self.config.profiles.retain(|profile| profile.name != name);
+        if let Some(first) = self
+            .config
+            .profiles
+            .first()
+            .map(|profile| profile.name.clone())
+        {
+            self.apply_profile(&first);
+        }
+        self.notice = Some(format!("已删除方案「{name}」"));
+    }
+
+    fn profile_ui(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new("识别方案").strong());
+            let dirty = self.profile_dirty();
+            let label = if dirty {
+                format!("{} *", self.config.active_profile)
+            } else {
+                self.config.active_profile.clone()
+            };
+            let mut chosen: Option<String> = None;
+            egui::ComboBox::from_id_salt("profile_select")
+                .selected_text(label)
+                .width(150.0)
+                .show_ui(ui, |ui| {
+                    for profile in &self.config.profiles {
+                        if ui
+                            .selectable_label(
+                                profile.name == self.config.active_profile,
+                                &profile.name,
+                            )
+                            .clicked()
+                        {
+                            chosen = Some(profile.name.clone());
+                        }
+                    }
+                });
+            if let Some(name) = chosen {
+                self.apply_profile(&name);
+            }
+            if ui
+                .small_button("保存")
+                .on_hover_text("把当前的图色门控和预处理设置保存到当前方案")
+                .clicked()
+            {
+                self.save_active_profile();
+            }
+            if ui
+                .small_button("另存为")
+                .on_hover_text("用当前设置新建一个方案")
+                .clicked()
+            {
+                self.profile_saving = true;
+                self.profile_name_edit = format!("方案 {}", self.config.profiles.len() + 1);
+            }
+            if ui
+                .add_enabled(
+                    self.config.profiles.len() > 1,
+                    egui::Button::new("删除").small(),
+                )
+                .clicked()
+            {
+                self.delete_active_profile();
+            }
+            if dirty {
+                ui.label(
+                    egui::RichText::new("有未保存的修改")
+                        .small()
+                        .color(theme::gold()),
+                );
+            }
+        });
+        if self.profile_saving {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("方案名称");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.profile_name_edit).desired_width(140.0),
+                );
+                if ui.button("确定").clicked() {
+                    self.create_profile();
+                }
+                if ui.button("取消").clicked() {
+                    self.profile_saving = false;
+                }
+            });
+        }
     }
 
     fn set_on_top(&mut self, on: bool, ctx: &egui::Context) {
@@ -554,27 +1121,36 @@ impl MhxyApp {
             .find(|window| window.handle == handle)
             .map(|window| window.title.clone())
             .unwrap_or_else(|| format!("#{handle}"));
-        let extra = if self.config.extra_region_enabled {
-            Some(self.config.extra_task_region)
-        } else {
-            None
-        };
         self.last_scan = Some(Instant::now());
-        let (panel, full) =
-            match capture::capture_task_panel(handle, self.config.task_region, extra) {
-                Ok(result) => result,
-                Err(err) => {
-                    self.log_detail(format!("截图失败（{window_title}）：{err}"));
-                    self.notice = Some(err.clone());
-                    if err.contains("关闭") || err.contains("最小化") {
-                        self.set_window(None);
-                    }
-                    return;
+        let full = match capture::capture_client(handle, self.config.task_region) {
+            Ok(full) => full,
+            Err(err) => {
+                self.log_detail(format!("截图失败（{window_title}）：{err}"));
+                self.notice = Some(err.clone());
+                if err.contains("关闭") || err.contains("最小化") {
+                    self.set_window(None);
                 }
-            };
+                return;
+            }
+        };
+        // 主区域和备用区域分别预处理，再上下拼接送一次 OCR。
+        let mut panels = vec![preprocess::apply(
+            capture::crop_task_region(&full, self.config.task_region),
+            self.preprocess_pipeline_for(false),
+            self.config.preprocess_color,
+            self.config.preprocess_tolerance,
+        )];
+        if self.config.extra_region_enabled {
+            panels.push(preprocess::apply(
+                capture::crop_task_region(&full, self.config.extra_task_region),
+                self.preprocess_pipeline_for(true),
+                self.config.extra_preprocess_color,
+                self.config.extra_preprocess_tolerance,
+            ));
+        }
+        let panel = capture::stack_images(&panels);
         self.update_preview(full);
         self.notice = None;
-
         let signature = hash_image(&panel);
         if self.last_signature == Some(signature) {
             self.log_detail(format!("{window_title}：识别区域未变化，跳过"));
@@ -635,6 +1211,14 @@ impl MhxyApp {
                     }
                     continue;
                 }
+                OcrEvent::PanelTest { result } => {
+                    self.ocr_test_running = false;
+                    self.ocr_test_result = Some(match result {
+                        Ok(text) => Ok(self.format_test_result(&text)),
+                        Err(err) => Err(err),
+                    });
+                    continue;
+                }
             };
             if generation != self.generation {
                 continue;
@@ -686,6 +1270,94 @@ impl MhxyApp {
             let _ = sender.send(OcrEvent::Test { result });
             ctx.request_repaint();
         });
+    }
+
+    /// 取点窗口的「测试 OCR」：用当前截图与预处理设置识别一次，结果只显示在窗口里。
+    fn run_panel_test(&mut self) {
+        if self.ocr_test_running {
+            return;
+        }
+        if self.preview_image.is_none() {
+            self.capture_preview_once();
+        }
+        let Some(full) = self.preview_image.as_ref() else {
+            self.ocr_test_result = Some(Err("暂无截图：请打开游戏窗口后点击「更新截图」".into()));
+            return;
+        };
+        let mut panels = vec![preprocess::apply(
+            capture::crop_task_region(full, self.config.task_region),
+            self.preprocess_pipeline_for(false),
+            self.config.preprocess_color,
+            self.config.preprocess_tolerance,
+        )];
+        if self.config.extra_region_enabled {
+            panels.push(preprocess::apply(
+                capture::crop_task_region(full, self.config.extra_task_region),
+                self.preprocess_pipeline_for(true),
+                self.config.extra_preprocess_color,
+                self.config.extra_preprocess_tolerance,
+            ));
+        }
+        let panel = capture::stack_images(&panels);
+        self.ocr_test_running = true;
+        self.ocr_test_result = None;
+        if self.config.ocr_mode == "remote" {
+            let png = match ocr::encode_png(&panel) {
+                Ok(png) => png,
+                Err(err) => {
+                    self.ocr_test_running = false;
+                    self.ocr_test_result = Some(Err(err));
+                    return;
+                }
+            };
+            let url = self.config.api_url.clone();
+            let token = self.config.api_token.clone();
+            let format = self.config.api_format.clone();
+            let sender = self.sender.clone();
+            let ctx = self.ctx.clone();
+            thread::spawn(move || {
+                let result = ocr::remote_recognize(&url, &token, &format, &png);
+                let _ = sender.send(OcrEvent::PanelTest { result });
+                ctx.request_repaint();
+            });
+        } else if let Err(err) = self.worker.submit_test(panel) {
+            self.ocr_test_running = false;
+            self.ocr_test_result = Some(Err(err));
+        }
+    }
+
+    /// 把测试 OCR 结果整理成几行可读文本：耗时、识别文字、解析出的任务。
+    fn format_test_result(&self, text: &OcrText) -> String {
+        let tasks = parse_tasks(
+            &text.text,
+            &self.maps,
+            TaskFilter {
+                zhuagui: true,
+                ghost_king: true,
+                generic: true,
+            },
+        );
+        let mut lines = vec![format!("耗时 {:.2} 秒", text.elapsed_secs)];
+        let raw = text.text.trim().replace('\n', " | ");
+        if raw.is_empty() {
+            lines.push("未识别到文字".to_string());
+        } else {
+            lines.push(format!("文字：{}", truncate_text(&raw, 240)));
+        }
+        if tasks.is_empty() {
+            lines.push("未解析到任务（可检查截图区域或预处理）".to_string());
+        }
+        for task in tasks {
+            lines.push(format!(
+                "{} {} ({}, {}){}",
+                task.task_type,
+                task.map_name,
+                task.x,
+                task.y,
+                if task.nearby { " 附近" } else { "" }
+            ));
+        }
+        lines.join("\n")
     }
 
     fn apply_ocr(&mut self, ocr_text: &OcrText) {
@@ -829,7 +1501,7 @@ impl MhxyApp {
         }
         let (rect, response) = ui.allocate_exact_size(available, Sense::hover());
         let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, CornerRadius::same(8), theme::INSET);
+        painter.rect_filled(rect, CornerRadius::same(8), theme::inset());
         let outer = rect.shrink(8.0);
         let image_rect = fit_rect(outer, texture_size);
         if image_rect.width() <= 1.0 {
@@ -1000,7 +1672,8 @@ impl MhxyApp {
             .id_salt("sidebar")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                theme::section(ui, "游戏窗口", |ui| {
+                let fold_window = self.sidebar_section_open("window");
+                let now = theme::collapsible_section(ui, "sidebar_window", "游戏窗口", fold_window, |ui| {
                     let current = self
                         .windows
                         .iter()
@@ -1046,7 +1719,7 @@ impl MhxyApp {
                         ui.label(
                             egui::RichText::new("请先打开游戏，窗口列表会自动刷新")
                                 .small()
-                                .color(theme::GOLD),
+                                .color(theme::gold()),
                         );
                     }
                     ui.horizontal(|ui| {
@@ -1086,7 +1759,11 @@ impl MhxyApp {
                         }
                     }
                 });
-                theme::section(ui, "识别模式", |ui| {
+                if now != fold_window {
+                    self.set_sidebar_section_open("window", now);
+                }
+                let fold_trigger = self.sidebar_section_open("trigger");
+                let now = theme::collapsible_section(ui, "sidebar_trigger", "识别模式", fold_trigger, |ui| {
                     let previous = self.config.trigger_mode.clone();
                     ui.horizontal(|ui| {
                         ui.selectable_value(
@@ -1142,7 +1819,7 @@ impl MhxyApp {
                                 );
                             }
                             Err(err) => {
-                                ui.colored_label(theme::GOLD, format!("快捷键无效：{err}"));
+                                ui.colored_label(theme::gold(), format!("快捷键无效：{err}"));
                             }
                         }
                         ui.horizontal(|ui| {
@@ -1168,7 +1845,11 @@ impl MhxyApp {
                         self.persist();
                     }
                 });
-                theme::section(ui, "识别方式", |ui| {
+                if now != fold_trigger {
+                    self.set_sidebar_section_open("trigger", now);
+                }
+                let fold_ocr = self.sidebar_section_open("ocr");
+                let now = theme::collapsible_section(ui, "sidebar_ocr", "识别方式", fold_ocr, |ui| {
                     let previous = self.config.ocr_mode.clone();
                     ui.horizontal(|ui| {
                         ui.selectable_value(
@@ -1247,8 +1928,8 @@ impl MhxyApp {
                         });
                         if let Some(result) = &self.remote_feedback {
                             let (message, color) = match result {
-                                Ok(message) => (message, theme::JADE),
-                                Err(message) => (message, theme::RED),
+                                Ok(message) => (message, theme::jade()),
+                                Err(message) => (message, theme::red()),
                             };
                             ui.label(egui::RichText::new(message).small().color(color));
                         }
@@ -1259,8 +1940,34 @@ impl MhxyApp {
                                 .weak(),
                         );
                     }
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("预处理").small().weak());
+                        let main_pipeline = self.preprocess_pipeline_for(false);
+                        let extra_pipeline = self.preprocess_pipeline_for(true);
+                        let summary = if self.config.extra_region_enabled {
+                            format!(
+                                "主 {} / 备 {}",
+                                main_pipeline.summary(),
+                                extra_pipeline.summary()
+                            )
+                        } else {
+                            main_pipeline.summary()
+                        };
+                        let all_off = main_pipeline.is_off()
+                            && (!self.config.extra_region_enabled || extra_pipeline.is_off());
+                        ui.label(
+                            egui::RichText::new(summary)
+                                .small()
+                                .color(if all_off { theme::muted() } else { theme::jade() }),
+                        );
+                    });
                 });
-                theme::section(ui, "任务显示", |ui| {
+                if now != fold_ocr {
+                    self.set_sidebar_section_open("ocr", now);
+                }
+                let fold_task = self.sidebar_section_open("task");
+                let now = theme::collapsible_section(ui, "sidebar_task", "任务显示", fold_task, |ui| {
                     // 抓鬼 / 鬼王 按任务名解析；通用任务不看任务类型，两边互斥。
                     if ui
                         .checkbox(&mut self.config.zhuagui_enabled, "识别抓鬼任务")
@@ -1339,7 +2046,44 @@ impl MhxyApp {
                         self.persist();
                     }
                 });
-                self.log_ui(ui);
+                if now != fold_task {
+                    self.set_sidebar_section_open("task", now);
+                }
+                let fold_ui = self.sidebar_section_open("ui");
+                let now = theme::collapsible_section(
+                    ui,
+                    "sidebar_ui",
+                    "界面",
+                    fold_ui,
+                    |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("主题");
+                            let mut light = self.config.theme_light;
+                            let mut changed = false;
+                            changed |= ui.radio_value(&mut light, false, "暗色").changed();
+                            changed |= ui.radio_value(&mut light, true, "亮色").changed();
+                            if changed {
+                                self.config.theme_light = light;
+                                theme::set_light(ui.ctx(), light);
+                                self.persist();
+                            }
+                        });
+                    },
+                );
+                if now != fold_ui {
+                    self.set_sidebar_section_open("ui", now);
+                }
+                let fold_log = self.sidebar_section_open("log");
+                let now = theme::collapsible_section(
+                    ui,
+                    "sidebar_log",
+                    "日志",
+                    fold_log,
+                    |ui| self.log_ui(ui),
+                );
+                if now != fold_log {
+                    self.set_sidebar_section_open("log", now);
+                }
                 ui.add_space(4.0);
             });
     }
@@ -1395,7 +2139,6 @@ impl MhxyApp {
         // 日志高度跟随窗口高度，窗口变高时能显示更多记录。
         let log_height = log_panel_height(ui.ctx().content_rect().height());
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("日志").strong());
             let mut level = self.config.log_level.clone();
             let mut changed = false;
             changed |= ui
@@ -1415,7 +2158,7 @@ impl MhxyApp {
             });
         });
         egui::Frame::new()
-            .fill(theme::INSET)
+            .fill(theme::inset())
             .corner_radius(8)
             .inner_margin(10)
             .show(ui, |ui| {
@@ -1434,7 +2177,7 @@ impl MhxyApp {
                                         egui::RichText::new(&self.logs[index])
                                             .monospace()
                                             .size(11.0)
-                                            .color(theme::MUTED),
+                                            .color(theme::muted()),
                                     )
                                     .truncate(),
                                 )
@@ -1446,23 +2189,22 @@ impl MhxyApp {
     }
 
     /// 画客户区预览：红框主区域、蓝框备用区域、图色点位；点击时返回 (x, y, 颜色)。
-    fn preview(&self, ui: &mut egui::Ui) -> Option<(i32, i32, [u8; 3])> {
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("识别区域预览").strong());
-            ui.label(egui::RichText::new("红框=主区域，蓝框=备用区域；点击图片可取点").weak());
-        });
+    fn preview(&self, ui: &mut egui::Ui, max_height: f32) -> Option<(i32, i32, [u8; 3])> {
         let Some(image) = self.preview_image.as_ref() else {
             ui.centered_and_justified(|ui| {
                 ui.label(
                     egui::RichText::new("暂无截图\n选择游戏窗口后，点击「更新截图」")
-                        .color(theme::MUTED),
+                        .color(theme::muted()),
                 );
             });
             return None;
         };
         let texture = self.preview_texture.as_ref()?;
         let size = Vec2::new(image.width() as f32, image.height() as f32);
-        let available = ui.available_size();
+        let available = vec2(
+            ui.available_width(),
+            ui.available_height().min(max_height).max(1.0),
+        );
         let scale = (available.x / size.x).min(available.y / size.y).max(0.001);
         let (rect, response) = ui.allocate_exact_size(size * scale, Sense::click());
         let painter = ui.painter_at(rect);
@@ -1477,7 +2219,7 @@ impl MhxyApp {
         let to_screen =
             |x: f32, y: f32| pos2(target.min.x + x * draw_scale, target.min.y + y * draw_scale);
         for (region, color, enabled) in [
-            (self.config.task_region, theme::RED, true),
+            (self.config.task_region, theme::red(), true),
             (
                 self.config.extra_task_region,
                 Color32::from_rgb(100, 174, 255),
@@ -1514,7 +2256,7 @@ impl MhxyApp {
                     FontId::proportional(13.0),
                     Color32::WHITE,
                 );
-                if self.pick_points && response.clicked() {
+                if (self.pick_points || self.pick_text_color) && response.clicked() {
                     picked = Some((px, py, color));
                 }
             }
@@ -1536,6 +2278,8 @@ impl MhxyApp {
         picked
     }
 
+    /// 识别区域窗口：
+    /// 上排「截图范围 / 图色门控 | 识别区域预览」，分隔线下面是「识别预处理 | 预处理预览」。
     fn region_window_ui(&mut self, ui: &mut egui::Ui) {
         if ui.ctx().input(|input| input.viewport().close_requested()) {
             self.show_region_window = false;
@@ -1551,50 +2295,472 @@ impl MhxyApp {
                     if ui.button("更新截图").clicked() {
                         self.capture_preview_once();
                     }
+                    if ui
+                        .add_enabled(
+                            !self.ocr_test_running,
+                            egui::Button::new(if self.ocr_test_running {
+                                "识别中…"
+                            } else {
+                                "测试 OCR"
+                            }),
+                        )
+                        .on_hover_text("用当前截图和预处理设置识别一次，不影响正式识别")
+                        .clicked()
+                    {
+                        self.run_panel_test();
+                    }
                     ui.checkbox(&mut self.pick_points, "点击预览取点");
+                    if self.pick_text_color {
+                        ui.label(
+                            egui::RichText::new("取色模式：点击右侧预览设置文字颜色")
+                                .small()
+                                .color(theme::jade()),
+                        );
+                    }
                 });
+                ui.separator();
+                self.profile_ui(ui);
+                if let Some(message) = &self.notice {
+                    ui.label(egui::RichText::new(message).small().color(theme::gold()));
+                }
+                if self.ocr_test_running {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(egui::RichText::new("正在识别…").small().weak());
+                    });
+                } else if let Some(result) = self.ocr_test_result.clone() {
+                    let mut clear = false;
+                    egui::Frame::new()
+                        .fill(theme::inset())
+                        .corner_radius(6)
+                        .inner_margin(8)
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new("测试结果").small().strong());
+                                if ui.small_button("清空").clicked() {
+                                    clear = true;
+                                }
+                            });
+                            egui::ScrollArea::vertical()
+                                .id_salt("test_result")
+                                .max_height(80.0)
+                                .show(ui, |ui| match &result {
+                                    Ok(text) => {
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(text)
+                                                    .monospace()
+                                                    .size(11.0)
+                                                    .color(theme::text()),
+                                            )
+                                            .wrap(),
+                                        );
+                                    }
+                                    Err(err) => {
+                                        ui.label(
+                                            egui::RichText::new(err).small().color(theme::red()),
+                                        );
+                                    }
+                                });
+                        });
+                    if clear {
+                        self.ocr_test_result = None;
+                    }
+                }
+
+                let total_height = ui.available_height();
+                let separator = 16.0;
+                let top_height = ((total_height - separator) * 0.62).max(240.0);
+                let bottom_height = (total_height - separator - top_height).max(140.0);
+                let settings_width = (ui.available_width() * 0.36).clamp(300.0, 430.0);
+
+                // 上排：截图范围 / 图色门控 | 识别区域预览
+                ui.allocate_ui_with_layout(
+                    vec2(ui.available_width(), top_height),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.horizontal_top(|ui| {
+                            ui.vertical(|ui| {
+                                ui.set_width(settings_width);
+                                egui::ScrollArea::vertical()
+                                    .id_salt("region_top_settings")
+                                    .auto_shrink([false, false])
+                                    .show(ui, |ui| {
+                                        let mut fold_changed = false;
+                                        let scope_open = theme::collapsible_section(
+                                            ui,
+                                            "region_scope",
+                                            "截图范围",
+                                            self.config.region_scope_open,
+                                            |ui| {
+                                                let mut changed = region_fields(
+                                                    ui,
+                                                    "main",
+                                                    "主区域",
+                                                    &mut self.config.task_region,
+                                                );
+                                                ui.add_space(6.0);
+                                                ui.label(egui::RichText::new("备用区域").strong());
+                                                changed |= ui
+                                                    .checkbox(
+                                                        &mut self.config.extra_region_enabled,
+                                                        "启用备用区域",
+                                                    )
+                                                    .changed();
+                                                ui.add_enabled_ui(
+                                                    self.config.extra_region_enabled,
+                                                    |ui| {
+                                                        changed |= region_grid(
+                                                            ui,
+                                                            "extra",
+                                                            &mut self.config.extra_task_region,
+                                                        );
+                                                    },
+                                                );
+                                                if changed {
+                                                    self.invalidate_scan();
+                                                    self.persist();
+                                                    self.refresh_preprocess_preview();
+                                                }
+                                            },
+                                        );
+                                        if scope_open != self.config.region_scope_open {
+                                            self.config.region_scope_open = scope_open;
+                                            fold_changed = true;
+                                        }
+                                        let gate_open = theme::collapsible_section(
+                                            ui,
+                                            "region_gate",
+                                            "图色门控设置",
+                                            self.config.region_gate_open,
+                                            |ui| self.color_gate_ui(ui),
+                                        );
+                                        if gate_open != self.config.region_gate_open {
+                                            self.config.region_gate_open = gate_open;
+                                            fold_changed = true;
+                                        }
+                                        if fold_changed {
+                                            self.persist();
+                                        }
+                                    });
+                            });
+                            ui.separator();
+                            ui.vertical(|ui| {
+                                ui.label(egui::RichText::new("识别区域预览").strong());
+                                ui.label(
+                                    egui::RichText::new(
+                                        "红框=主区域，蓝框=备用区域；点击图片可取点",
+                                    )
+                                    .small()
+                                    .weak(),
+                                );
+                                let preview_height = (ui.available_height() - 8.0).max(120.0);
+                                if let Some((x, y, color)) = self.preview(ui, preview_height) {
+                                    self.apply_preview_click(x, y, color);
+                                }
+                            });
+                        });
+                    },
+                );
+                ui.separator();
+                // 下排：识别预处理 | 预处理预览
+                ui.allocate_ui_with_layout(
+                    vec2(ui.available_width(), bottom_height),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.horizontal_top(|ui| {
+                            let total = ui.available_width();
+                            let preprocess_width = (total * 0.38).clamp(260.0, 420.0);
+                            // 识别预处理
+                            ui.vertical(|ui| {
+                                ui.set_width(preprocess_width);
+                                egui::ScrollArea::vertical()
+                                    .id_salt("region_preprocess_settings")
+                                    .auto_shrink([false, false])
+                                    .show(ui, |ui| {
+                                        let open = theme::collapsible_section(
+                                            ui,
+                                            "region_preprocess",
+                                            "识别预处理",
+                                            self.config.region_preprocess_open,
+                                            |ui| self.preprocess_ui(ui),
+                                        );
+                                        if open != self.config.region_preprocess_open {
+                                            self.config.region_preprocess_open = open;
+                                            self.persist();
+                                        }
+                                    });
+                            });
+                            ui.separator();
+                            // 预处理预览（主区域 / 备用区域左右排列）
+                            ui.vertical(|ui| {
+                                self.preprocess_preview_ui(
+                                    ui,
+                                    (ui.available_height() - 8.0).max(80.0),
+                                );
+                            });
+                        });
+                    },
+                );
+            });
+    }
+
+    fn apply_preview_click(&mut self, x: i32, y: i32, color: [u8; 3]) {
+        if self.pick_text_color {
+            let extra = self.preprocess_target_extra && self.config.extra_region_enabled;
+            if extra {
+                self.config.extra_preprocess_color = color;
+            } else {
+                self.config.preprocess_color = color;
+            }
+            self.preprocess_color_edit = gate::to_hex(color);
+            self.pick_text_color = false;
+            let mut pipeline = self.preprocess_pipeline_for(extra);
+            if !pipeline.color_key {
+                pipeline.color_key = true;
+                if extra {
+                    self.config.extra_preprocess_mode = pipeline.config_value();
+                } else {
+                    self.config.preprocess_mode = pipeline.config_value();
+                }
+            }
+            self.invalidate_scan();
+            self.persist();
+            self.refresh_preprocess_preview();
+            self.log_detail(format!(
+                "取文字颜色 {}，预处理：{}",
+                gate::to_hex(color),
+                pipeline.summary()
+            ));
+        } else {
+            let mut point = ColorPoint::new(x, y, color, self.config.color_gate_tolerance, 1);
+            point.label = format!("点{}", self.config.color_gate_points.len() + 1);
+            self.config.color_gate_points.push(point);
+            self.check_gate();
+            self.persist();
+            self.log_detail(format!("新增图色点位 ({x}, {y}) {}", gate::to_hex(color)));
+        }
+    }
+
+    fn preprocess_preview_ui(&self, ui: &mut egui::Ui, max_height: f32) {
+        ui.label(egui::RichText::new("预处理预览").small().weak());
+        let width = ui.available_width();
+        let column = ((width - 16.0) / 2.0).max(80.0);
+        let image_height = (max_height - 22.0).max(60.0);
+        ui.horizontal_top(|ui| {
+            ui.vertical(|ui| {
+                ui.set_width(column);
+                ui.label(egui::RichText::new("主区域").small().color(theme::muted()));
+                preview_texture(
+                    ui,
+                    &self.preprocess_preview,
+                    column,
+                    image_height,
+                    "点击「更新截图」后可预览",
+                );
+            });
+            ui.separator();
+            ui.vertical(|ui| {
+                ui.set_width(column);
                 ui.label(
-                    egui::RichText::new("截取游戏客户区，设置任务栏范围与图色点位")
+                    egui::RichText::new("备用区域")
+                        .small()
+                        .color(theme::muted()),
+                );
+                if self.config.extra_region_enabled {
+                    preview_texture(
+                        ui,
+                        &self.preprocess_preview_extra,
+                        column,
+                        image_height,
+                        "暂无备用区域截图",
+                    );
+                } else {
+                    ui.label(egui::RichText::new("未启用备用区域").small().weak());
+                }
+            });
+        });
+    }
+
+    fn preprocess_pipeline_for(&self, extra: bool) -> preprocess::Pipeline {
+        let mode = if extra {
+            &self.config.extra_preprocess_mode
+        } else {
+            &self.config.preprocess_mode
+        };
+        preprocess::Pipeline::from_config(mode)
+    }
+
+    fn preprocess_ui(&mut self, ui: &mut egui::Ui) {
+        self.preprocess_block(ui, false, true);
+        ui.add_space(10.0);
+        ui.separator();
+        ui.add_space(6.0);
+        self.preprocess_block(ui, true, self.config.extra_region_enabled);
+    }
+
+    /// 单个区域的预处理设置。`extra` 未启用时整块灰色不可选。
+    fn preprocess_block(&mut self, ui: &mut egui::Ui, extra: bool, enabled: bool) {
+        let title = if extra {
+            "备用区域预处理"
+        } else {
+            "主区域预处理"
+        };
+        ui.add_enabled_ui(enabled, |ui| {
+            ui.label(egui::RichText::new(title).strong().color(if enabled {
+                theme::text()
+            } else {
+                theme::muted()
+            }));
+            if !enabled {
+                ui.label(
+                    egui::RichText::new("先在截图范围勾选「启用备用区域」")
                         .small()
                         .weak(),
                 );
-                let max_height = (ui.available_height() * 0.50).max(100.0);
-                egui::ScrollArea::vertical()
-                    .id_salt("region_settings")
-                    .max_height(max_height)
-                    .auto_shrink([false, true])
-                    .show(ui, |ui| {
-                        theme::section(ui, "截图范围 · 相对客户区百分比", |ui| {
-                            let mut changed =
-                                region_row(ui, "主区域", &mut self.config.task_region);
-                            changed |= ui
-                                .checkbox(&mut self.config.extra_region_enabled, "启用备用区域")
-                                .changed();
-                            if self.config.extra_region_enabled {
-                                changed |=
-                                    region_row(ui, "备用区", &mut self.config.extra_task_region);
-                            }
-                            if changed {
-                                self.invalidate_scan();
-                                self.persist();
-                            }
-                        });
-                        theme::section(ui, "图色门控", |ui| self.color_gate_ui(ui));
-                    });
-                if let Some(message) = &self.notice {
-                    ui.label(egui::RichText::new(message).small().color(theme::GOLD));
-                }
-                ui.add_space(4.0);
-                if let Some((x, y, color)) = self.preview(ui) {
-                    let mut point =
-                        ColorPoint::new(x, y, color, self.config.color_gate_tolerance, 1);
-                    point.label = format!("点{}", self.config.color_gate_points.len() + 1);
-                    self.config.color_gate_points.push(point);
-                    self.check_gate();
-                    self.persist();
-                    self.log_detail(format!("新增图色点位 ({x}, {y}) {}", gate::to_hex(color)));
-                }
+                return;
+            }
+            let previous_mode = if extra {
+                self.config.extra_preprocess_mode.clone()
+            } else {
+                self.config.preprocess_mode.clone()
+            };
+            let mut pipeline = preprocess::Pipeline::from_config(&previous_mode);
+            let mut color = if extra {
+                self.config.extra_preprocess_color
+            } else {
+                self.config.preprocess_color
+            };
+            let mut tolerance = if extra {
+                self.config.extra_preprocess_tolerance
+            } else {
+                self.config.preprocess_tolerance
+            };
+            let mut edit_value = if extra {
+                self.extra_preprocess_color_edit.clone()
+            } else {
+                self.preprocess_color_edit.clone()
+            };
+            let mut changed = false;
+            ui.horizontal_wrapped(|ui| {
+                changed |= ui.checkbox(&mut pipeline.color_key, "颜色提取").changed();
+                changed |= ui.checkbox(&mut pipeline.grayscale, "灰度").changed();
+                changed |= ui.checkbox(&mut pipeline.binarize, "二值化").changed();
+                changed |= ui
+                    .checkbox(&mut pipeline.invert, "反色")
+                    .on_hover_text("最终黑白颠倒：二值化把文字判成白色时勾选")
+                    .changed();
             });
+            if pipeline.color_key {
+                let mut new_color: Option<[u8; 3]> = None;
+                ui.horizontal_wrapped(|ui| {
+                    let (rect, _) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
+                    ui.painter().rect_filled(
+                        rect,
+                        CornerRadius::same(3),
+                        Color32::from_rgb(color[0], color[1], color[2]),
+                    );
+                    ui.painter().rect_stroke(
+                        rect,
+                        CornerRadius::same(3),
+                        egui::Stroke::new(1.0, theme::border()),
+                        egui::StrokeKind::Outside,
+                    );
+                    if ui
+                        .selectable_label(self.pick_text_color, "点击预览取色")
+                        .on_hover_text("在右侧预览图上点任务文字取色；点不准时用色值或调色板")
+                        .clicked()
+                    {
+                        self.pick_text_color = !self.pick_text_color;
+                        if self.pick_text_color {
+                            self.preprocess_target_extra = extra;
+                        }
+                    }
+                    if !self.config.color_gate_points.is_empty()
+                        && ui.small_button("用图色点位颜色").clicked()
+                    {
+                        new_color = Some(self.config.color_gate_points[0].color);
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("色值");
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut edit_value)
+                            .desired_width(84.0)
+                            .hint_text("#eaff65"),
+                    );
+                    if response.changed() {
+                        if let Some(picked) = gate::parse_hex(&edit_value) {
+                            new_color = Some(picked);
+                        }
+                    } else if !response.has_focus() {
+                        edit_value = gate::to_hex(color);
+                    }
+                    if ui
+                        .small_button("默认")
+                        .on_hover_text("恢复默认颜色 234, 255, 101（#eaff65）")
+                        .clicked()
+                    {
+                        new_color = Some(crate::config::DEFAULT_PREPROCESS_COLOR);
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("容差");
+                    changed |= ui
+                        .add(egui::DragValue::new(&mut tolerance).range(0..=255))
+                        .changed();
+                });
+                ui.collapsing("更多颜色", |ui| {
+                    let mut color32 = Color32::from_rgb(color[0], color[1], color[2]);
+                    if egui::color_picker::color_picker_color32(
+                        ui,
+                        &mut color32,
+                        egui::color_picker::Alpha::Opaque,
+                    ) {
+                        new_color = Some([color32.r(), color32.g(), color32.b()]);
+                    }
+                });
+                if let Some(picked) = new_color {
+                    color = picked;
+                    edit_value = gate::to_hex(picked);
+                    changed = true;
+                }
+            }
+            let summary = pipeline.summary();
+            ui.label(
+                egui::RichText::new(format!(
+                    "顺序：{}（二值化已包含灰度，颜色提取自带反色；结果黑白颠倒时再勾反色）",
+                    if summary == "关闭" {
+                        "未启用"
+                    } else {
+                        &summary
+                    }
+                ))
+                .small()
+                .weak(),
+            );
+            let mode_value = pipeline.config_value();
+            if changed || mode_value != previous_mode {
+                if extra {
+                    self.config.extra_preprocess_mode = mode_value;
+                    self.config.extra_preprocess_color = color;
+                    self.config.extra_preprocess_tolerance = tolerance;
+                } else {
+                    self.config.preprocess_mode = mode_value;
+                    self.config.preprocess_color = color;
+                    self.config.preprocess_tolerance = tolerance;
+                }
+                self.invalidate_scan();
+                self.persist();
+                self.refresh_preprocess_preview();
+            }
+            if extra {
+                self.extra_preprocess_color_edit = edit_value;
+            } else {
+                self.preprocess_color_edit = edit_value;
+            }
+        });
     }
 
     fn color_gate_ui(&mut self, ui: &mut egui::Ui) {
@@ -1772,9 +2938,9 @@ impl MhxyApp {
             (state.location.clone(), state.map_index)
         };
         let accent = if task_type == "抓鬼" {
-            theme::JADE
+            theme::jade()
         } else {
-            theme::GOLD
+            theme::gold()
         };
         theme::card().show(ui, |ui| {
             ui.set_min_size(ui.available_size());
@@ -1812,9 +2978,9 @@ impl MhxyApp {
                     let size = ui.available_size().max(vec2(1.0, 1.0));
                     let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
                     let painter = ui.painter_at(rect);
-                    painter.rect_filled(rect, CornerRadius::same(8), theme::INSET);
+                    painter.rect_filled(rect, CornerRadius::same(8), theme::inset());
                     let center = rect.center();
-                    painter.circle_stroke(center, 18.0, egui::Stroke::new(1.0, theme::BORDER));
+                    painter.circle_stroke(center, 18.0, egui::Stroke::new(1.0, theme::border()));
                     painter.circle_stroke(
                         center,
                         9.0,
@@ -1822,11 +2988,11 @@ impl MhxyApp {
                     );
                     painter.line_segment(
                         [center - vec2(25.0, 0.0), center + vec2(25.0, 0.0)],
-                        egui::Stroke::new(1.0, theme::BORDER),
+                        egui::Stroke::new(1.0, theme::border()),
                     );
                     painter.line_segment(
                         [center - vec2(0.0, 25.0), center + vec2(0.0, 25.0)],
-                        egui::Stroke::new(1.0, theme::BORDER),
+                        egui::Stroke::new(1.0, theme::border()),
                     );
                 }
             }
@@ -1837,6 +3003,37 @@ impl MhxyApp {
 impl eframe::App for MhxyApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.poll_updates();
+        // 默认开启的定时检查：启动 2 秒后检查一次，之后每 30 分钟一次。
+        // 有更新/正在下载时不再重复检查；测试环境不联网。
+        if !cfg!(test)
+            && self.config.update_enabled
+            && self.started_at.elapsed() >= Duration::from_secs(2)
+            && !matches!(
+                self.update_phase,
+                UpdatePhase::Checking
+                    | UpdatePhase::Downloading
+                    | UpdatePhase::Available
+                    | UpdatePhase::Downloaded
+            )
+            && self
+                .last_update_check
+                .is_none_or(|last| last.elapsed() >= UPDATE_CHECK_INTERVAL)
+        {
+            self.start_update_check(false);
+        }
+        // 让按钮上的“已是最新/检查失败”提示自动消失。
+        if let Some(at) = self.update_message_at {
+            if at.elapsed() < UPDATE_FLASH_DURATION {
+                ctx.request_repaint_after(UPDATE_FLASH_DURATION - at.elapsed());
+            }
+        }
+        if matches!(
+            self.update_phase,
+            UpdatePhase::Checking | UpdatePhase::Downloading
+        ) {
+            ctx.request_repaint_after(Duration::from_millis(120));
+        }
         // 收起侧栏后放宽最小宽度，让窗口可以继续缩小。
         let desired_min_size = if self.config.sidebar_expanded {
             MIN_WINDOW_SIZE_EXPANDED
@@ -1911,18 +3108,21 @@ impl eframe::App for MhxyApp {
         egui::Panel::top("header")
             .frame(
                 egui::Frame::new()
-                    .fill(theme::SURFACE)
+                    .fill(theme::surface())
                     .inner_margin(egui::Margin::symmetric(16, 12)),
             )
             .show(ui, |ui| {
                 let narrow = ui.available_width() < 560.0;
                 ui.horizontal(|ui| {
                     if ui
-                        .button(if self.config.sidebar_expanded {
-                            "收起设置"
-                        } else {
-                            "展开设置"
-                        })
+                        .add(
+                            egui::Button::new(if self.config.sidebar_expanded {
+                                "收起设置"
+                            } else {
+                                "展开设置"
+                            })
+                            .min_size(vec2(0.0, 34.0)),
+                        )
                         .clicked()
                     {
                         self.config.sidebar_expanded = !self.config.sidebar_expanded;
@@ -1930,7 +3130,7 @@ impl eframe::App for MhxyApp {
                     }
                     ui.heading("梦幻西游");
                     if !narrow {
-                        ui.label(egui::RichText::new("任务坐标辅助").color(theme::MUTED));
+                        ui.label(egui::RichText::new("任务坐标辅助").color(theme::muted()));
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
@@ -1951,18 +3151,129 @@ impl eframe::App for MhxyApp {
                         }
                         let on_top = self.config.on_top;
                         if ui
-                            .selectable_label(on_top, "置顶")
+                            .add(header_button("置顶", on_top))
                             .on_hover_text("让本窗口始终显示在游戏窗口前面")
                             .clicked()
                         {
                             self.set_on_top(!on_top, &ctx);
                         }
                         if ui
-                            .selectable_label(self.show_help, "说明")
+                            .add(header_button("说明", self.show_help))
                             .on_hover_text("使用说明")
                             .clicked()
                         {
-                            self.show_help = !self.show_help;
+                            let opening = !self.show_help;
+                            self.show_help = opening;
+                            if opening {
+                                self.help_window_pos =
+                                    Some(centered_window_position(ui.ctx(), HELP_WINDOW_SIZE));
+                            }
+                        }
+                        // 更新按钮：无更新时是普通「检查更新」；发现更新后变成金色按钮，
+                        // 点击弹出更新说明，不主动弹窗。
+                        let total = self.update_info.as_ref().map(|info| info.size).unwrap_or(0);
+                        let downloaded = self.update_progress.load(Ordering::Relaxed);
+                        let percent = if total > 0 {
+                            (downloaded as f32 / total as f32 * 100.0).clamp(0.0, 100.0)
+                        } else {
+                            0.0
+                        };
+                        let flash_active = self
+                            .update_message_at
+                            .is_some_and(|at| at.elapsed() < UPDATE_FLASH_DURATION);
+                        let flash_text = self.update_message.clone().unwrap_or_default();
+                        let (text, color, enabled, highlight) = match self.update_phase {
+                            UpdatePhase::Checking => {
+                                ("检查中…".to_string(), theme::muted(), false, false)
+                            }
+                            UpdatePhase::Available => (
+                                format!(
+                                    "{} {}",
+                                    if narrow { "更新" } else { "发现新版本" },
+                                    self.update_info
+                                        .as_ref()
+                                        .map(|info| info.version.as_str())
+                                        .unwrap_or("")
+                                ),
+                                theme::on_accent(),
+                                true,
+                                true,
+                            ),
+                            UpdatePhase::Downloading => {
+                                (format!("下载 {percent:.0}%"), theme::text(), true, false)
+                            }
+                            UpdatePhase::Downloaded => (
+                                if narrow {
+                                    "重启更新"
+                                } else {
+                                    "重启并更新"
+                                }
+                                .to_string(),
+                                theme::on_accent(),
+                                true,
+                                true,
+                            ),
+                            UpdatePhase::Failed if flash_active => {
+                                (flash_text, theme::red(), true, false)
+                            }
+                            UpdatePhase::Failed => {
+                                ("检查更新".to_string(), theme::text(), true, false)
+                            }
+                            UpdatePhase::Idle if flash_active => {
+                                (flash_text, theme::muted(), true, false)
+                            }
+                            UpdatePhase::Idle => (
+                                if narrow { "更新" } else { "检查更新" }.to_string(),
+                                theme::text(),
+                                true,
+                                false,
+                            ),
+                        };
+                        let tooltip = match self.update_phase {
+                            UpdatePhase::Available => format!(
+                                "发现新版本 {}\n点击查看更新说明",
+                                self.update_info
+                                    .as_ref()
+                                    .map(|info| info.version.as_str())
+                                    .unwrap_or("")
+                            ),
+                            UpdatePhase::Downloading => "点击查看下载进度".to_string(),
+                            UpdatePhase::Downloaded => "安装包已就绪，点击完成更新".to_string(),
+                            UpdatePhase::Failed => self
+                                .update_error
+                                .clone()
+                                .unwrap_or_else(|| "检查更新失败".to_string()),
+                            UpdatePhase::Checking => "正在检查更新".to_string(),
+                            UpdatePhase::Idle => self
+                                .update_message
+                                .clone()
+                                .unwrap_or_else(|| "检查更新".to_string()),
+                        };
+                        let mut label = egui::RichText::new(text).color(color);
+                        if highlight {
+                            label = label.strong();
+                        }
+                        let mut button = egui::Button::new(label).min_size(vec2(0.0, 34.0));
+                        if highlight {
+                            button = button.fill(theme::gold());
+                        }
+                        if ui
+                            .add_enabled(enabled, button)
+                            .on_hover_text(tooltip)
+                            .clicked()
+                        {
+                            match self.update_phase {
+                                UpdatePhase::Available
+                                | UpdatePhase::Downloading
+                                | UpdatePhase::Downloaded => {
+                                    self.show_update_dialog = true;
+                                    self.update_window_pos = Some(centered_window_position(
+                                        ui.ctx(),
+                                        UPDATE_WINDOW_SIZE,
+                                    ));
+                                }
+                                _ => self.start_update_check(true),
+                            }
                         }
                     });
                 });
@@ -1970,7 +3281,7 @@ impl eframe::App for MhxyApp {
         egui::Panel::bottom("status_bar")
             .frame(
                 egui::Frame::new()
-                    .fill(theme::SURFACE)
+                    .fill(theme::surface())
                     .inner_margin(egui::Margin::symmetric(16, 6)),
             )
             .show(ui, |ui| {
@@ -1990,7 +3301,7 @@ impl eframe::App for MhxyApp {
                     if let Some(message) = &self.notice {
                         ui.add(
                             egui::Label::new(
-                                egui::RichText::new(message).small().color(theme::GOLD),
+                                egui::RichText::new(message).small().color(theme::gold()),
                             )
                             .truncate(),
                         )
@@ -2025,14 +3336,17 @@ impl eframe::App for MhxyApp {
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let (text, color) = if self.save_error.is_some() {
-                            ("配置保存失败", theme::RED)
+                            ("配置保存失败", theme::red())
                         } else if self.config_dirty_since.is_some() {
-                            ("正在保存…", theme::MUTED)
+                            ("正在保存…", theme::muted())
                         } else {
-                            ("设置自动保存", theme::MUTED)
+                            ("设置自动保存", theme::muted())
                         };
                         ui.label(egui::RichText::new(text).small().color(color))
                             .on_hover_text(self.save_error.as_deref().unwrap_or(text));
+                        ui.separator();
+                        ui.hyperlink_to(egui::RichText::new("发布页").small(), update::HOME_URL)
+                            .on_hover_text(update::HOME_URL);
                         ui.separator();
                         ui.hyperlink_to(egui::RichText::new("GitHub").small(), crate::APP_REPO_URL)
                             .on_hover_text(crate::APP_REPO_URL);
@@ -2047,11 +3361,19 @@ impl eframe::App for MhxyApp {
                 .default_size(320.0f32.min(max_sidebar).max(240.0))
                 .min_size(240.0f32.min(max_sidebar))
                 .max_size(max_sidebar)
-                .frame(egui::Frame::new().fill(theme::BACKGROUND).inner_margin(12))
+                .frame(
+                    egui::Frame::new()
+                        .fill(theme::background())
+                        .inner_margin(12),
+                )
                 .show(ui, |ui| self.controls(ui));
         }
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(theme::BACKGROUND).inner_margin(12))
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::background())
+                    .inner_margin(12),
+            )
             .show(ui, |ui| {
                 let tasks: Vec<&'static str> = TASK_ORDER
                     .iter()
@@ -2083,17 +3405,100 @@ impl eframe::App for MhxyApp {
                     self.task_panel(&mut child, task_type);
                 }
             });
-        if self.show_help {
-            let mut open = true;
-            egui::Window::new("使用说明")
-                .open(&mut open)
-                .collapsible(false)
-                .resizable(true)
-                .default_width(480.0)
-                .show(&ctx, |ui| self.help_contents(ui));
-            if !open {
-                self.show_help = false;
+        if self.show_update_dialog {
+            let on_top = self.config.on_top;
+            let mut builder = egui::ViewportBuilder::default()
+                .with_title(format!("发现新版本 · rust-mhxy {}", crate::APP_VERSION))
+                .with_inner_size(UPDATE_WINDOW_SIZE)
+                .with_min_inner_size([400.0, 340.0]);
+            if on_top {
+                builder = builder.with_always_on_top();
             }
+            if let Some(position) = self.update_window_pos {
+                builder = builder.with_position(position);
+            }
+            ctx.show_viewport_immediate(
+                egui::ViewportId::from_hash_of("update_window"),
+                builder,
+                |ui, _class| {
+                    if ui.ctx().viewport_id() == egui::ViewportId::ROOT {
+                        // 视口还没建好时先画在主窗口里（只出现一帧）。
+                        egui::Window::new("发现新版本")
+                            .collapsible(false)
+                            .resizable(false)
+                            .default_width(460.0)
+                            .show(ui.ctx(), |ui| self.update_dialog_ui(ui));
+                    } else {
+                        if ui.ctx().input(|input| input.viewport().close_requested()) {
+                            self.show_update_dialog = false;
+                        }
+                        if self.applied_update_on_top != Some(on_top) {
+                            let level = if on_top {
+                                egui::WindowLevel::AlwaysOnTop
+                            } else {
+                                egui::WindowLevel::Normal
+                            };
+                            ui.ctx()
+                                .send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
+                            self.applied_update_on_top = Some(on_top);
+                        }
+                        egui::Frame::central_panel(ui.style())
+                            .inner_margin(16)
+                            .show(ui, |ui| {
+                                ui.set_min_size(ui.available_size());
+                                egui::ScrollArea::vertical().show(ui, |ui| {
+                                    self.update_dialog_ui(ui);
+                                });
+                            });
+                    }
+                },
+            );
+        }
+        if self.show_help {
+            let on_top = self.config.on_top;
+            let mut builder = egui::ViewportBuilder::default()
+                .with_title("使用说明 · rust-mhxy")
+                .with_inner_size(HELP_WINDOW_SIZE)
+                .with_min_inner_size([420.0, 360.0]);
+            if on_top {
+                builder = builder.with_always_on_top();
+            }
+            if let Some(position) = self.help_window_pos {
+                builder = builder.with_position(position);
+            }
+            ctx.show_viewport_immediate(
+                egui::ViewportId::from_hash_of("help_window"),
+                builder,
+                |ui, _class| {
+                    if ui.ctx().viewport_id() == egui::ViewportId::ROOT {
+                        egui::Window::new("使用说明")
+                            .collapsible(false)
+                            .resizable(true)
+                            .default_width(480.0)
+                            .show(ui.ctx(), |ui| self.help_contents(ui));
+                    } else {
+                        if ui.ctx().input(|input| input.viewport().close_requested()) {
+                            self.show_help = false;
+                        }
+                        if self.applied_help_on_top != Some(on_top) {
+                            let level = if on_top {
+                                egui::WindowLevel::AlwaysOnTop
+                            } else {
+                                egui::WindowLevel::Normal
+                            };
+                            ui.ctx()
+                                .send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
+                            self.applied_help_on_top = Some(on_top);
+                        }
+                        egui::Frame::central_panel(ui.style())
+                            .inner_margin(16)
+                            .show(ui, |ui| {
+                                ui.set_min_size(ui.available_size());
+                                egui::ScrollArea::vertical().show(ui, |ui| self.help_contents(ui));
+                            });
+                    }
+                },
+            );
         }
         if !self.show_region_window {
             self.release_preview();
@@ -2103,7 +3508,7 @@ impl eframe::App for MhxyApp {
             let mut builder = egui::ViewportBuilder::default()
                 .with_title("识别区域")
                 .with_inner_size(REGION_WINDOW_SIZE)
-                .with_min_inner_size([660.0, 480.0]);
+                .with_min_inner_size([720.0, 600.0]);
             if on_top {
                 // 主窗口置顶时取点窗口也必须置顶，否则会被主窗口整个盖住。
                 builder = builder.with_always_on_top();
@@ -2145,46 +3550,95 @@ impl eframe::App for MhxyApp {
     }
 }
 
-fn region_row(ui: &mut egui::Ui, label: &str, region: &mut crate::core::TaskRegion) -> bool {
-    let mut changed = false;
-    ui.horizontal_wrapped(|ui| {
-        ui.label(label);
-        let mut values = [
-            region.0 * 100.0,
-            region.1 * 100.0,
-            region.2 * 100.0,
-            region.3 * 100.0,
-        ];
-        let mut edited = false;
-        for (name, value) in ["左", "上", "右", "下"].into_iter().zip(values.iter_mut()) {
-            ui.label(egui::RichText::new(name).small().weak());
-            let response = ui.add(
-                egui::DragValue::new(value)
-                    .speed(0.2)
-                    .range(0.0..=100.0)
-                    .suffix("%"),
-            );
-            edited |= response.changed();
-        }
-        if edited {
-            *region = (
-                values[0] / 100.0,
-                values[1] / 100.0,
-                values[2] / 100.0,
-                values[3] / 100.0,
-            );
-            region.0 = region.0.clamp(0.0, 0.99);
-            region.1 = region.1.clamp(0.0, 0.99);
-            region.2 = region.2.clamp(region.0 + 0.01, 1.0);
-            region.3 = region.3.clamp(region.1 + 0.01, 1.0);
-            changed = true;
-        }
-    });
-    changed
+/// 左/上/右/下 四个百分比，两行两列对齐。
+fn region_grid(ui: &mut egui::Ui, id: &str, region: &mut crate::core::TaskRegion) -> bool {
+    let mut values = [
+        region.0 * 100.0,
+        region.1 * 100.0,
+        region.2 * 100.0,
+        region.3 * 100.0,
+    ];
+    let mut edited = false;
+    egui::Grid::new(("region_grid", id))
+        .num_columns(4)
+        .spacing([8.0, 4.0])
+        .show(ui, |ui| {
+            for (index, (name, value)) in ["左", "上", "右", "下"]
+                .into_iter()
+                .zip(values.iter_mut())
+                .enumerate()
+            {
+                ui.label(egui::RichText::new(name).small().weak());
+                edited |= ui
+                    .add(
+                        egui::DragValue::new(value)
+                            .speed(0.2)
+                            .range(0.0..=100.0)
+                            .suffix("%"),
+                    )
+                    .changed();
+                if index % 2 == 1 {
+                    ui.end_row();
+                }
+            }
+        });
+    if !edited {
+        return false;
+    }
+    *region = (
+        values[0] / 100.0,
+        values[1] / 100.0,
+        values[2] / 100.0,
+        values[3] / 100.0,
+    );
+    region.0 = region.0.clamp(0.0, 0.99);
+    region.1 = region.1.clamp(0.0, 0.99);
+    region.2 = region.2.clamp(region.0 + 0.01, 1.0);
+    region.3 = region.3.clamp(region.1 + 0.01, 1.0);
+    true
+}
+
+/// 带标题的区域设置（标题单独一行）。
+fn region_fields(
+    ui: &mut egui::Ui,
+    id: &str,
+    title: &str,
+    region: &mut crate::core::TaskRegion,
+) -> bool {
+    ui.label(egui::RichText::new(title).strong());
+    region_grid(ui, id, region)
 }
 
 /// 取点窗口的默认尺寸。
-const REGION_WINDOW_SIZE: Vec2 = Vec2::new(900.0, 700.0);
+const REGION_WINDOW_SIZE: Vec2 = Vec2::new(1000.0, 820.0);
+
+/// 顶部栏统一按钮格式：统一样式与高度，用 selected 表示开关状态。
+fn header_button(text: &str, selected: bool) -> egui::Button<'static> {
+    egui::Button::new(egui::RichText::new(text.to_owned()))
+        .selected(selected)
+        .min_size(vec2(0.0, 34.0))
+}
+
+/// 说明 / 更新窗口在主窗口中间打开，并限制在屏幕内。
+fn centered_window_position(ctx: &egui::Context, size: Vec2) -> egui::Pos2 {
+    ctx.input(|input| {
+        let viewport = input.viewport();
+        let monitor = viewport
+            .monitor_size
+            .unwrap_or_else(|| Vec2::new(1920.0, 1080.0));
+        let main = viewport.outer_rect;
+        let x = main
+            .map(|rect| rect.center().x - size.x / 2.0)
+            .unwrap_or(0.0);
+        let y = main
+            .map(|rect| rect.center().y - size.y / 2.0)
+            .unwrap_or(0.0);
+        egui::pos2(
+            x.clamp(0.0, (monitor.x - size.x).max(0.0)),
+            y.clamp(0.0, (monitor.y - size.y).max(0.0)),
+        )
+    })
+}
 
 /// 取点窗口优先放在主窗口右侧，右侧空间不够就改放左侧；两边都放不下时才贴屏幕右缘，
 /// 此时不可避免会和主窗口重叠，靠窗口层级（置顶）保证它显示在主窗口之上。
@@ -2221,6 +3675,40 @@ fn place_region_window(main: Rect, monitor: Vec2, size: Vec2) -> egui::Pos2 {
     };
     let y = main.min.y.clamp(0.0, max_y);
     egui::pos2(x, y)
+}
+
+/// 按可用宽高等比绘制一张预览纹理；没有纹理时显示提示文字。
+fn preview_texture(
+    ui: &mut egui::Ui,
+    texture: &Option<TextureHandle>,
+    max_width: f32,
+    max_height: f32,
+    empty_text: &str,
+) {
+    match texture {
+        Some(texture) => {
+            let size = texture.size_vec2();
+            let scale = (max_width / size.x).min(max_height / size.y).min(1.0);
+            let (rect, _) = ui.allocate_exact_size(size * scale, Sense::hover());
+            ui.painter().image(
+                texture.id(),
+                rect,
+                Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                Color32::WHITE,
+            );
+        }
+        None => {
+            ui.label(egui::RichText::new(empty_text).small().weak());
+        }
+    }
+}
+
+fn truncate_text(text: &str, max_chars: usize) -> String {
+    let mut output: String = text.chars().take(max_chars).collect();
+    if text.chars().count() > max_chars {
+        output.push('…');
+    }
+    output
 }
 
 fn fit_rect(outer: Rect, size: Vec2) -> Rect {
@@ -2275,7 +3763,7 @@ mod tests {
 
     fn app() -> MhxyApp {
         let ctx = egui::Context::default();
-        theme::install(&ctx);
+        theme::install(&ctx, false);
         MhxyApp::from_config(Config::default(), PathBuf::from("/unused/config.json"), ctx)
     }
 
@@ -2347,6 +3835,317 @@ mod tests {
         assert!(!app.testing_remote);
         assert_eq!(app.remote_feedback, Some(Err("连接超时".into())));
         assert_eq!(app.logs.len(), 1);
+    }
+
+    #[test]
+    fn region_window_renders_all_preprocess_modes() {
+        let mut app = app();
+        app.show_region_window = true;
+        app.config.preprocess_mode = "color".into();
+        app.config.preprocess_color = [240, 210, 120];
+        app.update_preview(image::RgbImage::from_pixel(
+            320,
+            240,
+            image::Rgb([24, 24, 24]),
+        ));
+        let ctx = app.ctx.clone();
+        for mode in [
+            "off",
+            "gray",
+            "binary",
+            "color",
+            "color,binary",
+            "gray,binary",
+            "binary,invert",
+        ] {
+            app.config.preprocess_mode = mode.into();
+            app.refresh_preprocess_preview();
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 700.0))),
+                    ..Default::default()
+                },
+                |ui| app.region_window_ui(ui),
+            );
+            assert!(!output.shapes.is_empty(), "预处理模式 {mode} 渲染失败");
+            output.textures_delta.clear();
+        }
+    }
+
+    #[test]
+    fn update_events_move_through_phases() {
+        let mut app = app();
+        let info = UpdateInfo {
+            version: "v9.9.9".into(),
+            notes: "测试".into(),
+            url: "https://example.com/a.zip".into(),
+            sha256: "abc".into(),
+            size: 100,
+        };
+        app.update_tx
+            .send(UpdateEvent::Checked(Ok(Some(info))))
+            .unwrap();
+        app.poll_updates();
+        assert_eq!(app.update_phase, UpdatePhase::Available);
+        assert_eq!(
+            app.update_info.as_ref().map(|info| info.version.as_str()),
+            Some("v9.9.9")
+        );
+
+        app.update_tx
+            .send(UpdateEvent::Downloaded(Ok(PathBuf::from("/tmp/a.zip"))))
+            .unwrap();
+        app.poll_updates();
+        assert_eq!(app.update_phase, UpdatePhase::Downloaded);
+        assert!(app.update_zip.is_some());
+
+        app.update_tx
+            .send(UpdateEvent::Checked(Err("网络错误".into())))
+            .unwrap();
+        app.poll_updates();
+        assert_eq!(app.update_phase, UpdatePhase::Failed);
+        assert_eq!(app.update_error.as_deref(), Some("网络错误"));
+    }
+
+    #[test]
+    fn update_section_renders_every_phase() {
+        let mut app = app();
+        let ctx = app.ctx.clone();
+        let mut frame = eframe::Frame::_new_kittest();
+        app.update_info = Some(UpdateInfo {
+            version: "v9.9.9".into(),
+            notes: "测试说明".into(),
+            url: "https://example.com/a.zip".into(),
+            sha256: "abc".into(),
+            size: 1024,
+        });
+        app.update_message = Some("已是最新版本".into());
+        app.update_message_at = Some(Instant::now());
+        app.update_error = Some("测试错误".into());
+        app.update_progress.store(512, Ordering::Relaxed);
+        for phase in [
+            UpdatePhase::Idle,
+            UpdatePhase::Checking,
+            UpdatePhase::Available,
+            UpdatePhase::Downloading,
+            UpdatePhase::Downloaded,
+            UpdatePhase::Failed,
+        ] {
+            app.update_phase = phase;
+            // 同时渲染顶部按钮和更新说明弹窗。
+            app.show_update_dialog = true;
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1120.0, 800.0))),
+                    ..Default::default()
+                },
+                |ui| app.ui(ui, &mut frame),
+            );
+            assert!(!output.shapes.is_empty(), "更新阶段 {phase:?} 渲染失败");
+            app.show_update_dialog = false;
+            output.textures_delta.clear();
+        }
+    }
+
+    #[test]
+    fn panel_test_result_is_formatted_for_region_window() {
+        let mut app = app();
+        app.ocr_test_running = true;
+        app.sender
+            .send(OcrEvent::PanelTest {
+                result: Ok(OcrText {
+                    text: "抓鬼 长寿村 12,34".into(),
+                    elapsed_secs: 0.2,
+                }),
+            })
+            .unwrap();
+        app.poll_events();
+        assert!(!app.ocr_test_running, "测试结束后应复位状态");
+        let text = app
+            .ocr_test_result
+            .as_ref()
+            .expect("应保存测试结果")
+            .as_ref()
+            .expect("应识别成功");
+        assert!(text.contains("耗时 0.20 秒"));
+        assert!(text.contains("抓鬼"));
+        assert!(text.contains("长寿村"));
+        assert!(text.contains("(12, 34)"));
+
+        app.ocr_test_running = true;
+        app.sender
+            .send(OcrEvent::PanelTest {
+                result: Err("模型加载失败".into()),
+            })
+            .unwrap();
+        app.poll_events();
+        assert_eq!(app.ocr_test_result, Some(Err("模型加载失败".to_string())));
+    }
+
+    #[test]
+    fn region_window_uses_left_right_layout() {
+        fn mesh_bounds(shape: &egui::Shape, texture: egui::TextureId) -> Option<Rect> {
+            match shape {
+                egui::Shape::Mesh(mesh) if mesh.texture_id == texture => Some(mesh.calc_bounds()),
+                egui::Shape::Vec(shapes) => {
+                    shapes.iter().find_map(|shape| mesh_bounds(shape, texture))
+                }
+                _ => None,
+            }
+        }
+        let mut app = app();
+        app.show_region_window = true;
+        app.config.preprocess_mode = "binary".into();
+        app.config.extra_region_enabled = true;
+        app.update_preview(image::RgbImage::from_pixel(
+            640,
+            360,
+            image::Rgb([20, 20, 20]),
+        ));
+        let ctx = app.ctx.clone();
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, 820.0))),
+                ..Default::default()
+            },
+            |ui| app.region_window_ui(ui),
+        );
+        let preview_id = app.preview_texture.as_ref().expect("预览纹理").id();
+        let preprocess_id = app.preprocess_preview.as_ref().expect("预处理预览").id();
+        let extra_preview_id = app
+            .preprocess_preview_extra
+            .as_ref()
+            .expect("备用区域预处理预览")
+            .id();
+        let preview = output
+            .shapes
+            .iter()
+            .find_map(|shape| mesh_bounds(&shape.shape, preview_id))
+            .expect("识别区域预览未绘制");
+        let preprocess = output
+            .shapes
+            .iter()
+            .find_map(|shape| mesh_bounds(&shape.shape, preprocess_id))
+            .expect("预处理预览未绘制");
+        assert!(preview.min.x >= 300.0, "识别区域预览应在右侧：{preview:?}");
+        assert!(
+            preprocess.min.x >= 300.0,
+            "预处理预览应在右侧：{preprocess:?}"
+        );
+        assert!(
+            preprocess.min.y > preview.max.y,
+            "预处理预览应在识别区域预览下方：preview={preview:?} preprocess={preprocess:?}"
+        );
+        let extra_preprocess = output
+            .shapes
+            .iter()
+            .find_map(|shape| mesh_bounds(&shape.shape, extra_preview_id))
+            .expect("备用区域预处理预览未绘制");
+        assert!(
+            preprocess.min.x < extra_preprocess.min.x,
+            "主区域在左、备用区域在右：main={preprocess:?} extra={extra_preprocess:?}"
+        );
+        assert!(
+            preprocess.min.y < extra_preprocess.max.y && extra_preprocess.min.y < preprocess.max.y,
+            "两张预处理预览应左右排列：main={preprocess:?} extra={extra_preprocess:?}"
+        );
+
+        // 文字位置：截图范围、门控设置在上排左侧；识别预处理在分隔线下方。
+        fn text_pos(shapes: &[egui::epaint::ClippedShape], needle: &str) -> Option<egui::Pos2> {
+            fn walk(shape: &egui::Shape, needle: &str) -> Option<egui::Pos2> {
+                match shape {
+                    egui::Shape::Text(text) => {
+                        text.galley.text().contains(needle).then_some(text.pos)
+                    }
+                    egui::Shape::Vec(shapes) => shapes.iter().find_map(|shape| walk(shape, needle)),
+                    _ => None,
+                }
+            }
+            shapes.iter().find_map(|shape| walk(&shape.shape, needle))
+        }
+        let scope = text_pos(&output.shapes, "截图范围").expect("缺少截图范围标题");
+        let extra_region = text_pos(&output.shapes, "备用区域").expect("缺少备用区域标题");
+        let gate = text_pos(&output.shapes, "图色门控设置").expect("缺少门控标题");
+        let preprocess_title = text_pos(&output.shapes, "识别预处理").expect("缺少预处理标题");
+        let preview_title = text_pos(&output.shapes, "识别区域预览").expect("缺少预览标题");
+        assert!(
+            scope.y < extra_region.y && extra_region.y < gate.y,
+            "顺序应为 截图范围 → 备用区域 → 门控设置：{scope:?} {extra_region:?} {gate:?}"
+        );
+        let main_region = text_pos(&output.shapes, "主区域").expect("缺少主区域标题");
+        let enable_extra = text_pos(&output.shapes, "启用备用区域").expect("缺少启用备用区域");
+        let main_preprocess = text_pos(&output.shapes, "主区域预处理").expect("缺少主区域预处理");
+        let extra_preprocess =
+            text_pos(&output.shapes, "备用区域预处理").expect("缺少备用区域预处理");
+        assert!(
+            main_region.y < extra_region.y && extra_region.y < enable_extra.y,
+            "截图范围内顺序应为 主区域 → 备用区域 → 启用备用区域"
+        );
+        assert!(
+            main_preprocess.y > gate.y && main_preprocess.y < extra_preprocess.y,
+            "预处理应为 主区域在上、备用区域在下，且在门控设置之后：{main_preprocess:?} {extra_preprocess:?}"
+        );
+        assert!(
+            preprocess_title.y > gate.y,
+            "识别预处理应在分隔线下方、门控设置之后"
+        );
+        assert!(
+            preview_title.x > scope.x + 120.0,
+            "识别区域预览标题应在右侧列"
+        );
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn preprocess_settings_are_independent_per_region() {
+        let mut app = app();
+        app.config.preprocess_mode = "binary".into();
+        app.config.extra_preprocess_mode = "color".into();
+        app.config.extra_preprocess_color = [1, 2, 3];
+        app.config.extra_region_enabled = true;
+        app.show_region_window = true;
+        app.update_preview(image::RgbImage::from_pixel(
+            200,
+            100,
+            image::Rgb([30, 30, 30]),
+        ));
+        assert_eq!(app.preprocess_pipeline_for(false).config_value(), "binary");
+        assert_eq!(app.preprocess_pipeline_for(true).config_value(), "color");
+        assert!(app.preprocess_preview.is_some(), "主区域预览应生成");
+        assert!(app.preprocess_preview_extra.is_some(), "备用区域预览应生成");
+
+        // 修改主区域设置不影响备用区域。
+        app.config.preprocess_mode = "gray".into();
+        app.refresh_preprocess_preview();
+        assert_eq!(app.preprocess_pipeline_for(true).config_value(), "color");
+    }
+
+    #[test]
+    fn preprocess_preview_tracks_settings() {
+        let mut app = app();
+        app.show_region_window = true;
+        app.config.preprocess_mode = "binary".into();
+        app.update_preview(image::RgbImage::from_pixel(
+            60,
+            40,
+            image::Rgb([10, 10, 10]),
+        ));
+        assert!(
+            app.preprocess_preview.is_some(),
+            "取点窗口打开时应生成预处理预览"
+        );
+        let first = app.preprocess_preview.as_ref().map(|texture| texture.id());
+        app.config.preprocess_mode = "gray".into();
+        app.refresh_preprocess_preview();
+        assert_eq!(
+            app.preprocess_preview.as_ref().map(|texture| texture.id()),
+            first,
+            "切换模式应复用同一纹理"
+        );
+
+        app.show_region_window = false;
+        app.release_preview();
+        assert!(app.preprocess_preview.is_none(), "关闭取点窗口后释放预览");
     }
 
     #[test]
@@ -2440,6 +4239,83 @@ mod tests {
                 output.textures_delta.clear();
             }
         }
+    }
+
+    #[test]
+    fn renders_in_light_theme() {
+        let ctx = egui::Context::default();
+        theme::install(&ctx, true);
+        let mut app = MhxyApp::from_config(
+            Config {
+                theme_light: true,
+                ..Default::default()
+            },
+            PathBuf::from("/unused/config.json"),
+            ctx.clone(),
+        );
+        let mut frame = eframe::Frame::_new_kittest();
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1120.0, 800.0))),
+                ..Default::default()
+            },
+            |ui| app.ui(ui, &mut frame),
+        );
+        assert!(!output.shapes.is_empty(), "亮色主题渲染失败");
+        output.textures_delta.clear();
+        // 恢复默认，避免影响并行运行的其他测试。
+        theme::set_light(&ctx, false);
+    }
+
+    #[test]
+    fn profiles_apply_save_and_delete() {
+        let mut app = app();
+        app.config.preprocess_mode = "binary".into();
+        app.config.color_gate_enabled = true;
+        app.save_active_profile();
+
+        app.config.preprocess_mode = "off".into();
+        app.config.color_gate_enabled = false;
+        let name = app.config.active_profile.clone();
+        app.apply_profile(&name);
+        assert_eq!(app.config.preprocess_mode, "binary");
+        assert!(app.config.color_gate_enabled);
+
+        app.profile_name_edit = "测试方案".into();
+        app.create_profile();
+        assert_eq!(app.config.active_profile, "测试方案");
+        assert!(app.config.profiles.iter().any(|p| p.name == "测试方案"));
+
+        app.delete_active_profile();
+        assert!(!app.config.profiles.iter().any(|p| p.name == "测试方案"));
+        assert!(!app.config.profiles.is_empty());
+    }
+
+    #[test]
+    fn sidebar_sections_can_collapse() {
+        let mut app = app();
+        app.config.sidebar_folded = "window,trigger,ocr,task,log".into();
+        assert!(!app.sidebar_section_open("window"));
+        assert!(!app.sidebar_section_open("log"));
+        assert!(app.sidebar_section_open("unknown"));
+        app.set_sidebar_section_open("window", true);
+        assert!(app.sidebar_section_open("window"));
+        assert!(app.config.sidebar_folded.contains("trigger"));
+        app.set_sidebar_section_open("trigger", true);
+        assert!(!app.config.sidebar_folded.contains("trigger"));
+
+        // 全折叠时侧栏仍能正常渲染。
+        let ctx = app.ctx.clone();
+        let mut frame = eframe::Frame::_new_kittest();
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1120.0, 800.0))),
+                ..Default::default()
+            },
+            |ui| app.ui(ui, &mut frame),
+        );
+        assert!(!output.shapes.is_empty());
+        output.textures_delta.clear();
     }
 
     #[test]

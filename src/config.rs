@@ -7,6 +7,45 @@ use std::path::{Path, PathBuf};
 
 pub const CONFIG_FILE_NAME: &str = "config.json";
 pub const CONFIG_PATH_ENV: &str = "MHXY_CONFIG_PATH";
+/// 预处理默认文字颜色：RGB u8 (234, 255, 101)，即 #eaff65。
+pub const DEFAULT_PREPROCESS_COLOR: [u8; 3] = [234, 255, 101];
+
+/// 可保存的识别方案：图色门控 + 预处理设置，方便一键切换。
+#[derive(Clone, Debug, PartialEq)]
+pub struct Profile {
+    pub name: String,
+    pub gate_enabled: bool,
+    pub gate_interval_ms: u32,
+    pub gate_mode: String,
+    pub gate_tolerance: u8,
+    pub gate_points: Vec<ColorPoint>,
+    pub preprocess_mode: String,
+    pub preprocess_color: [u8; 3],
+    pub preprocess_tolerance: u8,
+    pub extra_preprocess_mode: String,
+    pub extra_preprocess_color: [u8; 3],
+    pub extra_preprocess_tolerance: u8,
+}
+
+impl Profile {
+    /// 用当前配置生成一个方案（名称可指定）。
+    pub fn from_config(config: &Config, name: String) -> Self {
+        Self {
+            name,
+            gate_enabled: config.color_gate_enabled,
+            gate_interval_ms: config.color_gate_interval_ms,
+            gate_mode: config.color_gate_mode.clone(),
+            gate_tolerance: config.color_gate_tolerance,
+            gate_points: config.color_gate_points.clone(),
+            preprocess_mode: config.preprocess_mode.clone(),
+            preprocess_color: config.preprocess_color,
+            preprocess_tolerance: config.preprocess_tolerance,
+            extra_preprocess_mode: config.extra_preprocess_mode.clone(),
+            extra_preprocess_color: config.extra_preprocess_color,
+            extra_preprocess_tolerance: config.extra_preprocess_tolerance,
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -35,12 +74,37 @@ pub struct Config {
     pub color_gate_mode: String,
     pub color_gate_tolerance: u8,
     pub color_gate_points: Vec<ColorPoint>,
+    /// OCR 前预处理：off / gray / binary / color。
+    pub preprocess_mode: String,
+    /// 按颜色提取时保留的文字颜色。
+    pub preprocess_color: [u8; 3],
+    /// 按颜色提取时的颜色容差。
+    pub preprocess_tolerance: u8,
+    /// 备用区域独立的预处理设置。
+    pub extra_preprocess_mode: String,
+    pub extra_preprocess_color: [u8; 3],
+    pub extra_preprocess_tolerance: u8,
+    /// 亮色主题（false = 暗色）。
+    pub theme_light: bool,
+    /// 侧栏各分组折叠状态，逗号分隔的 id（如 "window,task"）。
+    pub sidebar_folded: String,
+    /// 启动时检查更新。
+    pub update_enabled: bool,
+    /// 更新清单地址（自建站点）。
+    pub update_manifest_url: String,
+    /// 保存的识别方案与当前方案名。
+    pub profiles: Vec<Profile>,
+    pub active_profile: String,
+    /// 识别区域窗口各分组的折叠状态。
+    pub region_scope_open: bool,
+    pub region_gate_open: bool,
+    pub region_preprocess_open: bool,
     pub on_top: bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self {
+        let mut config = Self {
             ocr_mode: "local".into(),
             interval_seconds: 5,
             task_region: DEFAULT_TASK_REGION,
@@ -65,12 +129,36 @@ impl Default for Config {
             color_gate_mode: "all".into(),
             color_gate_tolerance: 12,
             color_gate_points: Vec::new(),
+            preprocess_mode: "off".into(),
+            preprocess_color: DEFAULT_PREPROCESS_COLOR,
+            preprocess_tolerance: 24,
+            extra_preprocess_mode: "off".into(),
+            extra_preprocess_color: DEFAULT_PREPROCESS_COLOR,
+            extra_preprocess_tolerance: 24,
+            theme_light: false,
+            sidebar_folded: String::new(),
+            update_enabled: true,
+            update_manifest_url: crate::update::DEFAULT_MANIFEST_URL.to_string(),
+            region_scope_open: true,
+            region_gate_open: true,
+            region_preprocess_open: true,
             on_top: true,
-        }
+            profiles: Vec::new(),
+            active_profile: String::new(),
+        };
+        let profile = Profile::from_config(&config, "默认".to_string());
+        config.profiles = vec![profile];
+        config.active_profile = "默认".to_string();
+        config
     }
 }
 
 impl Config {
+    /// 用当前设置生成方案（沿用当前方案名）。
+    pub fn profile_from_current(&self) -> Profile {
+        Profile::from_config(self, self.active_profile.clone())
+    }
+
     pub fn load(path: &Path) -> Config {
         let mut config = Config::default();
         let Ok(raw) = std::fs::read_to_string(path) else {
@@ -136,6 +224,67 @@ impl Config {
             .map(|value| value.min(255) as u8)
             .unwrap_or(12);
         config.color_gate_points = get_points(map, "color_gate/points");
+        config.preprocess_mode = match get_string(map, "ocr/preprocess", "off").as_str() {
+            "gray" | "grayscale" => "gray".into(),
+            "binary" | "binarize" => "binary".into(),
+            "color" => "color".into(),
+            _ => "off".into(),
+        };
+        config.preprocess_color = parse_hex(&get_string(map, "ocr/preprocess_color", "#eaff65"))
+            .unwrap_or(DEFAULT_PREPROCESS_COLOR);
+        config.preprocess_tolerance = map
+            .get("ocr/preprocess_tolerance")
+            .and_then(Value::as_u64)
+            .map(|value| value.min(255) as u8)
+            .unwrap_or(24);
+        config.extra_preprocess_mode =
+            match get_string(map, "ocr/extra_preprocess", &config.preprocess_mode).as_str() {
+                "gray" | "grayscale" => "gray".into(),
+                "binary" | "binarize" => "binary".into(),
+                "color" => "color".into(),
+                "off" => "off".into(),
+                other => other.to_string(),
+            };
+        config.extra_preprocess_color = parse_hex(&get_string(
+            map,
+            "ocr/extra_preprocess_color",
+            &to_hex(config.preprocess_color),
+        ))
+        .unwrap_or(config.preprocess_color);
+        config.extra_preprocess_tolerance = map
+            .get("ocr/extra_preprocess_tolerance")
+            .and_then(Value::as_u64)
+            .map(|value| value.min(255) as u8)
+            .unwrap_or(config.preprocess_tolerance);
+        config.theme_light = get_string(map, "window/theme", "dark") == "light";
+        config.sidebar_folded = get_string(map, "window/sidebar/folded", "");
+        config.update_enabled = get_bool(map, "update/enabled", true);
+        config.update_manifest_url = get_string(
+            map,
+            "update/manifest_url",
+            crate::update::DEFAULT_MANIFEST_URL,
+        );
+        config.profiles = map
+            .get("profiles/items")
+            .and_then(Value::as_array)
+            .map(|items| items.iter().filter_map(profile_from_value).collect())
+            .unwrap_or_default();
+        config.active_profile = get_string(map, "profiles/active", "");
+        if config.profiles.is_empty() {
+            config
+                .profiles
+                .push(Profile::from_config(&config, "默认".to_string()));
+        }
+        if !config
+            .profiles
+            .iter()
+            .any(|profile| profile.name == config.active_profile)
+        {
+            config.active_profile = config.profiles[0].name.clone();
+        }
+        config.region_scope_open = get_bool(map, "window/region/scope_open", true);
+        config.region_gate_open = get_bool(map, "window/region/gate_open", true);
+        config.region_preprocess_open = get_bool(map, "window/region/preprocess_open", true);
         config.on_top = get_bool(map, "window/coordinate/on_top", true);
         // 通用任务与抓鬼/鬼王互斥；手改配置或旧配置里同时为真时，以通用任务为准。
         if config.generic_enabled {
@@ -203,6 +352,63 @@ impl Config {
         insert(
             "color_gate/points",
             points_to_value(&self.color_gate_points),
+        );
+        insert(
+            "ocr/preprocess",
+            Value::String(self.preprocess_mode.clone()),
+        );
+        insert(
+            "ocr/preprocess_color",
+            Value::String(to_hex(self.preprocess_color)),
+        );
+        insert(
+            "ocr/preprocess_tolerance",
+            Value::from(self.preprocess_tolerance),
+        );
+        insert(
+            "ocr/extra_preprocess",
+            Value::String(self.extra_preprocess_mode.clone()),
+        );
+        insert(
+            "ocr/extra_preprocess_color",
+            Value::String(to_hex(self.extra_preprocess_color)),
+        );
+        insert(
+            "ocr/extra_preprocess_tolerance",
+            Value::from(self.extra_preprocess_tolerance),
+        );
+        insert(
+            "window/theme",
+            Value::String(if self.theme_light { "light" } else { "dark" }.to_string()),
+        );
+        insert(
+            "window/sidebar/folded",
+            Value::String(self.sidebar_folded.clone()),
+        );
+        insert("update/enabled", Value::Bool(self.update_enabled));
+        insert(
+            "update/manifest_url",
+            Value::String(self.update_manifest_url.clone()),
+        );
+        insert(
+            "profiles/active",
+            Value::String(self.active_profile.clone()),
+        );
+        insert(
+            "profiles/items",
+            Value::Array(self.profiles.iter().map(profile_to_value).collect()),
+        );
+        insert(
+            "window/region/scope_open",
+            Value::Bool(self.region_scope_open),
+        );
+        insert(
+            "window/region/gate_open",
+            Value::Bool(self.region_gate_open),
+        );
+        insert(
+            "window/region/preprocess_open",
+            Value::Bool(self.region_preprocess_open),
         );
         insert("window/coordinate/on_top", Value::Bool(self.on_top));
 
@@ -318,6 +524,115 @@ fn points_to_value(points: &[ColorPoint]) -> Value {
             })
             .collect(),
     )
+}
+
+fn profile_from_value(value: &Value) -> Option<Profile> {
+    let object = value.as_object()?;
+    let name = object.get("name")?.as_str()?.trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    Some(Profile {
+        name,
+        gate_enabled: object
+            .get("gate_enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        gate_interval_ms: object
+            .get("gate_interval_ms")
+            .and_then(Value::as_u64)
+            .map(|value| (value as u32).clamp(50, 5000))
+            .unwrap_or(300),
+        gate_mode: match object.get("gate_mode").and_then(Value::as_str) {
+            Some("any") => "any".to_string(),
+            _ => "all".to_string(),
+        },
+        gate_tolerance: object
+            .get("gate_tolerance")
+            .and_then(Value::as_u64)
+            .map(|value| value.min(255) as u8)
+            .unwrap_or(12),
+        gate_points: points_from_value(object.get("gate_points")),
+        preprocess_mode: match object.get("preprocess_mode").and_then(Value::as_str) {
+            Some("gray" | "grayscale") => "gray".to_string(),
+            Some("binary" | "binarize") => "binary".to_string(),
+            Some("color") => "color".to_string(),
+            Some(value) => value.to_string(),
+            None => "off".to_string(),
+        },
+        preprocess_color: object
+            .get("preprocess_color")
+            .and_then(Value::as_str)
+            .and_then(parse_hex)
+            .unwrap_or(DEFAULT_PREPROCESS_COLOR),
+        preprocess_tolerance: object
+            .get("preprocess_tolerance")
+            .and_then(Value::as_u64)
+            .map(|value| value.min(255) as u8)
+            .unwrap_or(24),
+        extra_preprocess_mode: match object.get("extra_preprocess_mode").and_then(Value::as_str) {
+            Some("gray" | "grayscale") => "gray".to_string(),
+            Some("binary" | "binarize") => "binary".to_string(),
+            Some("color") => "color".to_string(),
+            Some(value) => value.to_string(),
+            None => "off".to_string(),
+        },
+        extra_preprocess_color: object
+            .get("extra_preprocess_color")
+            .and_then(Value::as_str)
+            .and_then(parse_hex)
+            .unwrap_or(DEFAULT_PREPROCESS_COLOR),
+        extra_preprocess_tolerance: object
+            .get("extra_preprocess_tolerance")
+            .and_then(Value::as_u64)
+            .map(|value| value.min(255) as u8)
+            .unwrap_or(24),
+    })
+}
+
+fn points_from_value(value: Option<&Value>) -> Vec<ColorPoint> {
+    value
+        .and_then(Value::as_array)
+        .map(|items| items.iter().filter_map(point_from_value).collect())
+        .unwrap_or_default()
+}
+
+fn profile_to_value(profile: &Profile) -> Value {
+    let mut object = Map::new();
+    object.insert("name".into(), Value::String(profile.name.clone()));
+    object.insert("gate_enabled".into(), Value::Bool(profile.gate_enabled));
+    object.insert(
+        "gate_interval_ms".into(),
+        Value::from(profile.gate_interval_ms),
+    );
+    object.insert("gate_mode".into(), Value::String(profile.gate_mode.clone()));
+    object.insert("gate_tolerance".into(), Value::from(profile.gate_tolerance));
+    object.insert("gate_points".into(), points_to_value(&profile.gate_points));
+    object.insert(
+        "preprocess_mode".into(),
+        Value::String(profile.preprocess_mode.clone()),
+    );
+    object.insert(
+        "preprocess_color".into(),
+        Value::String(to_hex(profile.preprocess_color)),
+    );
+    object.insert(
+        "preprocess_tolerance".into(),
+        Value::from(profile.preprocess_tolerance),
+    );
+    object.insert(
+        "extra_preprocess_mode".into(),
+        Value::String(profile.extra_preprocess_mode.clone()),
+    );
+    object.insert(
+        "extra_preprocess_color".into(),
+        Value::String(to_hex(profile.extra_preprocess_color)),
+    );
+    object.insert(
+        "extra_preprocess_tolerance".into(),
+        Value::from(profile.extra_preprocess_tolerance),
+    );
+    Value::Object(object)
 }
 
 /// 去掉 JSON 里的 // 与 /* */ 注释，字符串里的斜杠保持原样。
@@ -483,6 +798,126 @@ mod tests {
         assert!(loaded.generic_enabled);
         assert!(!loaded.zhuagui_enabled);
         assert!(!loaded.ghost_king_enabled);
+    }
+
+    #[test]
+    fn round_trips_profiles() {
+        let dir = std::env::temp_dir().join("rust-mhxy-config-profile-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("config.json");
+        let mut config = Config {
+            active_profile: "抓鬼".into(),
+            color_gate_enabled: true,
+            preprocess_mode: "binary".into(),
+            ..Default::default()
+        };
+        let profile = Config::profile_from_current(&config);
+        config.profiles.push(profile);
+        config.save(&path).unwrap();
+        let loaded = Config::load(&path);
+        assert_eq!(loaded.active_profile, "抓鬼");
+        let saved = loaded
+            .profiles
+            .iter()
+            .find(|profile| profile.name == "抓鬼")
+            .expect("方案应被保存");
+        assert!(saved.gate_enabled);
+        assert_eq!(saved.preprocess_mode, "binary");
+        assert_eq!(loaded.profiles[0].name, "默认");
+    }
+
+    #[test]
+    fn round_trips_extra_preprocess_settings() {
+        let dir = std::env::temp_dir().join("rust-mhxy-config-extra-preprocess-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("config.json");
+        Config {
+            preprocess_mode: "binary".into(),
+            extra_preprocess_mode: "color".into(),
+            extra_preprocess_color: [9, 8, 7],
+            extra_preprocess_tolerance: 33,
+            ..Default::default()
+        }
+        .save(&path)
+        .unwrap();
+        let loaded = Config::load(&path);
+        assert_eq!(loaded.preprocess_mode, "binary");
+        assert_eq!(loaded.extra_preprocess_mode, "color");
+        assert_eq!(loaded.extra_preprocess_color, [9, 8, 7]);
+        assert_eq!(loaded.extra_preprocess_tolerance, 33);
+    }
+
+    #[test]
+    fn round_trips_theme_setting() {
+        let dir = std::env::temp_dir().join("rust-mhxy-config-theme-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("config.json");
+        Config {
+            theme_light: true,
+            ..Default::default()
+        }
+        .save(&path)
+        .unwrap();
+        assert!(Config::load(&path).theme_light);
+    }
+
+    #[test]
+    fn round_trips_sidebar_fold_state() {
+        let dir = std::env::temp_dir().join("rust-mhxy-config-sidebar-fold-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("config.json");
+        Config {
+            sidebar_folded: "window,task".into(),
+            ..Default::default()
+        }
+        .save(&path)
+        .unwrap();
+        assert_eq!(Config::load(&path).sidebar_folded, "window,task");
+    }
+
+    #[test]
+    fn round_trips_region_fold_state() {
+        let dir = std::env::temp_dir().join("rust-mhxy-config-fold-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("config.json");
+        Config {
+            region_scope_open: false,
+            region_gate_open: false,
+            region_preprocess_open: true,
+            ..Default::default()
+        }
+        .save(&path)
+        .unwrap();
+        let loaded = Config::load(&path);
+        assert!(!loaded.region_scope_open);
+        assert!(!loaded.region_gate_open);
+        assert!(loaded.region_preprocess_open);
+    }
+
+    #[test]
+    fn default_preprocess_color_is_eaff65() {
+        let config = Config::default();
+        assert_eq!(config.preprocess_color, [234, 255, 101]);
+        assert_eq!(to_hex(config.preprocess_color), "#eaff65");
+    }
+
+    #[test]
+    fn round_trips_preprocess_settings() {
+        let dir = std::env::temp_dir().join("rust-mhxy-config-preprocess-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("config.json");
+        Config {
+            preprocess_mode: "color".into(),
+            preprocess_color: [0xd4, 0xa0, 0x17],
+            preprocess_tolerance: 31,
+            ..Default::default()
+        }
+        .save(&path)
+        .unwrap();
+        let loaded = Config::load(&path);
+        assert_eq!(loaded.preprocess_mode, "color");
+        assert_eq!(loaded.preprocess_color, [0xd4, 0xa0, 0x17]);
+        assert_eq!(loaded.preprocess_tolerance, 31);
     }
 
     #[test]

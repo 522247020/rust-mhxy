@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rust-mhxy {{VERSION}} · 梦幻西游任务坐标辅助</title>
+<meta name="description" content="梦幻西游抓鬼 / 鬼王任务坐标辅助：自动识别任务栏坐标并在地图上标记，支持本地与远端 PP-OCR。">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main class="wrap">
+  <header class="hero">
+    <div class="brand">
+      <img class="logo" src="favicon.svg" alt="" width="44" height="44">
+      <div>
+        <h1>梦幻西游任务坐标辅助</h1>
+        <p class="sub">抓鬼 / 鬼王 · 自动识别坐标 · 地图标记</p>
+      </div>
+    </div>
+    <span class="version" title="当前版本">{{VERSION}}</span>
+  </header>
+
+  <section class="card download">
+    <div class="download-main">
+      <div>
+        <h2>Windows 10 / 11 · 64 位</h2>
+        <p class="muted">解压后双击 <code>rust-mhxy.exe</code>，无需安装，不会弹出命令窗口。</p>
+      </div>
+      <a class="btn" href="{{DOWNLOAD_URL}}" download>下载 {{VERSION}}</a>
+    </div>
+    <dl class="meta">
+      <div><dt>文件</dt><dd>{{ZIP_NAME}}</dd></div>
+      <div><dt>大小</dt><dd>{{SIZE_MB}} MB</dd></div>
+      <div><dt>更新</dt><dd>{{DATE}}</dd></div>
+      <div class="sha"><dt>SHA256</dt><dd><code id="sha">{{SHA256}}</code><button class="copy" type="button" data-copy="sha">复制</button></dd></div>
+    </dl>
+    <p class="hint">应用内也可直接检查更新：设置栏「版本与更新」→「检查更新」。</p>
+  </section>
+
+  <section class="grid">
+    <article class="card feature">
+      <h3>任务坐标识别</h3>
+      <p>识别抓鬼、捉鬼、鬼王任务文字，提取地图名称与坐标；未识别到任务时保留上次结果。</p>
+    </article>
+    <article class="card feature">
+      <h3>地图标记</h3>
+      <p>内置 20 张地图，标出目标点、附近范围与可选的 50×50 高概率区域。</p>
+    </article>
+    <article class="card feature">
+      <h3>本地 / 远端 OCR</h3>
+      <p>自带 PP-OCRv5 离线模型；也可接入自建 PP-OCR 服务，支持 multipart 与 raw。</p>
+    </article>
+    <article class="card feature">
+      <h3>识别预处理</h3>
+      <p>颜色提取、灰度、二值化、反色可组合，压掉任务栏背景干扰，减少坐标抖动。</p>
+    </article>
+    <article class="card feature">
+      <h3>图色门控</h3>
+      <p>按点位颜色判断是否有任务，战斗中自动跳过 OCR，降低占用。</p>
+    </article>
+    <article class="card feature">
+      <h3>轻量原生</h3>
+      <p>Rust + egui 原生界面，不依赖浏览器运行时；启动快、内存占用低。</p>
+    </article>
+  </section>
+
+  <section class="card">
+    <h2>更新内容</h2>
+    <ul class="notes">
+{{NOTES_HTML}}
+    </ul>
+  </section>
+
+  <section class="card">
+    <h2>使用提示</h2>
+    <ul class="tips">
+      <li>首次本地识别会加载 PP-OCRv5 模型，首次使用如果包内缺少模型会自动下载。</li>
+      <li>识别不到任务时，先在「设置识别区域」里调整截图范围，再试「识别预处理」。</li>
+      <li>坐标偶尔个位数跳动，可开启「大字体模式」，或在预处理里叠加二值化。</li>
+      <li>设置自动保存在程序目录的 <code>config.json</code>，可参考 <code>config.example.json</code>。</li>
+    </ul>
+  </section>
+
+  <footer>
+    <span>MIT License · {{YEAR}}</span>
+    <nav>
+      <a href="{{REPO}}" target="_blank" rel="noreferrer">GitHub 仓库</a>
+      <a href="{{REPO}}/releases" target="_blank" rel="noreferrer">Release 存档</a>
+      <a href="latest.json">更新清单</a>
+    </nav>
+  </footer>
+</main>
+<script>
+document.querySelectorAll('.copy').forEach(function (button) {
+  button.addEventListener('click', function () {
+    var text = document.getElementById(button.dataset.copy).textContent.trim();
+    var done = function () {
+      var old = button.textContent;
+      button.textContent = '已复制';
+      setTimeout(function () { button.textContent = old; }, 1200);
+    };
+    if (navigator.clipboard && window.isSecureContext) {
+      navigator.clipboard.writeText(text).then(done);
+    } else {
+      var area = document.createElement('textarea');
+      area.value = text;
+      document.body.appendChild(area);
+      area.select();
+      document.execCommand('copy');
+      document.body.removeChild(area);
+      done();
+    }
+  });
+});
+</script>
+</body>
+</html>

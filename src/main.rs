@@ -9,7 +9,9 @@ mod core;
 mod gate;
 mod hotkey;
 mod ocr;
+mod preprocess;
 mod theme;
+mod update;
 
 use std::sync::Arc;
 
@@ -25,6 +27,7 @@ fn main() -> eframe::Result {
     if config.on_top {
         viewport = viewport.with_always_on_top();
     }
+    let light_theme = config.theme_light;
     let options = eframe::NativeOptions {
         viewport,
         ..Default::default()
@@ -34,7 +37,7 @@ fn main() -> eframe::Result {
         options,
         Box::new(|cc| {
             install_fonts(&cc.egui_ctx);
-            theme::install(&cc.egui_ctx);
+            theme::install(&cc.egui_ctx, light_theme);
             Ok(Box::new(app::MhxyApp::new(cc)))
         }),
     )

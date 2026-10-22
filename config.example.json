@@ -18,6 +18,14 @@
   "ocr/extra_task_region": "0.70,0.71,0.99,0.90",
   // 是否启用第二个截图区域
   "ocr/extra_region_enabled": false,
+  // OCR 前的预处理，可叠加，按固定顺序执行：颜色提取 → 灰度 → 二值化 → 反色
+  // "off" 关闭；可组合，如 "binary"、"gray,binary"、"color,binary"、"binary,invert"
+  // 颜色提取输出黑字白底；二值化把文字判成白色时再加 "invert"
+  "ocr/preprocess": "off",
+  // 颜色提取时保留的文字颜色（十六进制），默认 234, 255, 101 即 #eaff65
+  "ocr/preprocess_color": "#eaff65",
+  // 颜色提取时的颜色容差（每通道 0~255）
+  "ocr/preprocess_tolerance": 24,
 
   // ---- 远端 PP-OCR ----
   // 请求格式："multipart"（POST /ocr，表单字段 file）/"raw"（POST /ocr/raw，原始字节）
@@ -60,9 +68,23 @@
   // 日志常开："simple" 只记启动应用 / 任务开始 / 任务停止；"detailed" 额外记录 OCR 过程与错误
   "log/level": "simple",
 
+  // ---- 自动更新 ----
+  // 启动后自动检查更新（侧栏「版本与更新」里也可以手动检查）
+  "update/enabled": true,
+  // 更新清单地址，默认走自建站点（国内访问比 GitHub 快）
+  "update/manifest_url": "https://xyq.mhwy.work/latest.json",
+
   // ---- 窗口 ----
   // 左侧设置栏是否展开
   "window/sidebar_expanded": true,
+  // 界面主题："dark" 暗色 / "light" 亮色
+  "window/theme": "dark",
+  // 侧栏分组折叠状态：逗号分隔，可取值 window / trigger / ocr / task / ui / log
+  "window/sidebar/folded": "",
+  // 识别区域窗口里三个分组的折叠状态（true = 展开）
+  "window/region/scope_open": true,
+  "window/region/gate_open": true,
+  "window/region/preprocess_open": true,
   // 窗口置顶
   "window/coordinate/on_top": false
 }

@@ -113,10 +113,25 @@ jobs:
     needs: build
     if: startsWith(github.ref, 'refs/tags/v') && github.event_name == 'push'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     permissions:
       contents: write
+    env:
+      # 配置了 SITE_SSH_HOST 等 secrets 才会自动部署下载站；没配置则只打 GitHub Release。
+      SITE_SSH_HOST: ${{ secrets.SITE_SSH_HOST }}
+      SITE_SSH_USER: ${{ secrets.SITE_SSH_USER }}
+      SITE_SSH_PORT: ${{ secrets.SITE_SSH_PORT }}
+      SITE_SSH_KEY: ${{ secrets.SITE_SSH_KEY }}
+      SITE_PATH: ${{ secrets.SITE_PATH }}
     steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
       - name: Download Windows package
         uses: actions/download-artifact@v4
         with:
@@ -135,3 +150,63 @@ jobs:
             gh release create "$RELEASE_TAG" release/* \
               --verify-tag --title "rust-mhxy $RELEASE_TAG" --generate-notes
           fi
+
+      - name: Build download site and manifest
+        env:
+          RELEASE_TAG: ${{ needs.build.outputs.version }}
+        run: |
+          zip_path="release/rust-mhxy-${RELEASE_TAG}-windows-x86_64.zip"
+          if [ ! -f "$zip_path" ]; then
+            zip_path="$(ls release/*.zip | head -1)"
+          fi
+          echo "安装包：$zip_path"
+          if [ -s site/notes.txt ]; then
+            echo "使用 site/notes.txt 作为更新说明"
+            python scripts/build-site.py --zip "$zip_path" --notes-file site/notes.txt
+          else
+            notes="$(git tag -l --format='%(contents)' "$RELEASE_TAG")"
+            if [ -z "$notes" ]; then
+              notes="常规更新与修复。"
+            fi
+            python scripts/build-site.py --zip "$zip_path" --notes "$notes"
+          fi
+
+      - name: Upload download site artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-mhxy-site-${{ needs.build.outputs.version }}
+          path: dist/site
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Deploy download site (SSH/rsync)
+        if: env.SITE_SSH_HOST != ''
+        run: |
+          if [ -z "$SITE_SSH_USER" ] || [ -z "$SITE_PATH" ] || [ -z "$SITE_SSH_KEY" ]; then
+            echo "::error::SITE_SSH_USER / SITE_PATH / SITE_SSH_KEY 未配置完整"
+            exit 1
+          fi
+          port="${SITE_SSH_PORT:-22}"
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SITE_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -p "$port" "$SITE_SSH_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+          rsync -az --delete \
+            -e "ssh -p $port -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes" \
+            dist/site/ "$SITE_SSH_USER@$SITE_SSH_HOST:$SITE_PATH/"
+          rm -f ~/.ssh/deploy_key
+
+      - name: Verify published manifest
+        if: env.SITE_SSH_HOST != ''
+        env:
+          RELEASE_TAG: ${{ needs.build.outputs.version }}
+        run: |
+          for _ in 1 2 3 4 5; do
+            if curl -fsS "https://xyq.mhwy.work/latest.json?t=$(date +%s)" |
+              grep -q "\"$RELEASE_TAG\""; then
+              echo "下载站清单已更新到 $RELEASE_TAG"
+              exit 0
+            fi
+            sleep 6
+          done
+          echo "::warning::latest.json 暂未返回 $RELEASE_TAG，可能是 CDN 缓存，请稍后手动确认"

@@ -34,11 +34,15 @@ pub enum OcrEvent {
     },
     /// 远端连接测试的结果（只用于日志提示）。
     Test { result: Result<OcrText, String> },
+    /// 取点窗口里「测试 OCR」的结果，不参与正式识别流程。
+    PanelTest { result: Result<OcrText, String> },
 }
 
 struct LocalJob {
     generation: u64,
     image: RgbImage,
+    /// 测试任务不参与正式识别的合并与结果回写。
+    test: bool,
 }
 
 /// 常驻线程：收到第一张截图时才加载模型，远端模式不占用模型内存。
@@ -51,10 +55,25 @@ impl LocalWorker {
         let (sender, receiver) = channel::<LocalJob>();
         thread::spawn(move || {
             let mut engine = None;
-            while let Ok(mut job) = receiver.recv() {
-                // 切换设置时只处理最新的待识别截图，避免堆积无效任务。
-                while let Ok(newer) = receiver.try_recv() {
-                    job = newer;
+            let mut pending: std::collections::VecDeque<LocalJob> =
+                std::collections::VecDeque::new();
+            loop {
+                let mut job = match pending.pop_front() {
+                    Some(job) => job,
+                    None => match receiver.recv() {
+                        Ok(job) => job,
+                        Err(_) => break,
+                    },
+                };
+                if !job.test {
+                    // 只合并连续的普通识别任务；测试任务保留到下一轮，避免界面卡在「识别中」。
+                    while let Ok(newer) = receiver.try_recv() {
+                        if newer.test {
+                            pending.push_back(newer);
+                        } else {
+                            job = newer;
+                        }
+                    }
                 }
                 let result = (|| {
                     if engine.is_none() {
@@ -65,13 +84,15 @@ impl LocalWorker {
                         .expect("initialized engine")
                         .recognize(&job.image)
                 })();
-                if reply
-                    .send(OcrEvent::Local {
+                let event = if job.test {
+                    OcrEvent::PanelTest { result }
+                } else {
+                    OcrEvent::Local {
                         generation: job.generation,
                         result,
-                    })
-                    .is_err()
-                {
+                    }
+                };
+                if reply.send(event).is_err() {
                     break;
                 }
                 ctx.request_repaint();
@@ -82,7 +103,22 @@ impl LocalWorker {
 
     pub fn submit(&self, generation: u64, image: RgbImage) -> Result<(), String> {
         self.sender
-            .send(LocalJob { generation, image })
+            .send(LocalJob {
+                generation,
+                image,
+                test: false,
+            })
+            .map_err(|_| "本地识别线程已退出，请重启程序".to_string())
+    }
+
+    /// 取点窗口的「测试 OCR」：不占用正式识别的 generation。
+    pub fn submit_test(&self, image: RgbImage) -> Result<(), String> {
+        self.sender
+            .send(LocalJob {
+                generation: 0,
+                image,
+                test: true,
+            })
             .map_err(|_| "本地识别线程已退出，请重启程序".to_string())
     }
 }
