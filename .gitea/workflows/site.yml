@@ -59,17 +59,37 @@ jobs:
           rm -rf "$tmp"
           git log -1 --oneline
 
-      - name: Check toolchain
+      - name: Set up Rust toolchain
+        env:
+          # 国内网络默认走 rsproxy 镜像；需要别的源就改这里。
+          RUSTUP_DIST_SERVER: https://rsproxy.cn
+          RUSTUP_UPDATE_ROOT: https://rsproxy.cn/rustup
         run: |
           python3 --version
           if ! command -v cargo >/dev/null 2>&1; then
-            echo "::error::runner 需要预装 Rust（含 x86_64-pc-windows-msvc target 和 cargo-xwin）"
-            exit 1
+            echo "未检测到 Rust，安装 stable（镜像：$RUSTUP_DIST_SERVER）"
+            if command -v curl >/dev/null 2>&1; then
+              curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
+                sh -s -- -y --profile minimal --default-toolchain stable
+            else
+              wget -qO- https://sh.rustup.rs |
+                sh -s -- -y --profile minimal --default-toolchain stable
+            fi
+            # shellcheck disable=SC1091
+            . "$HOME/.cargo/env"
           fi
           cargo --version
-          rustup target list --installed | grep -q x86_64-pc-windows-msvc || \
+          rustup target list --installed | grep -q x86_64-pc-windows-msvc ||
             rustup target add x86_64-pc-windows-msvc
-          command -v cargo-xwin >/dev/null 2>&1 || cargo install cargo-xwin --locked
+          if ! command -v cargo-xwin >/dev/null 2>&1; then
+            echo "安装 cargo-xwin"
+            cargo install cargo-xwin --locked
+          fi
+          command -v rsync >/dev/null 2>&1 || {
+            echo "安装 rsync"
+            (command -v sudo >/dev/null 2>&1 && sudo apt-get update && sudo apt-get install -y rsync) ||
+              (apt-get update && apt-get install -y rsync)
+          }
 
       - name: Build Windows package
         run: bash scripts/package-windows.sh
