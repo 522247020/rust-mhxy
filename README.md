@@ -373,6 +373,34 @@ location /downloads/ {
 
 Gitea Runner 需要（自建、Linux）：Rust + `x86_64-pc-windows-msvc` target、`cargo-xwin`、Python 3.11+、`rsync`，并且能访问 crates.io / 模型下载源。Secrets 与 GitHub 相同，在 Gitea 仓库 **设置 → Actions → Secrets** 里添加 `SITE_SSH_HOST`、`SITE_SSH_USER`、`SITE_SSH_PORT`、`SITE_SSH_KEY`、`SITE_PATH`。
 
+#### act_runner 持久化缓存（推荐）
+
+act_runner 默认每个任务起一个全新容器，`/data` 是 runner 自己的目录，**作业容器里访问不到**。要让 Rust、cargo-xwin、编译产物和模型跨任务复用：
+
+1. 在宿主机建缓存目录（和 runner 数据目录同级）：
+
+```bash
+sudo mkdir -p /volume4/docker/app_config/act_runner/cache/{cargo,rustup,target,xwin,ort,oar}
+sudo chmod -R 777 /volume4/docker/app_config/act_runner/cache
+```
+
+2. 编辑 `/volume4/docker/app_config/act_runner/data/config.yaml`，给作业容器挂载缓存目录：
+
+```yaml
+container:
+  options: "--volume /volume4/docker/app_config/act_runner/cache:/cache"
+```
+
+3. 重启 runner 容器：
+
+```bash
+docker restart act_runner
+```
+
+工作流会自动检测 `/cache`，并把 `CARGO_HOME`、`RUSTUP_HOME`、`CARGO_TARGET_DIR`、`XWIN_CACHE_DIR`、`ORT_CACHE_DIR`、`OAR_HOME` 指过去；没有 `/cache` 时退回 `$HOME` 并给出警告（只在当前任务内有效）。`CARGO_TARGET_DIR` 会持续增长，定期清理 `cache/target` 即可。
+
+如果 runner 配置的是 **host 模式**（任务直接在宿主机跑），不需要挂载，`$HOME` 本身就是持久的，工作流会自动复用。
+
 也可以在任何机器上手动部署已生成的站点：
 
 ```bash

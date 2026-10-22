@@ -65,9 +65,32 @@ jobs:
           RUSTUP_DIST_SERVER: https://rsproxy.cn
           RUSTUP_UPDATE_ROOT: https://rsproxy.cn/rustup
         run: |
+          # /cache 由 act_runner 的 container.options 挂载（见 README）。
+          # 没有挂载时退回 $HOME，只能当前任务内有效。
+          if [ -d /cache ] && [ -w /cache ]; then
+            cache_root=/cache
+          else
+            cache_root="$HOME"
+            echo "::warning::没有可写的 /cache，Cargo/Rust 不会跨任务持久化"
+          fi
+          mkdir -p "$cache_root/cargo" "$cache_root/rustup" "$cache_root/target" \
+                   "$cache_root/xwin" "$cache_root/ort" "$cache_root/oar"
+          {
+            echo "CARGO_HOME=$cache_root/cargo"
+            echo "RUSTUP_HOME=$cache_root/rustup"
+            echo "CARGO_TARGET_DIR=$cache_root/target"
+            echo "XWIN_CACHE_DIR=$cache_root/xwin"
+            echo "ORT_CACHE_DIR=$cache_root/ort"
+            echo "OAR_HOME=$cache_root/oar"
+          } >> "$GITHUB_ENV"
+          echo "$cache_root/cargo/bin" >> "$GITHUB_PATH"
+          export CARGO_HOME="$cache_root/cargo"
+          export RUSTUP_HOME="$cache_root/rustup"
+          export PATH="$CARGO_HOME/bin:$PATH"
+
           python3 --version
           if ! command -v cargo >/dev/null 2>&1; then
-            echo "未检测到 Rust，安装 stable（镜像：$RUSTUP_DIST_SERVER）"
+            echo "未检测到 Rust，安装 stable（镜像：$RUSTUP_DIST_SERVER，目录：$CARGO_HOME）"
             if command -v curl >/dev/null 2>&1; then
               curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
                 sh -s -- -y --profile minimal --default-toolchain stable
@@ -76,7 +99,7 @@ jobs:
                 sh -s -- -y --profile minimal --default-toolchain stable
             fi
             # shellcheck disable=SC1091
-            . "$HOME/.cargo/env"
+            . "$CARGO_HOME/env"
           fi
           cargo --version
           rustup target list --installed | grep -q x86_64-pc-windows-msvc ||
