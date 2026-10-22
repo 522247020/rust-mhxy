@@ -59,6 +59,21 @@ jobs:
           rm -rf "$tmp"
           git log -1 --oneline
 
+      - name: Check cache mount
+        run: |
+          echo "user: $(id -un) uid=$(id -u)"
+          if [ -d /cache ]; then
+            ls -ld /cache
+            if touch /cache/.cache-probe 2>/dev/null; then
+              echo "::notice::/cache 可写，持久化缓存生效"
+              rm -f /cache/.cache-probe
+            else
+              echo "::warning::/cache 存在但当前用户不可写（检查宿主机目录权限）"
+            fi
+          else
+            echo "::warning::作业容器里没有 /cache（检查 act_runner container.options 并重启 runner）"
+          fi
+
       - name: Set up Rust toolchain
         env:
           # 国内网络默认走 rsproxy 镜像；需要别的源就改这里。
@@ -140,6 +155,25 @@ jobs:
             (command -v sudo >/dev/null 2>&1 && sudo apt-get update && sudo apt-get install -y rsync) ||
               (apt-get update && apt-get install -y rsync)
           }
+
+      - name: Prepare Windows SDK
+        run: |
+          echo "XWIN_CACHE_DIR=${XWIN_CACHE_DIR:-unset}"
+          echo "CARGO_HOME=${CARGO_HOME:-unset}"
+          if [ -d /cache ]; then
+            ls -ld /cache
+          else
+            echo "::warning::/cache 不存在，检查 act_runner 的 container.options 是否挂载并重启"
+          fi
+          # 预下载 MSVC CRT/SDK 到缓存目录
+          cargo xwin cache xwin
+          sdk_dir="${XWIN_CACHE_DIR:-$HOME/.cache/cargo-xwin}/xwin/sdk/lib/um/x86_64"
+          # Linux 链接器区分大小写，SDK 里是小写，Rust 链接参数是大写，补符号链接
+          ln -sf directml.lib "$sdk_dir/DirectML.lib"
+          ln -sf directml.lib "$sdk_dir/DIRECTML.lib"
+          ln -sf pathcch.lib "$sdk_dir/PathCch.lib"
+          ln -sf pathcch.lib "$sdk_dir/PATHCCH.lib"
+          ls -l "$sdk_dir" | grep -iE 'directml|pathcch'
 
       - name: Build Windows package
         run: bash scripts/package-windows.sh
