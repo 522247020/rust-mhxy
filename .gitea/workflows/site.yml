@@ -62,6 +62,12 @@ jobs:
       - name: Check cache mount
         run: |
           echo "user: $(id -un) uid=$(id -u)"
+          echo "--- 根目录 ---"
+          ls -la / | head -30
+          echo "--- 相关挂载 ---"
+          mount | grep -E ' /cache | /workspace |/data' || echo "（没有 cache/workspace 挂载）"
+          echo "--- cgroup ---"
+          head -3 /proc/1/cgroup 2>/dev/null || true
           if [ -d /cache ]; then
             ls -ld /cache
             if touch /cache/.cache-probe 2>/dev/null; then
@@ -82,13 +88,20 @@ jobs:
         run: |
           # /cache 由 act_runner 的 container.options 挂载（见 README）。
           # 没有挂载时退回 $HOME，只能当前任务内有效。
-          if [ -d /cache ] && [ -w /cache ]; then
-            cache_root=/cache
-            echo "使用持久化缓存：/cache"
-          else
-            cache_root="$HOME"
-            echo "::warning::没有可写的 /cache，Cargo/Rust 不会跨任务持久化（当前用 $HOME）"
+          cache_root="${MHXY_CACHE_DIR:-}"
+          if [ -z "$cache_root" ]; then
+            if [ -d /cache ] && [ -w /cache ]; then
+              cache_root=/cache
+            else
+              cache_root="$HOME"
+              echo "::warning::没有可写的 /cache，Cargo/Rust 不会跨任务持久化（当前用 $HOME）"
+            fi
           fi
+          if [ ! -d "$cache_root" ] || [ ! -w "$cache_root" ]; then
+            echo "::warning::缓存目录 $cache_root 不可写，退回 \$HOME"
+            cache_root="$HOME"
+          fi
+          echo "工具链缓存目录：$cache_root"
           mkdir -p "$cache_root/cargo" "$cache_root/rustup" "$cache_root/target" \
                    "$cache_root/xwin" "$cache_root/ort" "$cache_root/oar"
           {
