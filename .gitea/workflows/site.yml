@@ -7,6 +7,11 @@ on:
   push:
     tags: ['v*']
   workflow_dispatch:
+    inputs:
+      notes:
+        description: '更新说明（一行一条），留空则使用标签名'
+        required: false
+        default: ''
 
 jobs:
   deploy:
@@ -14,10 +19,44 @@ jobs:
     timeout-minutes: 90
     steps:
       - name: Prepare source
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if [ ! -f Cargo.toml ]; then
-            git clone --depth 1 --branch "${GITHUB_REF_NAME}" "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" .
+          # Gitea act runner 不会自动检出仓库；用内置 token 克隆当前 ref。
+          if [ -f Cargo.toml ]; then
+            echo "工作区已有源码"
+            git log -1 --oneline
+            exit 0
           fi
+          server="${GITHUB_SERVER_URL#http://}"
+          server="${server#https://}"
+          scheme="http"
+          case "$GITHUB_SERVER_URL" in
+            https://*) scheme="https" ;;
+          esac
+          base="${scheme}://${server}/${GITHUB_REPOSITORY}.git"
+          tmp="$(mktemp -d)"
+          cloned=""
+          clone_repo() {
+            git clone --depth 1 --branch "${GITHUB_REF_NAME}" "$1" "$tmp/repo"
+          }
+          if [ -n "${TOKEN:-}" ]; then
+            for user in "${GITHUB_ACTOR:-}" oauth2; do
+              [ -z "$user" ] && continue
+              echo "尝试用 ${user} + token 克隆 ${GITHUB_REF_NAME}"
+              if clone_repo "${scheme}://${user}:${TOKEN}@${server}/${GITHUB_REPOSITORY}.git"; then
+                cloned=1
+                break
+              fi
+              rm -rf "$tmp/repo"
+            done
+          fi
+          if [ -z "$cloned" ]; then
+            echo "回退到匿名克隆 ${base}"
+            clone_repo "$base"
+          fi
+          cp -a "$tmp/repo/." .
+          rm -rf "$tmp"
           git log -1 --oneline
 
       - name: Check toolchain
@@ -38,15 +77,14 @@ jobs:
       - name: Build download site
         env:
           VERSION: ${{ github.ref_name }}
+          MANUAL_NOTES: ${{ github.event.inputs.notes }}
         run: |
-          notes_file=""
           if [ -s site/notes.txt ]; then
-            notes_file="site/notes.txt"
-          fi
-          if [ -n "$notes_file" ]; then
-            python3 scripts/build-site.py --notes-file "$notes_file"
+            python3 scripts/build-site.py --notes-file site/notes.txt
+          elif [ -n "${MANUAL_NOTES:-}" ]; then
+            python3 scripts/build-site.py --notes "$MANUAL_NOTES"
           else
-            python3 scripts/build-site.py --notes "${VERSION:-手动部署}"
+            python3 scripts/build-site.py --notes "常规更新与修复。"
           fi
 
       - name: Deploy to website
