@@ -69,9 +69,10 @@ jobs:
           # 没有挂载时退回 $HOME，只能当前任务内有效。
           if [ -d /cache ] && [ -w /cache ]; then
             cache_root=/cache
+            echo "使用持久化缓存：/cache"
           else
             cache_root="$HOME"
-            echo "::warning::没有可写的 /cache，Cargo/Rust 不会跨任务持久化"
+            echo "::warning::没有可写的 /cache，Cargo/Rust 不会跨任务持久化（当前用 $HOME）"
           fi
           mkdir -p "$cache_root/cargo" "$cache_root/rustup" "$cache_root/target" \
                    "$cache_root/xwin" "$cache_root/ort" "$cache_root/oar"
