@@ -164,10 +164,20 @@ def package(binary: Path, output: Path, models: Path, ort_cache: Path, version: 
     return archive
 
 
+def default_target_root() -> Path:
+    """优先使用 CARGO_TARGET_DIR（CI 会把构建产物放到持久化缓存目录）。"""
+    configured = os.environ.get("CARGO_TARGET_DIR")
+    if not configured:
+        return ROOT / "target"
+    path = Path(configured)
+    return path if path.is_absolute() else (ROOT / path)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--print-version", action="store_true", help="仅输出 Cargo 版本，含 v 前缀")
-    parser.add_argument("--binary", type=Path, default=ROOT / "target" / TARGET / "release" / "rust-mhxy.exe")
+    parser.add_argument("--binary", type=Path,
+                        default=default_target_root() / TARGET / "release" / "rust-mhxy.exe")
     parser.add_argument("--output-dir", type=Path, default=ROOT / "dist")
     parser.add_argument("--models-dir", type=Path, default=Path(os.environ.get("OAR_HOME", Path.home() / ".oar")))
     parser.add_argument("--ort-cache", type=Path)

@@ -11,4 +11,5 @@ echo "==> 交叉编译（release）"
 cargo xwin build --locked --release --target "${TARGET}"
 
 echo "==> 组装 Windows 分发包"
-python3 scripts/package-windows.py --binary "target/${TARGET}/release/rust-mhxy.exe"
+# 不硬编码 target/：package-windows.py 会跟随 CARGO_TARGET_DIR
+python3 scripts/package-windows.py
