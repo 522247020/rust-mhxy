@@ -402,16 +402,28 @@ Gitea Runner 需要（自建、Linux）：Rust + `x86_64-pc-windows-msvc` target
 
 #### act_runner 持久化缓存（推荐）
 
-act_runner 默认每个任务起一个全新容器，`/data` 是 runner 自己的目录，**作业容器里访问不到**。要让 Rust、cargo-xwin、编译产物和模型跨任务复用：
+act_runner 默认每个任务起一个全新容器：`/data` 是 runner 自己的目录，作业容器访问不到；`/workspace/<owner>/<repo>` 是**每任务一个命名卷**（名字里带 task id，任务结束即删除）；`$HOME` 也是全新的。所以这些位置都不能当缓存。
 
-1. 在宿主机建缓存目录（和 runner 数据目录同级）：
+act_runner 会把内置命名卷 `act-toolcache` 挂到作业容器的 **`/opt/hostedtoolcache`**，它跨任务、跨仓库持久（宿主机路径 `/volume4/@docker/volumes/act-toolcache/_data`）。**工作流默认就用它**，不需要任何 runner 配置：
+
+```
+工具链缓存目录：/opt/hostedtoolcache/rust-mhxy
+```
+
+`CARGO_HOME`、`RUSTUP_HOME`、`CARGO_TARGET_DIR`、`XWIN_CACHE_DIR`、`ORT_CACHE_DIR`、`OAR_HOME` 都指向这个目录下的子目录。
+
+### 可选：改用独立的 `/cache`
+
+如果想把缓存和 toolcache 分开、或者放到更宽裕的磁盘上，可以给作业容器额外挂一个 `/cache`：
+
+1. 宿主机建目录（和 runner 数据目录同级）：
 
 ```bash
-sudo mkdir -p /volume4/docker/app_config/act_runner/cache/{cargo,rustup,target,xwin,ort,oar}
+sudo mkdir -p /volume4/docker/app_config/act_runner/cache
 sudo chmod -R 777 /volume4/docker/app_config/act_runner/cache
 ```
 
-2. 编辑 runner 的 `config.yaml`（compose 里挂到 `/config.yaml` 或 `/data/config.yaml`，用下面第 3 步的命令确认到底是哪个），给作业容器挂载缓存目录。**`valid_volumes` 必须同时放行**，否则 `container.options` 里的 bind 会被静默丢弃（runner 日志会打印 `... is not a valid volume, will be ignored`）：
+2. 编辑 runner 的 `config.yaml`（compose 里挂到 `/config.yaml` 还是 `/data/config.yaml`，用第 3 步的命令确认）。**`container.options` 和 `valid_volumes` 必须同时配**，否则 act 的 `sanitizeConfig` 会把不在 `valid_volumes` 里的所有 bind 静默丢弃（runner 日志：`... is not a valid volume, will be ignored`）：
 
 ```yaml
 container:
@@ -420,23 +432,27 @@ container:
     - /volume4/docker/app_config/act_runner/cache
 ```
 
-3. 确认 runner 真正读的是哪个配置文件，再重启：
+3. 确认 runner 真正读的是哪个配置文件，再重启，并检查卷是否被丢弃：
 
 ```bash
-# 看容器用哪个 config 文件（CONFIG_FILE 环境变量 / 启动参数）
 docker inspect act_runner-runner-1 \
-  --format 'image={{.Config.Image}} cmd={{.Config.Cmd}} env={{.Config.Env}}'
-# 确认容器里看到的配置确实带 volume 和 valid_volumes
-docker exec act_runner-runner-1 sh -c 'grep -n -A5 "^container:" /config.yaml /data/config.yaml 2>/dev/null'
+  --format 'image={{.Config.Image}} cmd={{.Config.Cmd}} env={{.Config.Env}} mounts={{json .Mounts}}'
+docker exec act_runner-runner-1 sh -c 'grep -n -A6 "^container:" /config.yaml /data/config.yaml 2>/dev/null'
 
 docker restart act_runner-runner-1
-# 重启后跑一次任务，再看 runner 日志里有没有被丢弃的 volume
-docker logs --tail 200 act_runner-runner-1 | grep -i 'valid volume\|volume'
+
+# 任务运行时，在宿主机上确认作业容器真的挂了 /cache
+docker ps --filter ancestor=docker.gitea.com/runner-images:ubuntu-latest --format '{{.Names}}' |
+while read -r n; do docker inspect "$n" --format '{{json .Mounts}}'; done
 ```
 
-工作流会自动检测 `/cache`，并把 `CARGO_HOME`、`RUSTUP_HOME`、`CARGO_TARGET_DIR`、`XWIN_CACHE_DIR`、`ORT_CACHE_DIR`、`OAR_HOME` 指过去。作业日志里出现 `::notice::/cache 可写，持久化缓存生效` 就是挂载成功。
+挂上以后作业日志会变成：
 
-没有 `/cache` 时退回**工作区缓存** `<workspace>/.ci-cache`，但默认配置下 `/workspace` 就在作业容器的 overlay 文件系统里（`mount | grep workspace` 无输出），任务结束即丢弃，**不能当真正的持久化缓存**。`$HOME` 同样。所以跨任务缓存只能靠上面的 `/cache` 挂载；如果暂时不想动 runner 配置，可以改用 act_runner 自带的 cache server + `actions/cache@v3`。`CARGO_TARGET_DIR` 会持续增长，定期清理 `cache/target` 即可。
+```
+::notice::使用 /cache（container.options 挂载生效）
+```
+
+优先级：`MHXY_CACHE_DIR`（可用 `runner.envs` 指定）> `/cache` > `/opt/hostedtoolcache/rust-mhxy` > 工作区 `.ci-cache`（不持久，仅兜底）。`CARGO_TARGET_DIR` 会持续增长，定期清理 `cache/target` 或 `toolcache/rust-mhxy/target` 即可。
 
 如果 runner 配置的是 **host 模式**（任务直接在宿主机跑），不需要挂载，`$HOME` 本身就是持久的，工作流会自动复用。
 
