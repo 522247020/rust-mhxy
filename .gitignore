@@ -5,3 +5,4 @@
 /.ort-cache
 /.ocr-models
 __pycache__/
+/.ci-cache

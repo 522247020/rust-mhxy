@@ -52,8 +52,9 @@ jobs:
             echo "回退到匿名克隆 ${base}"
             clone_repo "$base"
           fi
-          echo "清空工作区（保留 target/ 与 dist/）"
-          find . -mindepth 1 -maxdepth 1 ! -name target ! -name dist -exec rm -rf {} +
+          echo "清空工作区（保留 target/、dist/、.ci-cache/）"
+          find . -mindepth 1 -maxdepth 1 ! -name target ! -name dist ! -name .ci-cache \
+            -exec rm -rf {} +
           cp -a "$tmp/repo/." .
           rm -rf "$tmp"
           echo "HEAD: $(git rev-parse --short HEAD) $(git log -1 --pretty=%s)"
@@ -79,7 +80,7 @@ jobs:
               echo "::warning::/cache 存在但当前用户不可写（检查宿主机目录权限）"
             fi
           else
-            echo "::warning::作业容器里没有 /cache（检查 act_runner container.options 并重启 runner）"
+            echo "::warning::作业容器里没有 /cache（container.options 未生效，或被 valid_volumes 过滤：两者都要配）"
           fi
 
       - name: Set up Rust toolchain
@@ -88,20 +89,23 @@ jobs:
           RUSTUP_DIST_SERVER: https://rsproxy.cn
           RUSTUP_UPDATE_ROOT: https://rsproxy.cn/rustup
         run: |
-          # /cache 由 act_runner 的 container.options 挂载（见 README）。
-          # 没有挂载时退回 $HOME，只能当前任务内有效。
+          # 缓存优先级：MHXY_CACHE_DIR > /cache（container.options 挂载）> 工作区 .ci-cache。
+          # 工作区在 act_runner 上会跨任务保留（同一台 runner），比 $HOME 更靠谱；
+          # $HOME 在每个作业容器里都是全新的，等于没有缓存。
+          workspace="${GITHUB_WORKSPACE:-$PWD}"
           cache_root="${MHXY_CACHE_DIR:-}"
           if [ -z "$cache_root" ]; then
             if [ -d /cache ] && [ -w /cache ]; then
               cache_root=/cache
             else
-              cache_root="$HOME"
-              echo "::warning::没有可写的 /cache，Cargo/Rust 不会跨任务持久化（当前用 $HOME）"
+              cache_root="$workspace/.ci-cache"
+              echo "::warning::作业容器里没有可写的 /cache（检查 act_runner 的 container.options 与 valid_volumes 并重启 runner）"
+              echo "::warning::改回用工作区缓存 $cache_root（跨任务有效，但会随工作区清理而丢失）"
             fi
           fi
           if [ ! -d "$cache_root" ] || [ ! -w "$cache_root" ]; then
-            echo "::warning::缓存目录 $cache_root 不可写，退回 \$HOME"
-            cache_root="$HOME"
+            echo "::warning::缓存目录 $cache_root 不可写，退回 $workspace/.ci-cache"
+            cache_root="$workspace/.ci-cache"
           fi
           echo "工具链缓存目录：$cache_root"
           mkdir -p "$cache_root/cargo" "$cache_root/rustup" "$cache_root/target" \
@@ -178,7 +182,7 @@ jobs:
           if [ -d /cache ]; then
             ls -ld /cache
           else
-            echo "::warning::/cache 不存在，检查 act_runner 的 container.options 是否挂载并重启"
+            echo "::warning::/cache 不存在：检查 act_runner 的 container.options 与 valid_volumes 是否都配好并重启"
           fi
           # 预下载 MSVC CRT/SDK 到缓存目录
           cargo xwin cache xwin

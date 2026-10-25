@@ -384,20 +384,32 @@ sudo mkdir -p /volume4/docker/app_config/act_runner/cache/{cargo,rustup,target,x
 sudo chmod -R 777 /volume4/docker/app_config/act_runner/cache
 ```
 
-2. 编辑 `/volume4/docker/app_config/act_runner/data/config.yaml`，给作业容器挂载缓存目录：
+2. 编辑 runner 的 `config.yaml`（compose 里挂到 `/config.yaml` 或 `/data/config.yaml`，用下面第 3 步的命令确认到底是哪个），给作业容器挂载缓存目录。**`valid_volumes` 必须同时放行**，否则 `container.options` 里的 bind 会被静默丢弃（runner 日志会打印 `... is not a valid volume, will be ignored`）：
 
 ```yaml
 container:
   options: "--volume /volume4/docker/app_config/act_runner/cache:/cache"
+  valid_volumes:
+    - /volume4/docker/app_config/act_runner/cache
 ```
 
-3. 重启 runner 容器：
+3. 确认 runner 真正读的是哪个配置文件，再重启：
 
 ```bash
-docker restart act_runner
+# 看容器用哪个 config 文件（CONFIG_FILE 环境变量 / 启动参数）
+docker inspect act_runner-runner-1 \
+  --format 'image={{.Config.Image}} cmd={{.Config.Cmd}} env={{.Config.Env}}'
+# 确认容器里看到的配置确实带 volume 和 valid_volumes
+docker exec act_runner-runner-1 sh -c 'grep -n -A5 "^container:" /config.yaml /data/config.yaml 2>/dev/null'
+
+docker restart act_runner-runner-1
+# 重启后跑一次任务，再看 runner 日志里有没有被丢弃的 volume
+docker logs --tail 200 act_runner-runner-1 | grep -i 'valid volume\|volume'
 ```
 
-工作流会自动检测 `/cache`，并把 `CARGO_HOME`、`RUSTUP_HOME`、`CARGO_TARGET_DIR`、`XWIN_CACHE_DIR`、`ORT_CACHE_DIR`、`OAR_HOME` 指过去；没有 `/cache` 时退回 `$HOME` 并给出警告（只在当前任务内有效）。`CARGO_TARGET_DIR` 会持续增长，定期清理 `cache/target` 即可。
+工作流会自动检测 `/cache`，并把 `CARGO_HOME`、`RUSTUP_HOME`、`CARGO_TARGET_DIR`、`XWIN_CACHE_DIR`、`ORT_CACHE_DIR`、`OAR_HOME` 指过去。作业日志里出现 `::notice::/cache 可写，持久化缓存生效` 就是挂载成功。
+
+没有 `/cache` 时退回**工作区缓存** `<workspace>/.ci-cache`：act_runner 会复用 `/workspace/<repo>`，所以它同样跨任务有效，只是工作区被清理时会丢。`$HOME` 在每个作业容器里都是全新的，不能当缓存用。`CARGO_TARGET_DIR` 会持续增长，定期清理 `cache/target` 即可。
 
 如果 runner 配置的是 **host 模式**（任务直接在宿主机跑），不需要挂载，`$HOME` 本身就是持久的，工作流会自动复用。
 
