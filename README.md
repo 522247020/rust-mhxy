@@ -450,9 +450,10 @@ sudo chmod -R 777 /volume4/docker/app_config/act_runner/cache
 
 ```yaml
 container:
-  options: "--volume /volume4/docker/app_config/act_runner/cache:/cache"
+  options: "--volume /volume3/ssd-3-temp/runner:/cache"
+  # 必须与上面 --volume 的源路径完全一致（glob 精确匹配），否则卷会被静默丢弃
   valid_volumes:
-    - /volume4/docker/app_config/act_runner/cache
+    - /volume3/ssd-3-temp/runner
 ```
 
 3. 确认 runner 真正读的是哪个配置文件，再重启，并检查卷是否被丢弃：
