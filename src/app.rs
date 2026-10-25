@@ -198,6 +198,8 @@ pub struct MhxyApp {
     recording_hotkey: bool,
     last_manual_trigger: Option<Instant>,
     logs: Vec<String>,
+    /// 精简模式：只留地图，隐藏顶部按钮栏、状态栏和侧栏；按 Esc 退出。
+    compact: bool,
 }
 
 impl MhxyApp {
@@ -302,6 +304,7 @@ impl MhxyApp {
             recording_hotkey: false,
             last_manual_trigger: None,
             logs: Vec::new(),
+            compact: false,
         };
         app.log(format!("程序启动，加载 {} 张地图", app.maps.len()));
         app.log_detail(format!("资源目录：{}", assets_dir().display()));
@@ -2954,37 +2957,18 @@ impl MhxyApp {
         } else {
             theme::gold()
         };
-        theme::card().show(ui, |ui| {
+        let show_high_chance = match task_type {
+            "抓鬼" => self.config.high_chance,
+            "鬼王" => self.config.ghost_king_high_chance,
+            _ => false,
+        };
+        let compact = self.compact;
+        let draw = |app: &mut Self, ui: &mut egui::Ui| {
             ui.set_min_size(ui.available_size());
-            if task_type == "抓鬼" || task_type == "鬼王" {
-                let mut high = if task_type == "抓鬼" {
-                    self.config.high_chance
-                } else {
-                    self.config.ghost_king_high_chance
-                };
-                ui.horizontal(|ui| {
-                    if ui
-                        .checkbox(&mut high, egui::RichText::new("高概率区域").small())
-                        .changed()
-                    {
-                        if task_type == "抓鬼" {
-                            self.config.high_chance = high;
-                        } else {
-                            self.config.ghost_king_high_chance = high;
-                        }
-                        self.persist();
-                    }
-                });
-            }
-            let show_high_chance = match task_type {
-                "抓鬼" => self.config.high_chance,
-                "鬼王" => self.config.ghost_king_high_chance,
-                _ => false,
-            };
-            match (location, map_index) {
+            match (&location, map_index) {
                 (Some(location), Some(index)) => {
-                    let definition = self.maps[index].clone();
-                    self.render_map(ui, &definition, &location, show_high_chance);
+                    let definition = app.maps[index].clone();
+                    app.render_map(ui, &definition, location, show_high_chance);
                 }
                 _ => {
                     let size = ui.available_size().max(vec2(1.0, 1.0));
@@ -3008,7 +2992,13 @@ impl MhxyApp {
                     );
                 }
             }
-        });
+        };
+        if compact {
+            // 精简模式不套任务卡片的边框和背景，地图直接铺满窗口。
+            draw(self, ui);
+        } else {
+            theme::card().show(ui, |ui| draw(self, ui));
+        }
     }
 }
 
@@ -3047,7 +3037,7 @@ impl eframe::App for MhxyApp {
             ctx.request_repaint_after(Duration::from_millis(120));
         }
         // 收起侧栏后放宽最小宽度，让窗口可以继续缩小。
-        let desired_min_size = if self.config.sidebar_expanded {
+        let desired_min_size = if self.config.sidebar_expanded && !self.compact {
             MIN_WINDOW_SIZE_EXPANDED
         } else {
             MIN_WINDOW_SIZE_COLLAPSED
@@ -3069,6 +3059,12 @@ impl eframe::App for MhxyApp {
         }
         self.poll_events();
         self.poll_hotkey();
+        // 精简模式下按 Esc 回到默认界面；正在录制快捷键时 Esc 只用于取消录制。
+        if self.compact && !self.recording_hotkey && ctx.input(|i| i.key_pressed(egui::Key::Escape))
+        {
+            self.compact = false;
+            self.notice = Some("已退出精简模式".to_string());
+        }
         if self.recording_hotkey {
             if let Some(captured) = hotkey::capture_egui(&ctx) {
                 self.recording_hotkey = false;
@@ -3117,255 +3113,275 @@ impl eframe::App for MhxyApp {
         if self.running || self.busy {
             ctx.request_repaint_after(Duration::from_millis(150));
         }
-        egui::Panel::top("header")
-            .frame(
-                egui::Frame::new()
-                    .fill(theme::surface())
-                    .inner_margin(egui::Margin::symmetric(16, 12)),
-            )
-            .show(ui, |ui| {
-                let narrow = ui.available_width() < 560.0;
-                ui.horizontal(|ui| {
-                    if ui
-                        .add(
-                            egui::Button::new(if self.config.sidebar_expanded {
-                                "收起设置"
-                            } else {
-                                "展开设置"
-                            })
-                            .min_size(vec2(0.0, 34.0)),
-                        )
-                        .clicked()
-                    {
-                        self.config.sidebar_expanded = !self.config.sidebar_expanded;
-                        self.persist();
-                    }
-                    ui.heading("梦幻西游");
-                    if !narrow {
-                        ui.label(egui::RichText::new("任务坐标辅助").color(theme::muted()));
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        if !self.compact {
+            egui::Panel::top("header")
+                .frame(
+                    egui::Frame::new()
+                        .fill(theme::surface())
+                        .inner_margin(egui::Margin::symmetric(16, 12)),
+                )
+                .show(ui, |ui| {
+                    let narrow = ui.available_width() < 560.0;
+                    ui.horizontal(|ui| {
                         if ui
-                            .add(theme::primary_button(if self.running {
-                                if self.manual_mode() {
-                                    "暂停监听"
+                            .add(
+                                egui::Button::new(if self.config.sidebar_expanded {
+                                    "收起设置"
                                 } else {
-                                    "暂停识别"
+                                    "展开设置"
+                                })
+                                .min_size(vec2(0.0, 34.0)),
+                            )
+                            .clicked()
+                        {
+                            self.config.sidebar_expanded = !self.config.sidebar_expanded;
+                            self.persist();
+                        }
+                        ui.heading("梦幻西游");
+                        if !narrow {
+                            ui.label(egui::RichText::new("任务坐标辅助").color(theme::muted()));
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .add(theme::primary_button(if self.running {
+                                    if self.manual_mode() {
+                                        "暂停监听"
+                                    } else {
+                                        "暂停识别"
+                                    }
+                                } else if self.manual_mode() {
+                                    "开始监听"
+                                } else {
+                                    "开始识别"
+                                }))
+                                .clicked()
+                            {
+                                self.toggle_running();
+                            }
+                            if ui
+                                .add(header_button("精简界面", false))
+                                .on_hover_text(
+                                    "只显示地图，隐藏顶部按钮、状态栏和设置侧栏；按 Esc 退出",
+                                )
+                                .clicked()
+                            {
+                                self.compact = true;
+                            }
+                            let on_top = self.config.on_top;
+                            if ui
+                                .add(header_button("置顶", on_top))
+                                .on_hover_text("让本窗口始终显示在游戏窗口前面")
+                                .clicked()
+                            {
+                                self.set_on_top(!on_top, &ctx);
+                            }
+                            if ui
+                                .add(header_button("说明", self.show_help))
+                                .on_hover_text("使用说明")
+                                .clicked()
+                            {
+                                let opening = !self.show_help;
+                                self.show_help = opening;
+                                if opening {
+                                    self.help_window_pos =
+                                        Some(centered_window_position(ui.ctx(), HELP_WINDOW_SIZE));
                                 }
-                            } else if self.manual_mode() {
-                                "开始监听"
+                            }
+                            // 更新按钮：无更新时是普通「检查更新」；发现更新后变成金色按钮，
+                            // 点击弹出更新说明，不主动弹窗。
+                            let total =
+                                self.update_info.as_ref().map(|info| info.size).unwrap_or(0);
+                            let downloaded = self.update_progress.load(Ordering::Relaxed);
+                            let percent = if total > 0 {
+                                (downloaded as f32 / total as f32 * 100.0).clamp(0.0, 100.0)
                             } else {
-                                "开始识别"
-                            }))
-                            .clicked()
-                        {
-                            self.toggle_running();
-                        }
-                        let on_top = self.config.on_top;
-                        if ui
-                            .add(header_button("置顶", on_top))
-                            .on_hover_text("让本窗口始终显示在游戏窗口前面")
-                            .clicked()
-                        {
-                            self.set_on_top(!on_top, &ctx);
-                        }
-                        if ui
-                            .add(header_button("说明", self.show_help))
-                            .on_hover_text("使用说明")
-                            .clicked()
-                        {
-                            let opening = !self.show_help;
-                            self.show_help = opening;
-                            if opening {
-                                self.help_window_pos =
-                                    Some(centered_window_position(ui.ctx(), HELP_WINDOW_SIZE));
-                            }
-                        }
-                        // 更新按钮：无更新时是普通「检查更新」；发现更新后变成金色按钮，
-                        // 点击弹出更新说明，不主动弹窗。
-                        let total = self.update_info.as_ref().map(|info| info.size).unwrap_or(0);
-                        let downloaded = self.update_progress.load(Ordering::Relaxed);
-                        let percent = if total > 0 {
-                            (downloaded as f32 / total as f32 * 100.0).clamp(0.0, 100.0)
-                        } else {
-                            0.0
-                        };
-                        let flash_active = self
-                            .update_message_at
-                            .is_some_and(|at| at.elapsed() < UPDATE_FLASH_DURATION);
-                        let flash_text = self.update_message.clone().unwrap_or_default();
-                        let (text, color, enabled, highlight) = match self.update_phase {
-                            UpdatePhase::Checking => {
-                                ("检查中…".to_string(), theme::muted(), false, false)
-                            }
-                            UpdatePhase::Available => (
-                                format!(
-                                    "{} {}",
-                                    if narrow { "更新" } else { "发现新版本" },
+                                0.0
+                            };
+                            let flash_active = self
+                                .update_message_at
+                                .is_some_and(|at| at.elapsed() < UPDATE_FLASH_DURATION);
+                            let flash_text = self.update_message.clone().unwrap_or_default();
+                            let (text, color, enabled, highlight) = match self.update_phase {
+                                UpdatePhase::Checking => {
+                                    ("检查中…".to_string(), theme::muted(), false, false)
+                                }
+                                UpdatePhase::Available => (
+                                    format!(
+                                        "{} {}",
+                                        if narrow { "更新" } else { "发现新版本" },
+                                        self.update_info
+                                            .as_ref()
+                                            .map(|info| info.version.as_str())
+                                            .unwrap_or("")
+                                    ),
+                                    theme::on_accent(),
+                                    true,
+                                    true,
+                                ),
+                                UpdatePhase::Downloading => {
+                                    (format!("下载 {percent:.0}%"), theme::text(), true, false)
+                                }
+                                UpdatePhase::Downloaded => (
+                                    if narrow {
+                                        "重启更新"
+                                    } else {
+                                        "重启并更新"
+                                    }
+                                    .to_string(),
+                                    theme::on_accent(),
+                                    true,
+                                    true,
+                                ),
+                                UpdatePhase::Failed if flash_active => {
+                                    (flash_text, theme::red(), true, false)
+                                }
+                                UpdatePhase::Failed => {
+                                    ("检查更新".to_string(), theme::text(), true, false)
+                                }
+                                UpdatePhase::Idle if flash_active => {
+                                    (flash_text, theme::muted(), true, false)
+                                }
+                                UpdatePhase::Idle => (
+                                    if narrow { "更新" } else { "检查更新" }.to_string(),
+                                    theme::text(),
+                                    true,
+                                    false,
+                                ),
+                            };
+                            let tooltip = match self.update_phase {
+                                UpdatePhase::Available => format!(
+                                    "发现新版本 {}\n点击查看更新说明",
                                     self.update_info
                                         .as_ref()
                                         .map(|info| info.version.as_str())
                                         .unwrap_or("")
                                 ),
-                                theme::on_accent(),
-                                true,
-                                true,
-                            ),
-                            UpdatePhase::Downloading => {
-                                (format!("下载 {percent:.0}%"), theme::text(), true, false)
+                                UpdatePhase::Downloading => "点击查看下载进度".to_string(),
+                                UpdatePhase::Downloaded => "安装包已就绪，点击完成更新".to_string(),
+                                UpdatePhase::Failed => self
+                                    .update_error
+                                    .clone()
+                                    .unwrap_or_else(|| "检查更新失败".to_string()),
+                                UpdatePhase::Checking => "正在检查更新".to_string(),
+                                UpdatePhase::Idle => self
+                                    .update_message
+                                    .clone()
+                                    .unwrap_or_else(|| "检查更新".to_string()),
+                            };
+                            let mut label = egui::RichText::new(text).color(color);
+                            if highlight {
+                                label = label.strong();
                             }
-                            UpdatePhase::Downloaded => (
-                                if narrow {
-                                    "重启更新"
-                                } else {
-                                    "重启并更新"
+                            let mut button = egui::Button::new(label).min_size(vec2(0.0, 34.0));
+                            if highlight {
+                                button = button.fill(theme::gold());
+                            }
+                            if ui
+                                .add_enabled(enabled, button)
+                                .on_hover_text(tooltip)
+                                .clicked()
+                            {
+                                match self.update_phase {
+                                    UpdatePhase::Available
+                                    | UpdatePhase::Downloading
+                                    | UpdatePhase::Downloaded => {
+                                        self.show_update_dialog = true;
+                                        self.update_window_pos = Some(centered_window_position(
+                                            ui.ctx(),
+                                            UPDATE_WINDOW_SIZE,
+                                        ));
+                                    }
+                                    _ => self.start_update_check(true),
                                 }
-                                .to_string(),
-                                theme::on_accent(),
-                                true,
-                                true,
-                            ),
-                            UpdatePhase::Failed if flash_active => {
-                                (flash_text, theme::red(), true, false)
                             }
-                            UpdatePhase::Failed => {
-                                ("检查更新".to_string(), theme::text(), true, false)
-                            }
-                            UpdatePhase::Idle if flash_active => {
-                                (flash_text, theme::muted(), true, false)
-                            }
-                            UpdatePhase::Idle => (
-                                if narrow { "更新" } else { "检查更新" }.to_string(),
-                                theme::text(),
-                                true,
-                                false,
-                            ),
-                        };
-                        let tooltip = match self.update_phase {
-                            UpdatePhase::Available => format!(
-                                "发现新版本 {}\n点击查看更新说明",
-                                self.update_info
-                                    .as_ref()
-                                    .map(|info| info.version.as_str())
-                                    .unwrap_or("")
-                            ),
-                            UpdatePhase::Downloading => "点击查看下载进度".to_string(),
-                            UpdatePhase::Downloaded => "安装包已就绪，点击完成更新".to_string(),
-                            UpdatePhase::Failed => self
-                                .update_error
-                                .clone()
-                                .unwrap_or_else(|| "检查更新失败".to_string()),
-                            UpdatePhase::Checking => "正在检查更新".to_string(),
-                            UpdatePhase::Idle => self
-                                .update_message
-                                .clone()
-                                .unwrap_or_else(|| "检查更新".to_string()),
-                        };
-                        let mut label = egui::RichText::new(text).color(color);
-                        if highlight {
-                            label = label.strong();
-                        }
-                        let mut button = egui::Button::new(label).min_size(vec2(0.0, 34.0));
-                        if highlight {
-                            button = button.fill(theme::gold());
-                        }
-                        if ui
-                            .add_enabled(enabled, button)
-                            .on_hover_text(tooltip)
-                            .clicked()
-                        {
-                            match self.update_phase {
-                                UpdatePhase::Available
-                                | UpdatePhase::Downloading
-                                | UpdatePhase::Downloaded => {
-                                    self.show_update_dialog = true;
-                                    self.update_window_pos = Some(centered_window_position(
-                                        ui.ctx(),
-                                        UPDATE_WINDOW_SIZE,
-                                    ));
-                                }
-                                _ => self.start_update_check(true),
-                            }
-                        }
+                        });
                     });
                 });
-            });
-        egui::Panel::bottom("status_bar")
-            .frame(
-                egui::Frame::new()
-                    .fill(theme::surface())
-                    .inner_margin(egui::Margin::symmetric(16, 6)),
-            )
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(crate::APP_VERSION).small().weak());
-                    ui.separator();
-                    ui.label(
-                        egui::RichText::new(if self.config.ocr_mode == "remote" {
-                            "远端 PP-OCR"
-                        } else {
-                            "本地 PP-OCRv5"
-                        })
-                        .small()
-                        .weak(),
-                    );
-                    ui.separator();
-                    if let Some(message) = &self.notice {
-                        ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(message).small().color(theme::gold()),
-                            )
-                            .truncate(),
-                        )
-                        .on_hover_text(message);
-                    } else if self.manual_mode() {
-                        let hotkey = Hotkey::parse(&self.config.ocr_hotkey)
-                            .map(|hotkey| hotkey.display())
-                            .unwrap_or_else(|_| self.config.ocr_hotkey.clone());
-                        let text = if self.running {
-                            format!("手动识别 · 按 {hotkey} 触发")
-                        } else {
-                            format!("手动识别 · 快捷键 {hotkey}（未开始监听）")
-                        };
-                        ui.label(egui::RichText::new(text).small().weak());
-                    } else {
+        }
+        if !self.compact {
+            egui::Panel::bottom("status_bar")
+                .frame(
+                    egui::Frame::new()
+                        .fill(theme::surface())
+                        .inner_margin(egui::Margin::symmetric(16, 6)),
+                )
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(crate::APP_VERSION).small().weak());
+                        ui.separator();
                         ui.label(
-                            egui::RichText::new(format!(
-                                "每 {} 秒识别",
-                                self.config.interval_seconds
-                            ))
+                            egui::RichText::new(if self.config.ocr_mode == "remote" {
+                                "远端 PP-OCR"
+                            } else {
+                                "本地 PP-OCRv5"
+                            })
                             .small()
                             .weak(),
                         );
-                    }
-                    if let Some(seconds) = self.last_ocr_secs {
                         ui.separator();
-                        ui.label(
-                            egui::RichText::new(format!("上次耗时 {seconds:.2} 秒"))
+                        if let Some(message) = &self.notice {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(message).small().color(theme::gold()),
+                                )
+                                .truncate(),
+                            )
+                            .on_hover_text(message);
+                        } else if self.manual_mode() {
+                            let hotkey = Hotkey::parse(&self.config.ocr_hotkey)
+                                .map(|hotkey| hotkey.display())
+                                .unwrap_or_else(|_| self.config.ocr_hotkey.clone());
+                            let text = if self.running {
+                                format!("手动识别 · 按 {hotkey} 触发")
+                            } else {
+                                format!("手动识别 · 快捷键 {hotkey}（未开始监听）")
+                            };
+                            ui.label(egui::RichText::new(text).small().weak());
+                        } else {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "每 {} 秒识别",
+                                    self.config.interval_seconds
+                                ))
                                 .small()
                                 .weak(),
-                        );
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let (text, color) = if self.save_error.is_some() {
-                            ("配置保存失败", theme::red())
-                        } else if self.config_dirty_since.is_some() {
-                            ("正在保存…", theme::muted())
-                        } else {
-                            ("设置自动保存", theme::muted())
-                        };
-                        ui.label(egui::RichText::new(text).small().color(color))
-                            .on_hover_text(self.save_error.as_deref().unwrap_or(text));
-                        ui.separator();
-                        ui.hyperlink_to(egui::RichText::new("发布页").small(), update::HOME_URL)
+                            );
+                        }
+                        if let Some(seconds) = self.last_ocr_secs {
+                            ui.separator();
+                            ui.label(
+                                egui::RichText::new(format!("上次耗时 {seconds:.2} 秒"))
+                                    .small()
+                                    .weak(),
+                            );
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let (text, color) = if self.save_error.is_some() {
+                                ("配置保存失败", theme::red())
+                            } else if self.config_dirty_since.is_some() {
+                                ("正在保存…", theme::muted())
+                            } else {
+                                ("设置自动保存", theme::muted())
+                            };
+                            ui.label(egui::RichText::new(text).small().color(color))
+                                .on_hover_text(self.save_error.as_deref().unwrap_or(text));
+                            ui.separator();
+                            ui.hyperlink_to(
+                                egui::RichText::new("发布页").small(),
+                                update::HOME_URL,
+                            )
                             .on_hover_text(update::HOME_URL);
-                        ui.separator();
-                        ui.hyperlink_to(egui::RichText::new("GitHub").small(), crate::APP_REPO_URL)
+                            ui.separator();
+                            ui.hyperlink_to(
+                                egui::RichText::new("GitHub").small(),
+                                crate::APP_REPO_URL,
+                            )
                             .on_hover_text(crate::APP_REPO_URL);
+                        });
                     });
                 });
-            });
-        if self.config.sidebar_expanded {
+        }
+        if self.config.sidebar_expanded && !self.compact {
             // 侧栏最多占可用宽度的一半减一点，保证右侧地图区域不会被挤压。
             let max_sidebar = (ui.available_width() - 360.0).clamp(240.0, 400.0);
             egui::Panel::left("controls")
@@ -3380,11 +3396,12 @@ impl eframe::App for MhxyApp {
                 )
                 .show(ui, |ui| self.controls(ui));
         }
+        let central_margin = if self.compact { 0 } else { 12 };
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
                     .fill(theme::background())
-                    .inner_margin(12),
+                    .inner_margin(central_margin),
             )
             .show(ui, |ui| {
                 let tasks: Vec<&'static str> = TASK_ORDER
@@ -3412,8 +3429,9 @@ impl eframe::App for MhxyApp {
                             vec2(rect.width(), height),
                         )
                     };
+                    let gap = if self.compact { 0.0 } else { 5.0 };
                     let mut child =
-                        ui.new_child(egui::UiBuilder::new().max_rect(child_rect.shrink(5.0)));
+                        ui.new_child(egui::UiBuilder::new().max_rect(child_rect.shrink(gap)));
                     self.task_panel(&mut child, task_type);
                 }
             });
@@ -3777,6 +3795,102 @@ mod tests {
         let ctx = egui::Context::default();
         theme::install(&ctx, false);
         MhxyApp::from_config(Config::default(), PathBuf::from("/unused/config.json"), ctx)
+    }
+
+    /// 收集这一帧渲染出的所有文字，用于断言哪些界面元素出现了。
+    fn collect_texts(shapes: &[egui::epaint::ClippedShape]) -> Vec<String> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(text) => out.push(text.galley.text().to_string()),
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    fn escape_input() -> egui::RawInput {
+        let mut input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1120.0, 800.0))),
+            ..Default::default()
+        };
+        input.events.push(egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        });
+        input
+    }
+
+    #[test]
+    fn task_panel_has_no_high_chance_checkbox() {
+        let mut app = app();
+        app.config.high_chance = true;
+        app.config.ghost_king_high_chance = true;
+        let ctx = app.ctx.clone();
+        let mut frame = eframe::Frame::_new_kittest();
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1120.0, 800.0))),
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| app.ui(ui, &mut frame));
+        let texts = collect_texts(&output.shapes);
+        assert!(
+            !texts.iter().any(|text| text == "高概率区域"),
+            "地图上方不应再有高概率勾选框：{texts:?}"
+        );
+        // 侧栏「任务显示」里的开关还在，只是换成了完整文案。
+        assert!(
+            texts.iter().any(|text| text.contains("显示高概率区域")),
+            "侧栏仍应保留高概率开关：{texts:?}"
+        );
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn compact_mode_hides_chrome_and_esc_restores_it() {
+        let mut app = app();
+        let ctx = app.ctx.clone();
+        let mut frame = eframe::Frame::_new_kittest();
+        let input = || egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1120.0, 800.0))),
+            ..Default::default()
+        };
+
+        app.compact = true;
+        let mut output = ctx.run_ui(input(), |ui| app.ui(ui, &mut frame));
+        let texts = collect_texts(&output.shapes);
+        for hidden in ["开始识别", "精简界面", "置顶", "说明", "梦幻西游"] {
+            assert!(
+                !texts.iter().any(|text| text == hidden),
+                "精简模式不应显示 {hidden}：{texts:?}"
+            );
+        }
+        assert!(
+            !texts.iter().any(|text| text.contains("检查更新")),
+            "精简模式不应显示更新按钮：{texts:?}"
+        );
+        output.textures_delta.clear();
+
+        // Esc 回到默认界面，顶部按钮和侧栏重新出现。
+        let mut output = ctx.run_ui(escape_input(), |ui| app.ui(ui, &mut frame));
+        assert!(!app.compact, "按 Esc 应退出精简模式");
+        let texts = collect_texts(&output.shapes);
+        assert!(
+            texts.iter().any(|text| text == "开始识别"),
+            "退出精简模式后应重新出现开始识别按钮：{texts:?}"
+        );
+        output.textures_delta.clear();
     }
 
     fn result(generation: u64) -> OcrEvent {
