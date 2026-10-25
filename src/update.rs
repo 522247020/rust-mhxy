@@ -300,27 +300,70 @@ pub fn apply_and_restart(zip: &Path) -> Result<(), String> {
 
     let exe = std::env::current_exe().map_err(|err| format!("无法定位程序：{err}"))?;
     let install_dir = exe.parent().ok_or_else(|| "无法定位程序目录".to_string())?;
-    let script = std::env::temp_dir().join("rust-mhxy-update.ps1");
+    let script = update_dir().join("update.ps1");
     // Windows PowerShell 5.1 需要 BOM 才能正确识别 UTF-8 路径。
     let body = r#"param([int]$TargetPid, [string]$Zip, [string]$InstallDir, [string]$Exe)
 $ErrorActionPreference = 'Stop'
-$log = Join-Path $env:TEMP 'rust-mhxy-update.log'
+$base = if ($env:LOCALAPPDATA) {
+    Join-Path $env:LOCALAPPDATA 'rust-mhxy\updates'
+} else {
+    Join-Path $env:TEMP 'rust-mhxy-updates'
+}
+New-Item -ItemType Directory -Path $base -Force | Out-Null
+$log = Join-Path $base 'update.log'
+function Write-Log([string]$Message) {
+    try {
+        $stamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+        Add-Content -LiteralPath $log -Value ("[$stamp] $Message") -Encoding utf8
+    } catch {}
+}
 try {
-    try { Wait-Process -Id $TargetPid -Timeout 60 -ErrorAction SilentlyContinue } catch {}
-    Start-Sleep -Milliseconds 600
+    Write-Log "开始更新：zip=$Zip install=$InstallDir exe=$Exe pid=$TargetPid"
+    try { Wait-Process -Id $TargetPid -Timeout 120 -ErrorAction SilentlyContinue } catch {}
+    Start-Sleep -Milliseconds 800
+    if (-not (Test-Path -LiteralPath $Zip)) { throw "安装包不存在：$Zip" }
+
     $temp = Join-Path $env:TEMP ('mhxy-update-' + [Guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $temp | Out-Null
-    Expand-Archive -LiteralPath $Zip -DestinationPath $temp -Force
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    [System.IO.Compression.ZipFile]::ExtractToDirectory($Zip, $temp)
+    Write-Log "已解压到 $temp"
+
     $root = Get-ChildItem -LiteralPath $temp -Directory | Select-Object -First 1
     if (-not $root) { $root = Get-Item -LiteralPath $temp }
-    Copy-Item -Path (Join-Path $root.FullName '*') -Destination $InstallDir -Recurse -Force
+
+    foreach ($item in (Get-ChildItem -LiteralPath $root.FullName -Force)) {
+        $target = Join-Path $InstallDir $item.Name
+        $copied = $false
+        for ($attempt = 1; $attempt -le 20; $attempt++) {
+            try {
+                Copy-Item -LiteralPath $item.FullName -Destination $target -Recurse -Force -ErrorAction Stop
+                $copied = $true
+                break
+            } catch {
+                if ($attempt -eq 20) { throw "覆盖失败：$($item.Name)：$($_.Exception.Message)" }
+                Start-Sleep -Milliseconds 500
+            }
+        }
+        if (-not $copied) { throw "覆盖失败：$($item.Name)" }
+    }
+    Write-Log "已覆盖安装目录：$InstallDir"
+
     Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $Zip -Force -ErrorAction SilentlyContinue
+    if (-not (Test-Path -LiteralPath $Exe)) { throw "找不到可执行文件：$Exe" }
     Start-Process -FilePath $Exe -WorkingDirectory $InstallDir
+    Write-Log "已启动新版本：$Exe"
 } catch {
-    ('更新失败：' + $_.Exception.Message) | Out-File -LiteralPath $log -Encoding utf8
-    Add-Type -AssemblyName PresentationFramework
-    [System.Windows.MessageBox]::Show(('自动更新失败：' + $_.Exception.Message + "`n请手动解压覆盖。'), 'rust-mhxy 更新失败') | Out-Null
+    Write-Log ("更新失败：" + $_.Exception.Message)
+    try {
+        Add-Type -AssemblyName PresentationFramework
+        $hint = "自动更新失败：" + $_.Exception.Message + "`n`n日志：" + $log + "`n安装包：" + $Zip + "`n`n可以手动解压覆盖，或把日志发给我。"
+        if ($InstallDir -like '*Program Files*') {
+            $hint = $hint + "`n程序装在 Program Files，可能需要用管理员权限运行一次。"
+        }
+        [System.Windows.MessageBox]::Show($hint, 'rust-mhxy 更新失败') | Out-Null
+    } catch {}
 }
 "#;
     std::fs::write(&script, format!("\u{feff}{body}"))
@@ -355,9 +398,26 @@ pub fn apply_and_restart(_zip: &Path) -> Result<(), String> {
     Err("自动更新仅支持 Windows，请打开发布页手动下载".to_string())
 }
 
-/// 下载后的临时文件路径。
+/// 安装包与更新日志的存放目录。
+///
+/// Windows 放在 `%LOCALAPPDATA%\rust-mhxy\updates`，不会被系统清理临时文件时误删；
+/// 其他平台放在临时目录下的 `rust-mhxy-updates`。
+pub fn update_dir() -> PathBuf {
+    #[cfg(windows)]
+    if let Some(dir) = std::env::var_os("LOCALAPPDATA") {
+        return PathBuf::from(dir).join("rust-mhxy").join("updates");
+    }
+    std::env::temp_dir().join("rust-mhxy-updates")
+}
+
+/// 更新脚本写的日志文件。
+pub fn update_log_path() -> PathBuf {
+    update_dir().join("update.log")
+}
+
+/// 下载后的安装包路径。
 pub fn temp_package(version: &str) -> PathBuf {
-    std::env::temp_dir().join(format!(
+    update_dir().join(format!(
         "rust-mhxy-{}-update.zip",
         version.trim_start_matches(['v', 'V'])
     ))

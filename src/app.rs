@@ -424,9 +424,22 @@ impl MhxyApp {
                         self.show_update_dialog = false;
                     }
                 });
+                if let Some(zip) = &self.update_zip {
+                    ui.label(
+                        egui::RichText::new(format!("安装包：{}", zip.display()))
+                            .small()
+                            .weak(),
+                    );
+                }
             }
             _ => {
+                let retry = self.update_zip.as_ref().filter(|zip| zip.exists()).cloned();
                 ui.horizontal(|ui| {
+                    if let Some(_zip) = &retry {
+                        if ui.add(theme::primary_button("重试安装")).clicked() {
+                            self.install_update();
+                        }
+                    }
                     if ui.add(theme::primary_button("下载并更新")).clicked() {
                         self.start_update_download();
                     }
@@ -435,6 +448,16 @@ impl MhxyApp {
                     }
                     ui.hyperlink_to(egui::RichText::new("打开发布页").small(), update::HOME_URL);
                 });
+                if self.update_phase == UpdatePhase::Failed {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "更新日志：{}",
+                            update::update_log_path().display()
+                        ))
+                        .small()
+                        .weak(),
+                    );
+                }
             }
         }
     }
@@ -443,16 +466,32 @@ impl MhxyApp {
         let Some(zip) = self.update_zip.clone() else {
             return;
         };
+        if !zip.exists() {
+            self.update_phase = UpdatePhase::Failed;
+            self.update_error = Some(format!("安装包已被删除：{}", zip.display()));
+            return;
+        }
         self.show_update_dialog = false;
         self.flush_config();
+        self.log_detail(format!("启动更新脚本，安装包：{}", zip.display()));
         match update::apply_and_restart(&zip) {
             Ok(()) => {
                 self.notice = Some("正在重启以完成更新…".to_string());
                 self.ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                // 兜底：更新脚本在等本进程退出，窗口关闭后如果进程还赖着就把自己结束掉。
+                let ctx = self.ctx.clone();
+                thread::spawn(move || {
+                    thread::sleep(Duration::from_secs(2));
+                    ctx.request_repaint();
+                    std::process::exit(0);
+                });
             }
             Err(err) => {
                 self.update_phase = UpdatePhase::Failed;
-                self.update_error = Some(err);
+                self.update_error = Some(format!(
+                    "{err}（日志：{}）",
+                    update::update_log_path().display()
+                ));
             }
         }
     }
