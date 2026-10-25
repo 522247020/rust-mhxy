@@ -105,6 +105,15 @@ pub fn install(ctx: &egui::Context, light: bool) {
     apply_style(ctx);
 }
 
+/// 按配置值解析实际主题：`system` 跟随操作系统，其余强制亮 / 暗。
+pub fn resolve_light(mode: &str, ctx: &egui::Context) -> bool {
+    match mode {
+        "light" => true,
+        "dark" => false,
+        _ => ctx.system_theme() == Some(egui::Theme::Light),
+    }
+}
+
 /// 运行中切换主题，立即生效。
 pub fn set_light(ctx: &egui::Context, light: bool) {
     LIGHT_MODE.store(light, Ordering::Relaxed);

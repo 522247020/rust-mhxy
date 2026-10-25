@@ -84,8 +84,8 @@ pub struct Config {
     pub extra_preprocess_mode: String,
     pub extra_preprocess_color: [u8; 3],
     pub extra_preprocess_tolerance: u8,
-    /// 亮色主题（false = 暗色）。
-    pub theme_light: bool,
+    /// 界面主题：system（跟随系统）/ light / dark。
+    pub theme: String,
     /// 侧栏各分组折叠状态，逗号分隔的 id（如 "window,task"）。
     pub sidebar_folded: String,
     /// 启动时检查更新。
@@ -135,7 +135,7 @@ impl Default for Config {
             extra_preprocess_mode: "off".into(),
             extra_preprocess_color: DEFAULT_PREPROCESS_COLOR,
             extra_preprocess_tolerance: 24,
-            theme_light: false,
+            theme: "system".into(),
             sidebar_folded: String::new(),
             update_enabled: true,
             update_manifest_url: crate::update::DEFAULT_MANIFEST_URL.to_string(),
@@ -256,7 +256,12 @@ impl Config {
             .and_then(Value::as_u64)
             .map(|value| value.min(255) as u8)
             .unwrap_or(config.preprocess_tolerance);
-        config.theme_light = get_string(map, "window/theme", "dark") == "light";
+        // 旧配置只有 light / dark，没有配置时跟随系统主题。
+        config.theme = match get_string(map, "window/theme", "system").as_str() {
+            "light" => "light".to_string(),
+            "dark" => "dark".to_string(),
+            _ => "system".to_string(),
+        };
         config.sidebar_folded = get_string(map, "window/sidebar/folded", "");
         config.update_enabled = get_bool(map, "update/enabled", true);
         config.update_manifest_url = get_string(
@@ -377,10 +382,7 @@ impl Config {
             "ocr/extra_preprocess_tolerance",
             Value::from(self.extra_preprocess_tolerance),
         );
-        insert(
-            "window/theme",
-            Value::String(if self.theme_light { "light" } else { "dark" }.to_string()),
-        );
+        insert("window/theme", Value::String(self.theme.clone()));
         insert(
             "window/sidebar/folded",
             Value::String(self.sidebar_folded.clone()),
@@ -852,13 +854,29 @@ mod tests {
         let dir = std::env::temp_dir().join("rust-mhxy-config-theme-test");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("config.json");
-        Config {
-            theme_light: true,
-            ..Default::default()
+        for mode in ["system", "light", "dark"] {
+            Config {
+                theme: mode.into(),
+                ..Default::default()
+            }
+            .save(&path)
+            .unwrap();
+            assert_eq!(Config::load(&path).theme, mode);
         }
-        .save(&path)
-        .unwrap();
-        assert!(Config::load(&path).theme_light);
+    }
+
+    #[test]
+    fn theme_defaults_to_system_and_accepts_old_values() {
+        let dir = std::env::temp_dir().join("rust-mhxy-config-theme-legacy-test");
+        let _ = std::fs::create_dir_all(&dir);
+        assert_eq!(Config::default().theme, "system");
+        let path = dir.join("legacy.json");
+        std::fs::write(&path, r#"{"window/theme": "light"}"#).unwrap();
+        assert_eq!(Config::load(&path).theme, "light");
+        std::fs::write(&path, r#"{"window/theme": "dark"}"#).unwrap();
+        assert_eq!(Config::load(&path).theme, "dark");
+        std::fs::write(&path, r#"{}"#).unwrap();
+        assert_eq!(Config::load(&path).theme, "system");
     }
 
     #[test]

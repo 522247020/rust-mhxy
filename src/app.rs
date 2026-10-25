@@ -200,6 +200,8 @@ pub struct MhxyApp {
     logs: Vec<String>,
     /// 精简模式：只留地图，隐藏顶部按钮栏、状态栏和侧栏；按 Esc 退出。
     compact: bool,
+    /// 当前实际应用的亮色 / 暗色，用于跟随系统主题时即时切换。
+    applied_light: Option<bool>,
 }
 
 impl MhxyApp {
@@ -305,6 +307,7 @@ impl MhxyApp {
             last_manual_trigger: None,
             logs: Vec::new(),
             compact: false,
+            applied_light: None,
         };
         app.log(format!("程序启动，加载 {} 张地图", app.maps.len()));
         app.log_detail(format!("资源目录：{}", assets_dir().display()));
@@ -2064,30 +2067,6 @@ impl MhxyApp {
                 if now != fold_task {
                     self.set_sidebar_section_open("task", now);
                 }
-                let fold_ui = self.sidebar_section_open("ui");
-                let now = theme::collapsible_section(
-                    ui,
-                    "sidebar_ui",
-                    "界面",
-                    fold_ui,
-                    |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label("主题");
-                            let mut light = self.config.theme_light;
-                            let mut changed = false;
-                            changed |= ui.radio_value(&mut light, false, "暗色").changed();
-                            changed |= ui.radio_value(&mut light, true, "亮色").changed();
-                            if changed {
-                                self.config.theme_light = light;
-                                theme::set_light(ui.ctx(), light);
-                                self.persist();
-                            }
-                        });
-                    },
-                );
-                if now != fold_ui {
-                    self.set_sidebar_section_open("ui", now);
-                }
                 let fold_log = self.sidebar_section_open("log");
                 let now = theme::collapsible_section(
                     ui,
@@ -3005,6 +2984,12 @@ impl MhxyApp {
 impl eframe::App for MhxyApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        // 跟随系统主题时，操作系统切换亮暗要即时生效。
+        let light = theme::resolve_light(&self.config.theme, &ctx);
+        if self.applied_light != Some(light) {
+            theme::set_light(&ctx, light);
+            self.applied_light = Some(light);
+        }
         self.poll_updates();
         // 默认开启的定时检查：启动 2 秒后检查一次，之后每 30 分钟一次。
         // 有更新/正在下载时不再重复检查；测试环境不联网。
@@ -3175,6 +3160,24 @@ impl eframe::App for MhxyApp {
                             {
                                 self.set_on_top(!on_top, &ctx);
                             }
+                            ui.scope(|ui| {
+                                ui.spacing_mut().interact_size.y = 34.0;
+                                ui.menu_button("界面主题", |ui| {
+                                    for (value, label) in [
+                                        ("system", "跟随系统"),
+                                        ("light", "亮色"),
+                                        ("dark", "暗色"),
+                                    ] {
+                                        if ui.radio(self.config.theme == value, label).clicked() {
+                                            self.config.theme = value.to_string();
+                                            self.persist();
+                                            ui.close();
+                                        }
+                                    }
+                                })
+                                .response
+                                .on_hover_text("默认跟随系统，也可以固定亮色或暗色");
+                            });
                             if ui
                                 .add(header_button("说明", self.show_help))
                                 .on_hover_text("使用说明")
@@ -3817,6 +3820,26 @@ mod tests {
         out
     }
 
+    /// 收集这一帧每段文字的位置，用于断言顶栏按钮顺序。
+    fn text_positions(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, egui::Pos2)> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<(String, egui::Pos2)>) {
+            match shape {
+                egui::Shape::Text(text) => out.push((text.galley.text().to_string(), text.pos)),
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
     fn escape_input() -> egui::RawInput {
         let mut input = egui::RawInput {
             screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1120.0, 800.0))),
@@ -3858,6 +3881,43 @@ mod tests {
     }
 
     #[test]
+    fn header_orders_update_help_theme_top_compact_start() {
+        let mut app = app();
+        let ctx = app.ctx.clone();
+        let mut frame = eframe::Frame::_new_kittest();
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1120.0, 800.0))),
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| app.ui(ui, &mut frame));
+        let positions = text_positions(&output.shapes);
+        let find = |needle: &str| {
+            positions
+                .iter()
+                .find(|(text, _)| text == needle)
+                .map(|(_, pos)| *pos)
+                .unwrap_or_else(|| panic!("顶栏缺少「{needle}」：{positions:?}"))
+        };
+        let update = find("检查更新");
+        let help = find("说明");
+        let theme = find("界面主题");
+        let on_top = find("置顶");
+        let compact = find("精简界面");
+        let start = find("开始识别");
+        assert!(
+            update.x < help.x
+                && help.x < theme.x
+                && theme.x < on_top.x
+                && on_top.x < compact.x
+                && compact.x < start.x,
+            "顶栏顺序应为 检查更新 | 说明 | 界面主题 | 置顶 | 精简界面 | 开始识别：\
+             update={update:?} help={help:?} theme={theme:?} on_top={on_top:?} \
+             compact={compact:?} start={start:?}"
+        );
+        output.textures_delta.clear();
+    }
+
+    #[test]
     fn compact_mode_hides_chrome_and_esc_restores_it() {
         let mut app = app();
         let ctx = app.ctx.clone();
@@ -3870,7 +3930,14 @@ mod tests {
         app.compact = true;
         let mut output = ctx.run_ui(input(), |ui| app.ui(ui, &mut frame));
         let texts = collect_texts(&output.shapes);
-        for hidden in ["开始识别", "精简界面", "置顶", "说明", "梦幻西游"] {
+        for hidden in [
+            "开始识别",
+            "精简界面",
+            "置顶",
+            "界面主题",
+            "说明",
+            "梦幻西游",
+        ] {
             assert!(
                 !texts.iter().any(|text| text == hidden),
                 "精简模式不应显示 {hidden}：{texts:?}"
@@ -4373,7 +4440,7 @@ mod tests {
         theme::install(&ctx, true);
         let mut app = MhxyApp::from_config(
             Config {
-                theme_light: true,
+                theme: "light".into(),
                 ..Default::default()
             },
             PathBuf::from("/unused/config.json"),

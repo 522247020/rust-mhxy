@@ -27,7 +27,7 @@ fn main() -> eframe::Result {
     if config.on_top {
         viewport = viewport.with_always_on_top();
     }
-    let light_theme = config.theme_light;
+    let theme_mode = config.theme.clone();
     let options = eframe::NativeOptions {
         viewport,
         ..Default::default()
@@ -35,9 +35,10 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "rust-mhxy",
         options,
-        Box::new(|cc| {
+        Box::new(move |cc| {
             install_fonts(&cc.egui_ctx);
-            theme::install(&cc.egui_ctx, light_theme);
+            let light = theme::resolve_light(&theme_mode, &cc.egui_ctx);
+            theme::install(&cc.egui_ctx, light);
             Ok(Box::new(app::MhxyApp::new(cc)))
         }),
     )
