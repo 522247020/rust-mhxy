@@ -68,7 +68,8 @@ jobs:
           echo "--- 根目录 ---"
           ls -la / | head -30
           echo "--- 相关挂载 ---"
-          mount | grep -E ' /cache | /workspace |/data' || echo "（没有 cache/workspace 挂载）"
+          mount | grep -E '/cache|/workspace|/hostedtoolcache|/var/run/act' ||
+            echo "（没有 cache/workspace/toolcache 挂载）"
           echo "--- 持久化候选 ---"
           for dir in /cache /opt/hostedtoolcache; do
             if [ -d "$dir" ]; then
