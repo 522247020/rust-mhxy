@@ -402,6 +402,29 @@ Gitea Runner 需要（自建、Linux）：Rust + `x86_64-pc-windows-msvc` target
 
 #### act_runner 持久化缓存（推荐）
 
+#### runner 的 compose（本仓库维护者使用）
+
+```yaml
+services:
+  runner:
+    restart: always
+    image: gitea/act_runner:latest
+    environment:
+      CONFIG_FILE: /config.yaml
+      GITEA_INSTANCE_URL: "http://192.168.124.254:6600/"
+      GITEA_RUNNER_REGISTRATION_TOKEN: "<token>"
+      GITEA_RUNNER_NAME: "NAS"
+      GITEA_RUNNER_LABELS: "${RUNNER_LABELS}"
+    ports:
+      - 8088:8088            # act_runner 自带 cache server（给 actions/cache 用）
+    volumes:
+      - /volume4/docker/app_config/act_runner/config.yaml:/config.yaml   # CONFIG_FILE 指的就是它
+      - /volume4/docker/app_config/act_runner/data:/data                 # .runner 注册信息、日志
+      - /var/run/docker.sock:/var/run/docker.sock                        # 起作业容器必需
+```
+
+这份 compose 不需要为缓存做任何改动：作业容器的 `/cache` 来自 `config.yaml` 的 `container.options`（宿主机路径），而不是 compose 的卷。**改了 `config.yaml` 一定要 `docker restart act_runner-runner-1`。**
+
 act_runner 默认每个任务起一个全新容器：`/data` 是 runner 自己的目录，作业容器访问不到；`/workspace/<owner>/<repo>` 是**每任务一个命名卷**（名字里带 task id，任务结束即删除）；`$HOME` 也是全新的。所以这些位置都不能当缓存。
 
 act_runner 会把内置命名卷 `act-toolcache` 挂到作业容器的 **`/opt/hostedtoolcache`**，它跨任务、跨仓库持久（宿主机路径 `/volume4/@docker/volumes/act-toolcache/_data`）。**工作流默认就用它**，不需要任何 runner 配置：
