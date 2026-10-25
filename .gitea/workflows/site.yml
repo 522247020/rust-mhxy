@@ -23,11 +23,8 @@ jobs:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # Gitea act runner 不会自动检出仓库；用内置 token 克隆当前 ref。
-          if [ -f Cargo.toml ]; then
-            echo "工作区已有源码"
-            git log -1 --oneline
-            exit 0
-          fi
+          # 注意：runner 会复用 /workspace/<repo> 目录，绝不能因为“已有源码”就跳过，
+          # 否则会用上一轮留下的旧代码（曾导致打包脚本仍是旧版本，找不到 exe）。
           server="${GITHUB_SERVER_URL#http://}"
           server="${server#https://}"
           scheme="http"
@@ -55,9 +52,14 @@ jobs:
             echo "回退到匿名克隆 ${base}"
             clone_repo "$base"
           fi
+          echo "清空工作区（保留 target/ 与 dist/）"
+          find . -mindepth 1 -maxdepth 1 ! -name target ! -name dist -exec rm -rf {} +
           cp -a "$tmp/repo/." .
           rm -rf "$tmp"
-          git log -1 --oneline
+          echo "HEAD: $(git rev-parse --short HEAD) $(git log -1 --pretty=%s)"
+          if [ -n "${GITHUB_SHA:-}" ] && [ "$(git rev-parse HEAD)" != "$GITHUB_SHA" ]; then
+            echo "::warning::工作区 HEAD 与 GITHUB_SHA 不一致（${GITHUB_REF_NAME} 可能已更新）"
+          fi
 
       - name: Check cache mount
         run: |
@@ -189,7 +191,10 @@ jobs:
           ls -l "$sdk_dir" | grep -iE 'directml|pathcch'
 
       - name: Build Windows package
-        run: bash scripts/package-windows.sh
+        run: |
+          echo "HEAD: $(git rev-parse --short HEAD)"
+          echo "CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-<unset>}"
+          bash scripts/package-windows.sh
 
       - name: Build download site
         env:

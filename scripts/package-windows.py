@@ -187,7 +187,16 @@ def main() -> None:
     if args.print_version:
         print(version)
         return
-    package(args.binary.resolve(), args.output_dir.resolve(), args.models_dir.resolve(),
+    binary = args.binary.resolve()
+    if not binary.is_file():
+        target_root = default_target_root()
+        sys.exit(
+            f"打包失败：找不到 {binary}\n"
+            f"  CARGO_TARGET_DIR={os.environ.get('CARGO_TARGET_DIR', '<unset>')}"
+            f"（默认产物目录 {target_root}）\n"
+            "  请先执行 cargo xwin build --release --target " + TARGET
+        )
+    package(binary, args.output_dir.resolve(), args.models_dir.resolve(),
             args.ort_cache or default_ort_cache(), version)
 
 
