@@ -64,8 +64,6 @@ pub struct Config {
     pub generic_enabled: bool,
     pub high_chance: bool,
     pub ghost_king_high_chance: bool,
-    /// 大字体模式：OCR 把多位坐标截断导致 y 轴抖动时开启。
-    pub large_font_mode: bool,
     pub horizontal_layout: bool,
     pub sidebar_expanded: bool,
     pub log_level: String,
@@ -120,7 +118,6 @@ impl Default for Config {
             generic_enabled: false,
             high_chance: false,
             ghost_king_high_chance: false,
-            large_font_mode: false,
             horizontal_layout: false,
             sidebar_expanded: true,
             log_level: "simple".into(),
@@ -205,7 +202,6 @@ impl Config {
         config.high_chance = get_bool(map, "task/high_chance", false);
         // 旧配置只有 task/high_chance，鬼王默认跟随抓鬼的设置。
         config.ghost_king_high_chance = get_bool(map, "task/high_chance/鬼王", config.high_chance);
-        config.large_font_mode = get_bool(map, "task/large_font_mode", false);
         config.horizontal_layout = get_bool(map, "task/horizontal_layout", false);
         config.sidebar_expanded = get_bool(map, "window/sidebar_expanded", true);
         config.log_level = match get_string(map, "log/level", &config.log_level).as_str() {
@@ -327,7 +323,6 @@ impl Config {
         insert("task/option/鬼王", Value::Bool(self.ghost_king_enabled));
         insert("task/option/通用", Value::Bool(self.generic_enabled));
         insert("task/high_chance", Value::Bool(self.high_chance));
-        insert("task/large_font_mode", Value::Bool(self.large_font_mode));
         insert(
             "task/high_chance/鬼王",
             Value::Bool(self.ghost_king_high_chance),

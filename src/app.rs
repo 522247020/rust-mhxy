@@ -59,60 +59,6 @@ enum UpdateEvent {
 struct TaskState {
     location: Option<TaskLocation>,
     map_index: Option<usize>,
-    stabilizer: YStabilizer,
-}
-
-/// 抑制 OCR 把多位 y 截断造成的抖动（如 79,26 偶尔识别成 79,2）。
-/// 同一地图、同一 x 下：大 y 每次 +3，小 y 每次 +1；分数持平取较大的 y。
-/// 地图或 x 变化视为新点位，直接重置。
-#[derive(Default)]
-struct YStabilizer {
-    valid: bool,
-    map_name: String,
-    x: i32,
-    scores: HashMap<i32, i32>,
-    displayed_y: i32,
-}
-
-impl YStabilizer {
-    fn stable_y(&mut self, map_name: &str, x: i32, y: i32) -> i32 {
-        if !self.valid || self.map_name != map_name || self.x != x {
-            self.valid = true;
-            self.map_name = map_name.to_string();
-            self.x = x;
-            self.scores.clear();
-            self.scores.insert(y, 1);
-            self.displayed_y = y;
-            return y;
-        }
-
-        let max_other = self
-            .scores
-            .keys()
-            .copied()
-            .filter(|known| *known != y)
-            .max();
-        let has_other = max_other.is_some();
-        // 只有一个候选时先按 +1，避免先出现的较小值靠 +3 快速堆分。
-        let is_largest = max_other.is_some_and(|max| y > max);
-        let weight = if has_other && is_largest { 3 } else { 1 };
-        *self.scores.entry(y).or_insert(0) += weight;
-        // 避免长时间运行后分数无限增长，导致新点位很难追上来。
-        if self.scores.values().copied().max().unwrap_or(0) > 60 {
-            for score in self.scores.values_mut() {
-                *score /= 2;
-            }
-        }
-
-        let best = self
-            .scores
-            .iter()
-            .max_by(|a, b| a.1.cmp(b.1).then(a.0.cmp(b.0)))
-            .map(|(candidate, _)| *candidate)
-            .unwrap_or(y);
-        self.displayed_y = best;
-        best
-    }
 }
 
 pub struct MhxyApp {
@@ -615,13 +561,6 @@ impl MhxyApp {
         self.pending_signature = None;
         self.last_signature = None;
         self.last_scan = None;
-    }
-
-    /// 清空所有任务的 y 轴加权历史（切换大字体模式时调用）。
-    fn reset_stabilizers(&mut self) {
-        for state in self.tasks.values_mut() {
-            state.stabilizer = YStabilizer::default();
-        }
     }
 
     fn set_window(&mut self, handle: Option<i64>) {
@@ -1384,7 +1323,7 @@ impl MhxyApp {
             if !self.task_active(task_type) {
                 continue;
             }
-            let mut location = locations
+            let location = locations
                 .iter()
                 .find(|location| location.task_type == task_type)
                 .cloned();
@@ -1430,24 +1369,6 @@ impl MhxyApp {
                     }
                 }
             };
-            let mut y_note = None;
-            if self.config.large_font_mode && task_status.is_none() {
-                if let Some(loc) = location.as_mut() {
-                    if let Some(state) = self.tasks.get_mut(task_type) {
-                        let raw_y = loc.y;
-                        let stable_y = state.stabilizer.stable_y(&loc.map_name, loc.x, raw_y);
-                        if stable_y != raw_y {
-                            y_note = Some((raw_y, stable_y));
-                        }
-                        loc.y = stable_y;
-                    }
-                }
-            }
-            if let Some((raw_y, stable_y)) = y_note {
-                self.log_detail(format!(
-                    "{task_type} y 抖动 {raw_y} -> {stable_y}（同 x 加权）"
-                ));
-            }
             if let Some(note) = clamp_note {
                 self.log_detail(note);
             }
@@ -1851,17 +1772,6 @@ impl MhxyApp {
                             );
                         });
                     }
-                    ui.add_space(2.0);
-                    if ui
-                        .checkbox(&mut self.config.large_font_mode, "大字体模式")
-                        .on_hover_text(
-                            "OCR 把多位坐标截断导致 y 轴抖动时开启：同一 x 下大数字权重 3、小数字权重 1，持平显示大数字；x 或地图变化会重新绘制",
-                        )
-                        .changed()
-                    {
-                        self.reset_stabilizers();
-                        self.persist();
-                    }
                 });
                 if now != fold_trigger {
                     self.set_sidebar_section_open("trigger", now);
@@ -2097,7 +2007,15 @@ impl MhxyApp {
         for line in [
             "自动（按间隔）：按设定间隔定时识别。",
             "手动（快捷键）：点「开始监听」后，按快捷键触发一次识别；快捷键可填写或点「录制」。",
-            "大字体模式：OCR 把多位坐标截断导致 y 轴抖动时开启。",
+        ] {
+            ui.label(egui::RichText::new(line).small());
+        }
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new("界面").strong());
+        for line in [
+            "界面主题：顶栏「界面主题」可选跟随系统 / 亮色 / 暗色，默认跟随系统，系统切换亮暗时立即跟随。",
+            "精简界面：顶栏「精简界面」隐藏按钮栏、状态栏和设置栏，只保留地图；按 Esc 恢复默认界面。",
+            "置顶：让本窗口始终保持在其他窗口之上，方便对照游戏。",
         ] {
             ui.label(egui::RichText::new(line).small());
         }
@@ -3968,19 +3886,6 @@ mod tests {
                 elapsed_secs: 0.25,
             }),
         }
-    }
-
-    #[test]
-    fn y_stabilizer_prefers_larger_value_and_resets() {
-        let mut stabilizer = YStabilizer::default();
-        assert_eq!(stabilizer.stable_y("普陀山", 79, 2), 2);
-        assert_eq!(stabilizer.stable_y("普陀山", 79, 26), 26);
-        assert_eq!(stabilizer.stable_y("普陀山", 79, 2), 26);
-        assert_eq!(stabilizer.stable_y("普陀山", 79, 26), 26);
-        // x 变化 → 视为新点位
-        assert_eq!(stabilizer.stable_y("普陀山", 80, 10), 10);
-        // 地图变化 → 重置
-        assert_eq!(stabilizer.stable_y("天宫", 80, 10), 10);
     }
 
     #[test]
