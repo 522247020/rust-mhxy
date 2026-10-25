@@ -1362,6 +1362,18 @@ impl MhxyApp {
 
     fn apply_ocr(&mut self, ocr_text: &OcrText) {
         let locations = parse_tasks(&ocr_text.text, &self.maps, self.task_filter());
+        // 详细日志里始终留一份 OCR 原文：同时有两个任务时，能直接看出是
+        // 只截到一段文字（区域 / 预处理）还是文字都在、只是没解析出来（解析）。
+        let raw = ocr_text.text.trim().replace('\n', " | ");
+        if raw.is_empty() {
+            self.log_detail("OCR 没有识别到文字");
+        } else {
+            self.log_detail(format!("OCR 文字：{}", truncate_text(&raw, 240)));
+        }
+        if !self.task_active("抓鬼") && !self.task_active("鬼王") && !self.task_active("通用")
+        {
+            self.log_detail("没有勾选任何任务类型，不会解析任务");
+        }
         for task_type in TASK_ORDER {
             if !self.task_active(task_type) {
                 continue;

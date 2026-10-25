@@ -212,7 +212,11 @@ fn is_cjk(ch: char) -> bool {
 }
 
 fn is_separator(ch: char) -> bool {
-    matches!(ch, ',' | '，' | '、' | '.')
+    // OCR 经常把坐标的逗号认成句号、冒号或分号，都当作分隔符。
+    matches!(
+        ch,
+        ',' | '，' | '、' | '.' | '．' | '。' | ':' | '：' | ';' | '；' | '·'
+    )
 }
 
 /// 归一化后的编辑距离相似度，近似 Python difflib 的匹配比例。
@@ -388,10 +392,18 @@ fn infer_map_name(before: &str) -> Option<String> {
 
 /// 任务关键字 → 归一化后的任务类型。长的写在前面，同一位置优先匹配更长的关键字。
 /// 通用任务不参与关键字匹配，它只看地图名和坐标。
-const TASK_KEYWORDS: &[(&str, &[char])] = &[
-    ("抓鬼", &['抓', '鬼']),
-    ("抓鬼", &['捉', '鬼']),
-    ("鬼王", &['鬼', '王']),
+///
+/// 最后一个字段表示是否要求关键字前面不是汉字：「鬼王」需要，否则「嗜血鬼王」
+/// 这类描述会被误判成鬼王任务；「抓鬼 / 捉鬼」不要求，因为任务栏里常写成
+/// 「任务抓鬼」「钟馗抓鬼」，加上前置断言会让它们全部失配。
+///
+/// 鬼王任务的任务名是「降伏千年厉鬼」，文字里「鬼王」只在坐标之后的
+/// 「降伏 xxxx鬼王」里出现，前面一定是汉字，所以额外用「降伏」当鬼王关键字。
+const TASK_KEYWORDS: &[(&str, &[char], bool)] = &[
+    ("抓鬼", &['抓', '鬼'], false),
+    ("抓鬼", &['捉', '鬼'], false),
+    ("鬼王", &['降', '伏'], false),
+    ("鬼王", &['鬼', '王'], true),
 ];
 
 pub fn parse_tasks(text: &str, maps: &[MapDefinition], filter: TaskFilter) -> Vec<TaskLocation> {
@@ -402,13 +414,13 @@ pub fn parse_tasks(text: &str, maps: &[MapDefinition], filter: TaskFilter) -> Ve
     let mut matches: Vec<(usize, usize, &str)> = Vec::new();
     let mut index = 0;
     while index < chars.len() {
-        let hit = TASK_KEYWORDS.iter().find_map(|(task, prefix)| {
+        let hit = TASK_KEYWORDS.iter().find_map(|(task, prefix, boundary)| {
             chars[index..]
                 .starts_with(prefix)
-                .then_some((*task, prefix.len()))
+                .then_some((*task, prefix.len(), *boundary))
         });
         match hit {
-            Some((task, len)) if index == 0 || !is_cjk(chars[index - 1]) => {
+            Some((task, len, boundary)) if !boundary || index == 0 || !is_cjk(chars[index - 1]) => {
                 matches.push((index, index + len, task));
                 index += len;
             }
@@ -434,13 +446,24 @@ pub fn parse_tasks(text: &str, maps: &[MapDefinition], filter: TaskFilter) -> Ve
         }
     }
 
-    for (position, (_start, end, task_type)) in matches.iter().enumerate() {
+    for (position, (start, end, task_type)) in matches.iter().enumerate() {
         if !filter.enabled(task_type) || tasks.iter().any(|task| task.task_type == *task_type) {
             continue;
         }
         let block_end = matches.get(position + 1).map_or(chars.len(), |next| next.0);
         let block = &normalized[byte_of_char[*end]..byte_of_char[block_end]];
         if let Some(location) = locate_in_text(block, maps, task_type) {
+            tasks.push(location);
+            continue;
+        }
+        // OCR 阅读顺序错乱时，地图和坐标可能被排到关键字前面（如「长寿村 123,45 抓鬼」）。
+        // 只在关键字后面的文字里完全没有坐标时，才回看前面一小段。
+        if find_coordinate(block).is_some() {
+            continue;
+        }
+        let from = byte_of_char[start.saturating_sub(40)];
+        let before = &normalized[from..byte_of_char[*start]];
+        if let Some(location) = locate_in_text(before, maps, task_type) {
             tasks.push(location);
         }
     }
@@ -517,13 +540,21 @@ fn locate_at(block: &str, maps: &[MapDefinition], task_type: &str) -> Option<Tas
         .iter()
         .filter(|map| map.supports_task(task_type))
         .collect();
+    // 1) 整段里包含某个别名（地图名与坐标之间可能夹着 OCR 噪声）。
     let mut definition = candidates.iter().copied().find(|map| {
         map.aliases.iter().any(|alias| {
             let alias = compact(alias);
             !alias.is_empty() && compact_block.contains(&alias)
         })
     });
+    // 2) 别名没命中时，用坐标附近的连续中文段做模糊匹配：
+    //    OCR 把「长寿村」认成「长寿材」时仍能对回地图；
+    //    地图名出现在坐标后面（阅读顺序错乱）也能处理。
+    if definition.is_none() {
+        definition = fuzzy_map_in_text(block, &candidates);
+    }
     let inferred_map = infer_map_name(&compact(&block[..coordinate_start]));
+    // 3) 最后按「去XXX / 前往XXX」推断。
     if definition.is_none() {
         if let Some(inferred) = &inferred_map {
             definition = match_map(inferred, candidates.iter().copied());
@@ -539,6 +570,59 @@ fn locate_at(block: &str, maps: &[MapDefinition], task_type: &str) -> Option<Tas
         y,
         nearby: compact_block.contains("附近"),
     })
+}
+
+/// 在整段文字上按「别名长度 ±1」滑动窗口，用编辑距离找出最像的地图名。
+///
+/// 比「截取连续汉字段再比对」宽松：OCR 把汉字认成字母（`长y村`）时，
+/// 汉字段会被字母切断；2 字地图名错一个字（`夭宫` / `天官`）相似度只有 0.5，
+/// 需要单独放低阈值。窗口里出现数字就跳过，避免把坐标和「第1个」这类计数带进来。
+fn fuzzy_map_in_text<'a>(
+    text: &str,
+    candidates: &[&'a MapDefinition],
+) -> Option<&'a MapDefinition> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut best: Option<(&MapDefinition, f32)> = None;
+    for definition in candidates {
+        for alias in &definition.aliases {
+            let alias: Vec<char> = compact(alias).chars().collect();
+            if alias.len() < 2 {
+                continue;
+            }
+            // 2 字地图名只错一个字时相似度是 0.5，阈值要跟着名字长度放低。
+            let threshold = if alias.len() <= 2 { 0.5 } else { 0.6 };
+            let lengths = [alias.len().saturating_sub(1), alias.len(), alias.len() + 1];
+            for length in lengths {
+                if length < 2 || length > chars.len() {
+                    continue;
+                }
+                for start in 0..=chars.len() - length {
+                    let window = &chars[start..start + length];
+                    if window.iter().any(|ch| ch.is_ascii_digit()) {
+                        continue;
+                    }
+                    // 至少要两个汉字，避免把零散的字母当成地图名。
+                    if window.iter().filter(|ch| is_cjk(**ch)).count() < 2 {
+                        continue;
+                    }
+                    // 没有任何相同字符的窗口不可能达到阈值，先跳过。
+                    if !window.iter().any(|ch| alias.contains(ch)) {
+                        continue;
+                    }
+                    let window_text: String = window.iter().collect();
+                    let alias_text: String = alias.iter().collect();
+                    let score = similarity(&window_text, &alias_text);
+                    if score < threshold {
+                        continue;
+                    }
+                    if best.is_none_or(|(_, best_score)| score > best_score) {
+                        best = Some((definition, score));
+                    }
+                }
+            }
+        }
+    }
+    best.map(|(definition, _)| definition)
 }
 
 pub fn coordinate_in_map(definition: &MapDefinition, x: f32, y: f32, tolerance: f32) -> bool {
@@ -886,6 +970,176 @@ mod tests {
             high_chance_areas("普陀山", 30.0, 30.0, 50.0),
             vec![(-20.0, -20.0)]
         );
+    }
+
+    #[test]
+    fn fuzzy_matches_misread_map_names() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/maps.json");
+        let maps = load_maps(&path).expect("加载 maps.json");
+        let filter = TaskFilter {
+            zhuagui: true,
+            ghost_king: true,
+            generic: false,
+        };
+        let ghost = |name: &str| {
+            format!("降伏千年厉鬼（第1个）：去{name}123,45附近降伏僵尸鬼王,剩余15分钟")
+        };
+        let catch = |name: &str| format!("钟馗抓鬼（第1个）：去{name}123,45附近抓僵尸。");
+        // 抓鬼地图：形近字、认成字母、多认一个字都要能对回正式名。
+        for (name, expected) in [
+            ("长寿寸", "长寿村"),
+            ("长y村", "长寿村"),
+            ("长寿打", "长寿村"),
+            ("普院山", "普陀山"),
+            ("普陀由", "普陀山"),
+            ("女儿材", "女儿村"),
+            ("五庄现", "五庄观"),
+            ("朱紫囯", "朱紫国"),
+            ("建邺域", "建邺城"),
+        ] {
+            let tasks = parse_tasks(&catch(name), &maps, filter);
+            assert_eq!(tasks.len(), 1, "{name}");
+            assert_eq!(tasks[0].map_name, expected, "{name}");
+        }
+        // 鬼王地图：3 字别名错一个字，以及 2 字地图名（阈值更低）。
+        for (name, expected) in [
+            ("北俱芦州", "北俱芦洲"),
+            ("北俱卢洲", "北俱芦洲"),
+            ("碗子由", "碗子山"),
+            ("麒麟由", "麒麟山"),
+            ("夭宫", "天宫"),
+            ("天官", "天宫"),
+        ] {
+            let tasks = parse_tasks(&ghost(name), &maps, filter);
+            assert_eq!(tasks.len(), 1, "{name}");
+            assert_eq!(tasks[0].map_name, expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn parses_real_task_bar_text() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/maps.json");
+        let maps = load_maps(&path).expect("加载 maps.json");
+        let filter = TaskFilter {
+            zhuagui: true,
+            ghost_king: true,
+            generic: false,
+        };
+        // 抓鬼：任务名是「钟馗抓鬼」，没开眼用「附近」，开眼用「处」。
+        for (text, map_name, (x, y), nearby) in [
+            (
+                "钟馗抓鬼（第1个）：去长寿村123,45附近抓僵尸。",
+                "长寿村",
+                (123, 45),
+                true,
+            ),
+            (
+                "钟馗抓鬼（第10个）：去长寿村123,45处抓僵尸。",
+                "长寿村",
+                (123, 45),
+                false,
+            ),
+            (
+                "钟馗抓鬼（第1个）：去普陀山79,26附近抓鬼将。",
+                "普陀山",
+                (79, 26),
+                true,
+            ),
+            (
+                "钟馗抓鬼（第1个）：去朱紫国120,4附近抓恶鬼。",
+                "朱紫国",
+                (120, 4),
+                true,
+            ),
+        ] {
+            let tasks = parse_tasks(text, &maps, filter);
+            assert_eq!(tasks.len(), 1, "{text}");
+            assert_eq!(tasks[0].task_type, "抓鬼", "{text}");
+            assert_eq!(tasks[0].map_name, map_name, "{text}");
+            assert_eq!((tasks[0].x, tasks[0].y), (x, y), "{text}");
+            assert_eq!(tasks[0].nearby, nearby, "{text}");
+        }
+        // 鬼王：任务名是「降伏千年厉鬼」，「鬼王」只在坐标之后；
+        // 开眼时描述里既没有「附近」也没有「处」。
+        for (text, map_name, (x, y), nearby) in [
+            (
+                "降伏千年厉鬼（第1个）：去天宫123,45附近降伏僵尸鬼王,剩余15分钟",
+                "天宫",
+                (123, 45),
+                true,
+            ),
+            (
+                "降伏千年厉鬼（第1个）：去天宫123,45降伏僵尸鬼王,剩余(15)分钟",
+                "天宫",
+                (123, 45),
+                false,
+            ),
+            (
+                "降伏千年厉鬼（第2个）：去北俱芦洲73,74附近降伏厉鬼鬼王,剩余9分钟",
+                "北俱芦洲",
+                (73, 74),
+                true,
+            ),
+        ] {
+            let tasks = parse_tasks(text, &maps, filter);
+            assert_eq!(tasks.len(), 1, "{text}");
+            assert_eq!(tasks[0].task_type, "鬼王", "{text}");
+            assert_eq!(tasks[0].map_name, map_name, "{text}");
+            assert_eq!((tasks[0].x, tasks[0].y), (x, y), "{text}");
+            assert_eq!(tasks[0].nearby, nearby, "{text}");
+        }
+        // 两块识别区域拼接后同一段文字里既有抓鬼又有鬼王。
+        let text = "钟馗抓鬼（第1个）：去长寿村123,45附近抓僵尸。\
+                    降伏千年厉鬼（第1个）：去天宫123,45附近降伏僵尸鬼王,剩余15分钟";
+        let tasks = parse_tasks(text, &maps, filter);
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].task_type, "抓鬼");
+        assert_eq!(tasks[0].map_name, "长寿村");
+        assert_eq!(tasks[1].task_type, "鬼王");
+        assert_eq!(tasks[1].map_name, "天宫");
+    }
+
+    #[test]
+    fn parses_task_text_with_ocr_noise() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/maps.json");
+        let maps = load_maps(&path).expect("加载 maps.json");
+        let filter = TaskFilter {
+            zhuagui: true,
+            ghost_king: true,
+            generic: false,
+        };
+        let cases = [
+            // 任务栏里「抓鬼」前面粘着别的汉字：以前会匹配不到关键字。
+            ("任务抓鬼长寿村123,45", "长寿村", (123, 45)),
+            ("钟馗抓鬼 长寿村 123,45", "长寿村", (123, 45)),
+            ("抓鬼长寿村 123,45", "长寿村", (123, 45)),
+            // 地图名被 OCR 认错一个字，模糊匹配回正确地图。
+            ("抓鬼\n长寿材 123,45", "长寿村", (123, 45)),
+            ("捉鬼\n普院山 79,26", "普陀山", (79, 26)),
+            // 坐标分隔符被认成冒号 / 分号 / 句号。
+            ("抓鬼\n长寿村 123;45", "长寿村", (123, 45)),
+            ("抓鬼\n长寿村 123。45", "长寿村", (123, 45)),
+            ("抓鬼\n长寿村 123:45", "长寿村", (123, 45)),
+            // 坐标行排在任务名之前（阅读顺序错乱）。
+            ("长寿村 123,45 抓鬼", "长寿村", (123, 45)),
+            // 任务栏里夹着「1/10」「第1个」这类计数，不能当成坐标。
+            ("抓鬼 1/10 长寿村 123,45", "长寿村", (123, 45)),
+            ("抓鬼\n第1个：长寿村 123,45", "长寿村", (123, 45)),
+        ];
+        for (text, map_name, (x, y)) in cases {
+            let tasks = parse_tasks(text, &maps, filter);
+            assert_eq!(tasks.len(), 1, "{text}");
+            assert_eq!(tasks[0].task_type, "抓鬼", "{text}");
+            assert_eq!(tasks[0].map_name, map_name, "{text}");
+            assert_eq!((tasks[0].x, tasks[0].y), (x, y), "{text}");
+        }
+    }
+
+    #[test]
+    fn embedded_zhuagui_keyword_still_needs_king_boundary() {
+        let text = "嗜血鬼王 天宫 10,20";
+        let tasks = parse_tasks(text, &maps(), TaskFilter::KEYWORD_TASKS);
+        assert!(tasks.is_empty());
     }
 
     #[test]
