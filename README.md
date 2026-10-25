@@ -436,7 +436,7 @@ docker logs --tail 200 act_runner-runner-1 | grep -i 'valid volume\|volume'
 
 工作流会自动检测 `/cache`，并把 `CARGO_HOME`、`RUSTUP_HOME`、`CARGO_TARGET_DIR`、`XWIN_CACHE_DIR`、`ORT_CACHE_DIR`、`OAR_HOME` 指过去。作业日志里出现 `::notice::/cache 可写，持久化缓存生效` 就是挂载成功。
 
-没有 `/cache` 时退回**工作区缓存** `<workspace>/.ci-cache`：act_runner 会复用 `/workspace/<repo>`，所以它同样跨任务有效，只是工作区被清理时会丢。`$HOME` 在每个作业容器里都是全新的，不能当缓存用。`CARGO_TARGET_DIR` 会持续增长，定期清理 `cache/target` 即可。
+没有 `/cache` 时退回**工作区缓存** `<workspace>/.ci-cache`，但默认配置下 `/workspace` 就在作业容器的 overlay 文件系统里（`mount | grep workspace` 无输出），任务结束即丢弃，**不能当真正的持久化缓存**。`$HOME` 同样。所以跨任务缓存只能靠上面的 `/cache` 挂载；如果暂时不想动 runner 配置，可以改用 act_runner 自带的 cache server + `actions/cache@v3`。`CARGO_TARGET_DIR` 会持续增长，定期清理 `cache/target` 即可。
 
 如果 runner 配置的是 **host 模式**（任务直接在宿主机跑），不需要挂载，`$HOME` 本身就是持久的，工作流会自动复用。
 
