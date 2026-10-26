@@ -1575,7 +1575,6 @@ impl MhxyApp {
         if self.flight_flag_index >= flag_names.len() && !flag_names.is_empty() {
             self.flight_flag_index = flag_names.len() - 1;
         }
-        self.flight_flag_style_ui(ui);
 
         ui.horizontal_wrapped(|ui| {
             ui.label("当前合成旗");
@@ -1593,6 +1592,7 @@ impl MhxyApp {
                 self.save_flight_flags();
             }
         });
+        self.flight_flag_style_ui(ui);
 
         if flag_names.is_empty() {
             ui.label(
@@ -1648,42 +1648,63 @@ impl MhxyApp {
         }
     }
 
+    /// 编辑当前选中合成旗自己的标注颜色；没选旗时提示先选择。
     fn flight_flag_style_ui(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal_wrapped(|ui| {
-            ui.label("标注样式");
-            let mut background = hsva_for_blend_picker(
-                self.flight_flags.style.background,
-                self.flight_flags.style.background_normal_alpha,
-            );
-            if ui.color_edit_button_hsva(&mut background).changed() {
-                let (color, normal_alpha) =
-                    split_blend_alpha(background, self.flight_flags.style.background_normal_alpha);
-                self.flight_flags.style.background = hsva_to_array(color);
-                self.flight_flags.style.background_normal_alpha = normal_alpha;
-                self.save_flight_flags();
+        let map = self.flight_map_edit.clone();
+        let index = self.flight_flag_index;
+        let fallback = self.flight_flags.style;
+        let mut changed = false;
+        {
+            let Some(flag) = self
+                .flight_flags
+                .maps
+                .get_mut(&map)
+                .and_then(|flags| flags.get_mut(index))
+            else {
+                ui.label(
+                    egui::RichText::new("选择一面合成旗后，可以单独设置它的背景和文字颜色")
+                        .small()
+                        .weak(),
+                );
+                return;
+            };
+            let mut style = flag.style.unwrap_or(fallback);
+            ui.horizontal_wrapped(|ui| {
+                ui.label("标注样式");
+                let mut background =
+                    hsva_for_blend_picker(style.background, style.background_normal_alpha);
+                if ui.color_edit_button_hsva(&mut background).changed() {
+                    let (color, normal_alpha) =
+                        split_blend_alpha(background, style.background_normal_alpha);
+                    style.background = hsva_to_array(color);
+                    style.background_normal_alpha = normal_alpha;
+                    changed = true;
+                }
+                ui.label("背景");
+                let mut text = hsva_for_blend_picker(style.text, style.text_normal_alpha);
+                if ui.color_edit_button_hsva(&mut text).changed() {
+                    let (color, normal_alpha) = split_blend_alpha(text, style.text_normal_alpha);
+                    style.text = hsva_to_array(color);
+                    style.text_normal_alpha = normal_alpha;
+                    changed = true;
+                }
+                ui.label("文字");
+                let mut size = f32::from(style.size);
+                if ui
+                    .add(egui::Slider::new(&mut size, 12.0..=40.0).text("大小"))
+                    .changed()
+                {
+                    style.size = size.round() as u8;
+                    changed = true;
+                }
+            });
+            if changed {
+                flag.style = Some(style);
             }
-            ui.label("背景");
-            let mut text = hsva_for_blend_picker(
-                self.flight_flags.style.text,
-                self.flight_flags.style.text_normal_alpha,
-            );
-            if ui.color_edit_button_hsva(&mut text).changed() {
-                let (color, normal_alpha) =
-                    split_blend_alpha(text, self.flight_flags.style.text_normal_alpha);
-                self.flight_flags.style.text = hsva_to_array(color);
-                self.flight_flags.style.text_normal_alpha = normal_alpha;
-                self.save_flight_flags();
-            }
-            ui.label("文字");
-            let mut size = f32::from(self.flight_flags.style.size);
-            if ui
-                .add(egui::Slider::new(&mut size, 12.0..=40.0).text("大小"))
-                .changed()
-            {
-                self.flight_flags.style.size = size.round() as u8;
-                self.save_flight_flags();
-            }
-        });
+        }
+        if changed {
+            self.save_flight_flags();
+        }
     }
 
     fn flight_flag_map_editor(
@@ -1730,7 +1751,7 @@ impl MhxyApp {
                         ),
                         flag_index + 1,
                         flag_index == self.flight_flag_index,
-                        self.flight_flags.style,
+                        self.flight_flags.flag_style(&definition.name, flag_index),
                     );
                 }
             }
@@ -1924,7 +1945,7 @@ impl MhxyApp {
                         to_screen(point),
                         flag_index + 1,
                         false,
-                        self.flight_flags.style,
+                        self.flight_flags.flag_style(&definition.name, flag_index),
                     );
                 }
             }
@@ -4384,7 +4405,24 @@ mod tests {
         assert!(texts
             .iter()
             .any(|text| text == "先新建一面合成旗，再点击地图添加点位"));
-        // 标注样式只保留背景和文字颜色，不再提供边框。
+        assert!(
+            texts.iter().any(|text| text.contains("选择一面合成旗后")),
+            "没选合成旗时应提示先选择：{texts:?}"
+        );
+
+        // 选中一面旗后，样式区只保留背景和文字颜色，而且只作用于这面旗。
+        app.flight_flags.add_flag("傲来国", "测试旗").unwrap();
+        app.flight_map_edit = "傲来国".to_string();
+        app.flight_flag_index = 0;
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 760.0))),
+                ..Default::default()
+            },
+            |ui| app.flight_flags_editor_ui(ui),
+        );
+        let texts = collect_texts(&output.shapes);
+        output.textures_delta.clear();
         assert!(
             texts.iter().any(|text| text == "背景"),
             "样式区应保留背景颜色：{texts:?}"

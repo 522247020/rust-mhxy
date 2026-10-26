@@ -13,11 +13,14 @@ pub struct FlightPoint {
     pub y: i32,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct CompositeFlag {
     pub name: String,
     #[serde(default)]
     pub points: Vec<FlightPoint>,
+    /// 每面合成旗自己的标注颜色；缺省时跟随 `FlightFlags::style`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub style: Option<FlightFlagStyle>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
@@ -106,6 +109,7 @@ impl FlightFlags {
                                 vec![CompositeFlag {
                                     name: "合成旗 1".to_string(),
                                     points,
+                                    style: None,
                                 }],
                             )
                         })
@@ -136,6 +140,14 @@ impl FlightFlags {
         })
     }
 
+    /// 某面合成旗实际使用的样式：没单独设置时跟随默认样式。
+    pub fn flag_style(&self, map: &str, index: usize) -> FlightFlagStyle {
+        self.flags_for(map)
+            .get(index)
+            .and_then(|flag| flag.style)
+            .unwrap_or(self.style)
+    }
+
     pub fn flags_for(&self, map: &str) -> &[CompositeFlag] {
         self.maps
             .get(normalize_map_name(map))
@@ -157,6 +169,7 @@ impl FlightFlags {
         flags.push(CompositeFlag {
             name,
             points: Vec::new(),
+            style: None,
         });
         Ok(flags.len() - 1)
     }
@@ -227,6 +240,9 @@ impl FlightFlags {
             }
             flags.retain_mut(|flag| {
                 flag.name = flag.name.trim().to_string();
+                if let Some(style) = &mut flag.style {
+                    style.migrate_legacy_rgba();
+                }
                 flag.points.retain(|point| point.x >= 0 && point.y >= 0);
                 let mut unique = Vec::with_capacity(flag.points.len());
                 flag.points.retain(|point| {
@@ -297,6 +313,23 @@ mod tests {
             .unwrap();
         assert_eq!(flags.flags_for("朱紫国")[0].points.len(), 2);
         assert_eq!(flags.flags_for("朱紫国")[0].name, "酒店旗");
+    }
+
+    #[test]
+    fn each_flag_keeps_its_own_style() {
+        let mut flags = FlightFlags::default();
+        flags.add_flag("长寿村", "一号").unwrap();
+        flags.add_flag("长寿村", "二号").unwrap();
+        // 没单独设置时跟随默认样式。
+        assert_eq!(flags.flag_style("长寿村", 0), flags.style);
+        assert_eq!(flags.flag_style("长寿村", 1), flags.style);
+
+        let mut red = flags.style;
+        red.background = [0.1, 0.2, 0.3, 1.0];
+        red.text = [0.9, 0.8, 0.7, 1.0];
+        flags.maps.get_mut("长寿村").unwrap()[0].style = Some(red);
+        assert_eq!(flags.flag_style("长寿村", 0), red);
+        assert_eq!(flags.flag_style("长寿村", 1), flags.style);
     }
 
     #[test]
