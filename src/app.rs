@@ -151,6 +151,9 @@ pub struct MhxyApp {
     hotkey_tried_at: Option<Instant>,
     recording_hotkey: bool,
     last_manual_trigger: Option<Instant>,
+    /// 识别还没结束时又按了快捷键：记下来，等这一轮结束立刻补一次，
+    /// 不再像以前那样直接丢掉（看起来就像快捷键没反应）。
+    pending_manual_trigger: bool,
     logs: Vec<String>,
     /// 精简模式：只留地图，隐藏顶部按钮栏、状态栏和侧栏；按 Esc 退出。
     compact: bool,
@@ -299,6 +302,7 @@ impl MhxyApp {
             hotkey_tried_at: None,
             recording_hotkey: false,
             last_manual_trigger: None,
+            pending_manual_trigger: false,
             logs: Vec::new(),
             compact: false,
             applied_light: None,
@@ -1099,7 +1103,17 @@ impl MhxyApp {
     /// 快捷键 / 「识别一次」触发：手动模式下一次只识别一次，忽略图色门控。
     fn manual_trigger(&mut self) {
         // 自动模式下手动按快捷键也强制识别一次，不用先切到手动模式。
-        if !self.running || self.busy {
+        if !self.running {
+            // 没开始监听时按到快捷键（例如窗口聚焦回退）就明确说清楚，
+            // 免得看起来像快捷键坏了。
+            self.pending_manual_trigger = false;
+            self.log_detail("未开始识别，快捷键不触发");
+            return;
+        }
+        if self.busy {
+            // 上一轮还没结束：先记下，等结果回来立刻补一次。
+            self.pending_manual_trigger = true;
+            self.log_detail("上一轮识别尚未结束，结束后立即补识别");
             return;
         }
         if let Some(last) = self.last_manual_trigger {
@@ -1107,9 +1121,18 @@ impl MhxyApp {
                 return;
             }
         }
+        self.pending_manual_trigger = false;
         self.last_manual_trigger = Some(Instant::now());
         self.log_detail("手动触发识别");
         self.trigger_scan(true);
+    }
+
+    /// 上一轮识别结束后，把排队的那一次快捷键触发补上。
+    fn flush_pending_manual_trigger(&mut self) {
+        if self.pending_manual_trigger && !self.busy {
+            self.pending_manual_trigger = false;
+            self.manual_trigger();
+        }
     }
 
     fn poll_hotkey(&mut self) {
@@ -1146,10 +1169,19 @@ impl MhxyApp {
         let raw = self.config.meditation_hotkey.trim().to_string();
         let changed = self.meditation_hotkey_attempted.as_deref() != Some(raw.as_str());
         if !changed {
-            // 已注册就什么都不做；注册失败则每 5 秒重试一次，
-            // 免得被别的程序临时占用后一直停留在「未注册」。
-            if self.meditation_hotkey_listener.is_some() {
+            // 已注册就什么都不做；线程意外退出或注册失败则定期重试，
+            // 免得界面停在「已注册」而实际按键无效。
+            if self
+                .meditation_hotkey_listener
+                .as_ref()
+                .is_some_and(|l| l.is_alive())
+            {
                 return;
+            }
+            if self.meditation_hotkey_listener.is_some() {
+                self.log_detail("打坐快捷键监听线程已退出，重新注册");
+                self.meditation_hotkey_listener = None;
+                self.meditation_hotkey_error = None;
             }
             if self
                 .meditation_hotkey_tried_at
@@ -1476,18 +1508,22 @@ impl MhxyApp {
             });
             match Hotkey::parse(&self.config.meditation_hotkey) {
                 Ok(hotkey) => {
+                    let registered = self
+                        .meditation_hotkey_listener
+                        .as_ref()
+                        .is_some_and(|listener| listener.is_alive());
                     let status = if !self.config.meditation_enabled {
                         "未启用（开启后注册）".to_string()
                     } else if self.meditation_recording_hotkey {
                         "请按下要绑定的按键（Esc 取消）".to_string()
-                    } else if self.meditation_hotkey_listener.is_some() {
+                    } else if registered {
                         "全局快捷键已注册".to_string()
                     } else if let Some(err) = &self.meditation_hotkey_error {
                         err.clone()
                     } else {
                         "正在注册…".to_string()
                     };
-                    let color = if self.meditation_hotkey_listener.is_some() {
+                    let color = if registered {
                         theme::muted()
                     } else {
                         theme::gold()
@@ -1548,7 +1584,16 @@ impl MhxyApp {
         let desired_label = desired.as_ref().map(|(_, label)| label.clone());
         let changed = desired_label != self.hotkey_attempted;
         if !changed {
-            if self.hotkey_listener.is_some() || !self.running {
+            // 监听线程意外退出时，系统已经把热键注销了，但界面还写着「已注册」。
+            // 这里主动发现并重新注册，否则就会一直「提示已注册、按键没反应」。
+            if self.hotkey_listener.as_ref().is_some_and(|l| l.is_alive()) {
+                return;
+            }
+            if self.hotkey_listener.is_some() {
+                self.log_detail("全局快捷键监听线程已退出，重新注册");
+                self.hotkey_listener = None;
+                self.hotkey_error = None;
+            } else if !self.running {
                 return;
             }
             // 注册失败后每 5 秒重试一次，避免被其他程序临时占用后一直无效。
@@ -1639,7 +1684,9 @@ impl MhxyApp {
         self.update_preview(full);
         self.notice = None;
         let signature = hash_image(&panel);
-        if self.last_signature == Some(signature) {
+        // 快捷键 / 「立即识别一次」是明确的用户意图，不能因为画面没变就跳过，
+        // 否则按下去毫无反应（自动识别才需要去重）。
+        if !force && self.last_signature == Some(signature) {
             self.log_detail(format!("{window_title}：识别区域未变化，跳过"));
             return;
         }
@@ -2603,7 +2650,11 @@ impl MhxyApp {
                         });
                         match Hotkey::parse(&self.config.ocr_hotkey) {
                             Ok(hotkey) => {
-                                let status = if self.hotkey_listener.is_some() {
+                                let registered = self
+                                    .hotkey_listener
+                                    .as_ref()
+                                    .is_some_and(|listener| listener.is_alive());
+                                let status = if registered {
                                     "全局快捷键已注册"
                                 } else if !self.running {
                                     "开始监听后生效"
@@ -2612,7 +2663,7 @@ impl MhxyApp {
                                 } else {
                                     "正在注册…"
                                 };
-                                let color = if self.hotkey_listener.is_some() {
+                                let color = if registered {
                                     theme::muted()
                                 } else {
                                     theme::gold()
@@ -3918,6 +3969,8 @@ impl eframe::App for MhxyApp {
             self.flush_config();
         }
         self.poll_events();
+        // 识别进行中按下的快捷键：结果回来后立刻补一次。
+        self.flush_pending_manual_trigger();
         self.poll_hotkey();
         self.poll_meditation_hotkey();
         if self.config.meditation_enabled {
@@ -3964,8 +4017,12 @@ impl eframe::App for MhxyApp {
         self.sync_hotkey();
         // 打坐计时不依赖识别是否在跑，每帧都同步一次（失败会按 5 秒间隔重试）。
         self.sync_meditation_hotkey();
-        // 非 Windows 或全局注册失败时，窗口聚焦也能用快捷键。
-        if self.running && self.hotkey_listener.is_none() && !self.busy {
+        // 非 Windows 或全局注册失败（含监听线程已退出）时，窗口聚焦也能用快捷键。
+        let hotkey_active = self
+            .hotkey_listener
+            .as_ref()
+            .is_some_and(|listener| listener.is_alive());
+        if self.running && !hotkey_active && !self.busy {
             if let Ok(hotkey) = Hotkey::parse(&self.config.ocr_hotkey) {
                 if hotkey.matches_egui(&ctx) {
                     self.manual_trigger();
@@ -4642,7 +4699,44 @@ fn hsva_to_array(hsva: egui::ecolor::Hsva) -> [f32; 4] {
     [hsva.h, hsva.s, hsva.v, hsva.a]
 }
 
-/// 修饰悬浮窗：去掉边框样式和 DWM 投影。返回是否成功找到窗口。
+/// 悬浮窗原始窗口过程，子类化后转发用。
+#[cfg(windows)]
+static OVERLAY_PREVIOUS_WNDPROC: std::sync::atomic::AtomicIsize =
+    std::sync::atomic::AtomicIsize::new(0);
+
+/// 抵消 winit 为「无边框窗口投影」多留的 1px。
+///
+/// winit 在处理 `WM_NCCALCSIZE` 时执行 `rgrc[0].top += 1; bottom += 1`
+/// （见 winit `event_loop.rs` 的 `MARKER_UNDECORATED_SHADOW` 分支，注释里也写了
+/// 这会留下 1px 的顶边）。背景不透明时看不出来，背景全透明时这 1px 由系统绘制，
+/// 表现为顶部一条白线；Windows 10 上 `DWMWA_BORDER_COLOR` 还不支持，改不掉它。
+/// 这里让客户区正好等于窗口矩形，从根上消掉那条 1px。
+#[cfg(windows)]
+unsafe extern "system" fn overlay_wndproc(
+    hwnd: windows::Win32::Foundation::HWND,
+    msg: u32,
+    wparam: windows::Win32::Foundation::WPARAM,
+    lparam: windows::Win32::Foundation::LPARAM,
+) -> windows::Win32::Foundation::LRESULT {
+    use windows::Win32::Foundation::{LRESULT, RECT};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CallWindowProcW, GetWindowRect, NCCALCSIZE_PARAMS, WM_NCCALCSIZE, WNDPROC,
+    };
+    if msg == WM_NCCALCSIZE && wparam.0 != 0 {
+        let params = lparam.0 as *mut NCCALCSIZE_PARAMS;
+        if !params.is_null() {
+            let mut rect = RECT::default();
+            if GetWindowRect(hwnd, &mut rect).is_ok() {
+                (*params).rgrc[0] = rect;
+                return LRESULT(0);
+            }
+        }
+    }
+    let previous: WNDPROC = std::mem::transmute(OVERLAY_PREVIOUS_WNDPROC.load(Ordering::Relaxed));
+    CallWindowProcW(previous, hwnd, msg, wparam, lparam)
+}
+
+/// 修饰悬浮窗：去掉边框样式、DWM 投影，并消掉顶部那 1px。返回是否成功找到窗口。
 #[cfg(windows)]
 fn prepare_overlay_window() -> bool {
     use std::ffi::c_void;
@@ -4653,9 +4747,9 @@ fn prepare_overlay_window() -> bool {
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         FindWindowW, GetWindowLongPtrW, GetWindowThreadProcessId, SetWindowLongPtrW, SetWindowPos,
-        GWL_EXSTYLE, GWL_STYLE, SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WS_BORDER,
-        WS_CAPTION, WS_DLGFRAME, WS_EX_TOOLWINDOW, WS_EX_WINDOWEDGE, WS_POPUP, WS_SYSMENU,
-        WS_THICKFRAME,
+        GWLP_WNDPROC, GWL_EXSTYLE, GWL_STYLE, SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE,
+        SWP_NOZORDER, WS_BORDER, WS_CAPTION, WS_DLGFRAME, WS_EX_TOOLWINDOW, WS_EX_WINDOWEDGE,
+        WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
     };
 
     let title: Vec<u16> = "打坐计时"
@@ -4673,8 +4767,8 @@ fn prepare_overlay_window() -> bool {
             return false;
         }
 
-        // winit 会给无边框窗口保留 WS_EX_WINDOWEDGE（3D 边框）和若干 frame 样式。
-        // Win11 上这会在背景全透明时留下一条顶边线，这里全部清掉。
+        // winit 会给无边框窗口保留 WS_EX_WINDOWEDGE（3D 边框）和若干 frame 样式，
+        // 背景全透明时会在顶边留下一条线，这里全部清掉。
         let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
         let style = (style
             & !(WS_CAPTION.0 | WS_THICKFRAME.0 | WS_BORDER.0 | WS_DLGFRAME.0 | WS_SYSMENU.0))
@@ -4683,6 +4777,17 @@ fn prepare_overlay_window() -> bool {
         let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
         let ex_style = (ex_style & !WS_EX_WINDOWEDGE.0) | WS_EX_TOOLWINDOW.0;
         SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex_style as isize);
+
+        // 子类化窗口过程，消掉 winit 为保留投影多留的那 1px 顶边。
+        // winit 只在创建窗口时设置一次窗口过程，这里判断后写入即可；
+        // 窗口被重建（换 viewport id）时外层会把尝试次数清零，会重新挂一次。
+        let current = GetWindowLongPtrW(hwnd, GWLP_WNDPROC);
+        let our_proc = overlay_wndproc as *const () as usize as isize;
+        if current != our_proc {
+            let previous = SetWindowLongPtrW(hwnd, GWLP_WNDPROC, our_proc);
+            OVERLAY_PREVIOUS_WNDPROC.store(previous, Ordering::Relaxed);
+        }
+
         let _ = SetWindowPos(
             hwnd,
             None,
@@ -5094,6 +5199,34 @@ mod tests {
         assert!(
             app.hotkey_listener.is_some() || app.hotkey_error.is_some(),
             "不能停在未注册也没有错误的状态"
+        );
+    }
+
+    #[test]
+    fn manual_trigger_is_queued_while_busy_instead_of_dropped() {
+        let mut app = app();
+        app.running = true;
+        app.busy = true;
+        app.manual_trigger();
+        assert!(
+            app.pending_manual_trigger,
+            "识别进行中按快捷键应排队，而不是直接丢掉（丢掉看起来就像快捷键没反应）"
+        );
+
+        // 上一轮结束后排队的那一次要被消费掉。
+        app.busy = false;
+        app.flush_pending_manual_trigger();
+        assert!(!app.pending_manual_trigger, "排队的触发应当被消费一次");
+    }
+
+    #[test]
+    fn manual_trigger_is_refused_before_running() {
+        let mut app = app();
+        app.running = false;
+        app.manual_trigger();
+        assert!(
+            !app.pending_manual_trigger,
+            "没开始识别时按下快捷键不应排队"
         );
     }
 

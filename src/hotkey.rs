@@ -395,6 +395,17 @@ pub struct GlobalHotkey {
     handle: std::thread::JoinHandle<()>,
 }
 
+impl GlobalHotkey {
+    /// 监听线程是否还活着。
+    ///
+    /// 线程一旦退出，系统会自动注销它注册的热键，但界面上的状态仍然停在
+    /// 「已注册」—— 这正是「提示已注册、按键却没反应」的来源。调用方发现
+    /// 这里返回 `false` 时应当丢弃旧监听器并重新注册。
+    pub fn is_alive(&self) -> bool {
+        !self.handle.is_finished()
+    }
+}
+
 /// 注册全局快捷键（目前仅 Windows）。成功时按下快捷键会向 `sender` 发送事件。
 ///
 /// `id` 用来区分同一进程里的多个快捷键：WM_HOTKEY 只带 id，
@@ -486,6 +497,49 @@ mod windows_impl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 回归测试：全局快捷键必须真的被系统持有，且消息能转发给调用方。
+    ///
+    /// 「提示已注册、按键却无效」这类问题只有这三段都成立才不会发生：
+    /// 注册成功 → 系统持有 → 消息泵把 WM_HOTKEY 转出来。
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "会占用一个全局快捷键，手动运行：cargo test --bin rust-mhxy -- --ignored global_hotkey"]
+    fn global_hotkey_is_held_by_system_and_forwards_messages() {
+        use std::sync::mpsc::channel;
+        use std::time::Duration;
+        use windows::Win32::Foundation::{LPARAM, WPARAM};
+        use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, MOD_ALT, MOD_CONTROL};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            PeekMessageW, PostThreadMessageW, MSG, PM_NOREMOVE, WM_HOTKEY,
+        };
+
+        let hotkey = Hotkey::parse("Ctrl+Alt+F24").unwrap();
+        let (tx, rx) = channel::<()>();
+        let Ok(listener) = spawn(hotkey, 98, tx) else {
+            eprintln!("注册失败，跳过（可能已被其他程序占用）");
+            return;
+        };
+        assert!(listener.is_alive(), "监听线程应当存活");
+
+        // 同一个组合键只能被一个线程注册：注册线程若意外退出，这里就会成功。
+        let taken = std::thread::spawn(|| unsafe {
+            let mut msg = MSG::default();
+            let _ = PeekMessageW(&mut msg, None, 0, 0, PM_NOREMOVE);
+            RegisterHotKey(None, 555, MOD_CONTROL | MOD_ALT, Key::F(24).vk()).is_err()
+        });
+        assert!(
+            taken.join().unwrap(),
+            "同一个组合键被成功注册了两次，说明第一次注册没有生效"
+        );
+
+        unsafe { PostThreadMessageW(listener.thread_id, WM_HOTKEY, WPARAM(98), LPARAM(0)) }
+            .expect("投递 WM_HOTKEY 失败");
+        assert!(
+            rx.recv_timeout(Duration::from_secs(2)).is_ok(),
+            "消息泵没有把 WM_HOTKEY 转发给调用方"
+        );
+    }
 
     #[test]
     fn parses_and_displays_hotkeys() {
