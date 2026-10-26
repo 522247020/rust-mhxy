@@ -159,9 +159,15 @@ pub struct MhxyApp {
     meditation_hotkey_rx: Receiver<()>,
     meditation_hotkey_listener: Option<GlobalHotkey>,
     meditation_hotkey_attempted: Option<String>,
+    /// 最近一次注册失败的原因，显示在设置里。
+    meditation_hotkey_error: Option<String>,
+    /// 上次尝试注册的时间，失败后定期重试。
+    meditation_hotkey_tried_at: Option<Instant>,
     meditation_applied_on_top: Option<bool>,
     meditation_applied_passthrough: Option<bool>,
     meditation_applied_size: Option<Vec2>,
+    /// 悬浮窗去阴影的尝试次数；窗口重建后归零重试。
+    meditation_shadow_attempts: u8,
     /// 正在录制打坐计时的全局快捷键。
     meditation_recording_hotkey: bool,
     /// 合成旗点位单独保存在用户本地目录，不进入主配置和更新包。
@@ -294,9 +300,12 @@ impl MhxyApp {
             meditation_hotkey_rx,
             meditation_hotkey_listener: None,
             meditation_hotkey_attempted: None,
+            meditation_hotkey_error: None,
+            meditation_hotkey_tried_at: None,
             meditation_applied_on_top: None,
             meditation_applied_passthrough: None,
             meditation_applied_size: None,
+            meditation_shadow_attempts: 0,
             meditation_recording_hotkey: false,
             flight_flags,
             flight_flags_path,
@@ -1114,31 +1123,51 @@ impl MhxyApp {
         if !self.config.meditation_enabled {
             self.meditation_hotkey_listener = None;
             self.meditation_hotkey_attempted = None;
+            self.meditation_hotkey_error = None;
+            self.meditation_hotkey_tried_at = None;
             return;
         }
         let raw = self.config.meditation_hotkey.trim().to_string();
-        if self.meditation_hotkey_attempted.as_deref() == Some(raw.as_str()) {
-            return;
+        let changed = self.meditation_hotkey_attempted.as_deref() != Some(raw.as_str());
+        if !changed {
+            // 已注册就什么都不做；注册失败则每 5 秒重试一次，
+            // 免得被别的程序临时占用后一直停留在「未注册」。
+            if self.meditation_hotkey_listener.is_some() {
+                return;
+            }
+            if self
+                .meditation_hotkey_tried_at
+                .is_some_and(|at| at.elapsed() < Duration::from_secs(5))
+            {
+                return;
+            }
         }
         self.meditation_hotkey_attempted = Some(raw.clone());
-        self.meditation_hotkey_listener = None;
+        self.meditation_hotkey_tried_at = Some(Instant::now());
         let (hotkey, label) = match Hotkey::parse(&raw) {
             Ok(hotkey) => (hotkey, hotkey.display()),
-            Err(_) => return,
+            Err(err) => {
+                self.meditation_hotkey_error = Some(err);
+                self.meditation_hotkey_listener = None;
+                return;
+            }
         };
+        // 先释放旧的，避免同一个键重复注册。
+        self.meditation_hotkey_listener = None;
         match hotkey::spawn(hotkey, self.meditation_hotkey_tx.clone()) {
             Ok(listener) => {
                 self.meditation_hotkey_listener = Some(listener);
+                self.meditation_hotkey_error = None;
                 self.log_detail(format!("已注册打坐计时快捷键：{label}"));
             }
             Err(err) => {
                 self.meditation_hotkey_listener = None;
+                self.meditation_hotkey_error = Some(err.clone());
                 self.log_detail(format!("打坐计时快捷键注册失败：{err}"));
             }
         }
     }
 
-    /// 悬浮窗文字、字体与胶囊尺寸。窗口按这个尺寸创建，背景和文字自然贴合。
     fn meditation_layout(&self, ctx: &egui::Context) -> (String, FontId, Color32, Vec2) {
         let font_px = if self.config.meditation_font_px == 0 {
             24.0
@@ -1147,7 +1176,13 @@ impl MhxyApp {
         };
         let text = self.meditation.text(self.config.meditation_clock_format);
         let color = self.meditation_text_color();
-        let font = FontId::proportional(font_px);
+        let family = if self.config.meditation_bold {
+            // 有系统粗体就用粗体族，少了再靠叠加绘制加粗。
+            egui::FontFamily::Name("bold".into())
+        } else {
+            egui::FontFamily::Proportional
+        };
+        let font = FontId::new(font_px, family);
         let galley = ctx.fonts_mut(|fonts| fonts.layout_no_wrap(text.clone(), font.clone(), color));
         let padding = (font_px * 0.35).max(8.0);
         // 没设置宽高时按文字自动收紧；设置后取两者较大值，避免文字被裁掉。
@@ -1178,6 +1213,7 @@ impl MhxyApp {
             self.meditation_applied_size = Some(size);
             self.meditation_applied_on_top = None;
             self.meditation_applied_passthrough = None;
+            self.meditation_shadow_attempts = 0;
         }
         let mut builder = egui::ViewportBuilder::default()
             .with_title("打坐计时")
@@ -1198,6 +1234,15 @@ impl MhxyApp {
                     return;
                 }
                 let ctx = ui.ctx().clone();
+                // Windows 会给无边框窗口加 DWM 投影，背景全透明时只剩一圈阴影，
+                // 这里把非客户区渲染关掉；窗口刚创建时可能还找不到，下一帧再试。
+                #[cfg(windows)]
+                if self.meditation_shadow_attempts < 30 {
+                    self.meditation_shadow_attempts += 1;
+                    if disable_overlay_shadow() {
+                        self.meditation_shadow_attempts = 30;
+                    }
+                }
                 if ctx.input(|input| input.viewport().close_requested()) {
                     self.config.meditation_enabled = false;
                     self.persist();
@@ -1248,14 +1293,17 @@ impl MhxyApp {
                     Color32::from_black_alpha(160),
                 );
                 painter.text(center, Align2::CENTER_CENTER, &text, font.clone(), color);
-                if self.config.meditation_bold {
-                    painter.text(
-                        center + vec2(0.9, 0.0),
-                        Align2::CENTER_CENTER,
-                        &text,
-                        font.clone(),
-                        color,
-                    );
+                if self.config.meditation_bold && !crate::has_bold_font() {
+                    // 没有系统粗体时，四个方向各叠一层模拟加粗。
+                    for offset in [vec2(0.7, 0.0), vec2(0.0, 0.7), vec2(0.7, 0.7)] {
+                        painter.text(
+                            center + offset,
+                            Align2::CENTER_CENTER,
+                            &text,
+                            font.clone(),
+                            color,
+                        );
+                    }
                 }
             },
         );
@@ -1406,17 +1454,26 @@ impl MhxyApp {
             });
             match Hotkey::parse(&self.config.meditation_hotkey) {
                 Ok(hotkey) => {
-                    let status = if self.meditation_recording_hotkey {
-                        "请按下要绑定的按键（Esc 取消）"
+                    let status = if !self.config.meditation_enabled {
+                        "未启用（开启后注册）".to_string()
+                    } else if self.meditation_recording_hotkey {
+                        "请按下要绑定的按键（Esc 取消）".to_string()
                     } else if self.meditation_hotkey_listener.is_some() {
-                        "全局快捷键已注册"
+                        "全局快捷键已注册".to_string()
+                    } else if let Some(err) = &self.meditation_hotkey_error {
+                        err.clone()
                     } else {
-                        "未注册（检查格式或权限）"
+                        "正在注册…".to_string()
+                    };
+                    let color = if self.meditation_hotkey_listener.is_some() {
+                        theme::muted()
+                    } else {
+                        theme::gold()
                     };
                     ui.label(
                         egui::RichText::new(format!("{} · {status}", hotkey.display()))
                             .small()
-                            .weak(),
+                            .color(color),
                     );
                 }
                 Err(err) => {
@@ -4529,6 +4586,59 @@ fn marker_color([h, s, v, a]: [f32; 4], normal_alpha: f32) -> Color32 {
 
 fn hsva_to_array(hsva: egui::ecolor::Hsva) -> [f32; 4] {
     [hsva.h, hsva.s, hsva.v, hsva.a]
+}
+
+/// 去掉悬浮窗的 DWM 投影。返回是否成功找到窗口。
+#[cfg(windows)]
+fn disable_overlay_shadow() -> bool {
+    use std::ffi::c_void;
+    use windows::core::PCWSTR;
+    use windows::Win32::Graphics::Dwm::{
+        DwmSetWindowAttribute, DWMNCRP_DISABLED, DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE,
+        DWMWA_NCRENDERING_POLICY, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, GetWindowThreadProcessId};
+
+    let title: Vec<u16> = "打坐计时"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        let Ok(hwnd) = FindWindowW(None, PCWSTR(title.as_ptr())) else {
+            return false;
+        };
+        // 同名窗口可能属于上一个实例，确认是本进程再改。
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        if pid != std::process::id() {
+            return false;
+        }
+        let policy = DWMNCRP_DISABLED;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_NCRENDERING_POLICY,
+            &policy as *const _ as *const c_void,
+            std::mem::size_of_val(&policy) as u32,
+        )
+        .is_ok();
+        // Win11 默认给窗口加圆角和细边框，背景全透明时看得到一圈描边；一并关掉。
+        // 这两个属性在 Win10 上会返回失败，忽略即可。
+        let corner = DWMWCP_DONOTROUND;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            &corner as *const _ as *const c_void,
+            std::mem::size_of_val(&corner) as u32,
+        );
+        let border = DWMWA_COLOR_NONE;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_BORDER_COLOR,
+            &border as *const _ as *const c_void,
+            std::mem::size_of_val(&border) as u32,
+        );
+        true
+    }
 }
 
 fn draw_flight_flag_marker(

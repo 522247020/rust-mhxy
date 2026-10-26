@@ -66,6 +66,25 @@ fn load_font(path: &std::path::Path) -> Option<&'static [u8]> {
     Some(Box::leak(bytes.into_boxed_slice()))
 }
 
+/// 系统里是否找到了可用的粗体中文字体。
+static BOLD_FONT_AVAILABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// 悬浮窗等地方用真实粗体；没有粗体字体时退回叠加绘制。
+pub fn has_bold_font() -> bool {
+    BOLD_FONT_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 粗体中文字体，找不到时退回普通字体。
+const BOLD_CANDIDATES: &[&str] = &[
+    "C:/Windows/Fonts/msyhbd.ttc",
+    "C:/Windows/Fonts/msyhbd.ttf",
+    "C:/Windows/Fonts/simhei.ttf",
+    "/usr/share/fonts/noto-cjk/NotoSansCJK-Bold.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+    "/System/Library/Fonts/PingFang.ttc",
+];
+
 /// egui 自带的字体没有中文字形，这里从系统里找一个 CJK 字体装上。
 fn install_fonts(ctx: &egui::Context) {
     const CANDIDATES: &[&str] = &[
@@ -106,12 +125,76 @@ fn install_fonts(ctx: &egui::Context) {
         .entry(egui::FontFamily::Monospace)
         .or_default()
         .push("cjk".to_owned());
+
+    // 粗体单独做成 "bold" 字体族：有系统粗体就用它，否则指向普通字体，
+    // 调用方再决定要不要叠加绘制。
+    let bold = BOLD_CANDIDATES
+        .iter()
+        .find_map(|path| load_font(std::path::Path::new(path)));
+    let bold_name = match bold {
+        Some(bytes) => {
+            fonts.font_data.insert(
+                "cjk_bold".to_owned(),
+                Arc::new(egui::FontData::from_static(bytes)),
+            );
+            BOLD_FONT_AVAILABLE.store(true, std::sync::atomic::Ordering::Relaxed);
+            "cjk_bold".to_owned()
+        }
+        None => "cjk".to_owned(),
+    };
+    let mut bold_family = vec![bold_name];
+    bold_family.extend(
+        fonts
+            .families
+            .get(&egui::FontFamily::Proportional)
+            .cloned()
+            .unwrap_or_default(),
+    );
+    fonts
+        .families
+        .insert(egui::FontFamily::Name("bold".into()), bold_family);
+
     ctx.set_fonts(fonts);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 系统有粗体字体时，`bold` 字体族必须比常规字体更宽。
+    #[test]
+    fn bold_family_uses_real_bold_font_when_available() {
+        let ctx = egui::Context::default();
+        install_fonts(&ctx);
+        let mut output = ctx.run_ui(Default::default(), |_ui| {});
+        output.textures_delta.clear();
+        if !has_bold_font() {
+            eprintln!("系统没有可用的粗体中文字体，跳过");
+            return;
+        }
+        let regular = ctx.fonts_mut(|fonts| {
+            fonts
+                .layout_no_wrap(
+                    "180".into(),
+                    egui::FontId::proportional(60.0),
+                    egui::Color32::WHITE,
+                )
+                .size()
+        });
+        let bold = ctx.fonts_mut(|fonts| {
+            fonts
+                .layout_no_wrap(
+                    "180".into(),
+                    egui::FontId::new(60.0, egui::FontFamily::Name("bold".into())),
+                    egui::Color32::WHITE,
+                )
+                .size()
+        });
+        assert!(
+            bold.x > regular.x,
+            "粗体应比常规字体更宽：regular={regular:?} bold={bold:?}"
+        );
+    }
 
     /// 字体改成零拷贝加载后，中文字形必须仍然可用。
     #[test]
