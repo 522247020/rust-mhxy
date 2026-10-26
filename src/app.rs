@@ -1113,7 +1113,12 @@ impl MhxyApp {
     }
 
     fn poll_hotkey(&mut self) {
+        let mut pressed = false;
         while self.hotkey_rx.try_recv().is_ok() {
+            pressed = true;
+        }
+        if pressed {
+            self.log("全局快捷键触发");
             self.manual_trigger();
         }
     }
@@ -3960,7 +3965,7 @@ impl eframe::App for MhxyApp {
         // 打坐计时不依赖识别是否在跑，每帧都同步一次（失败会按 5 秒间隔重试）。
         self.sync_meditation_hotkey();
         // 非 Windows 或全局注册失败时，窗口聚焦也能用快捷键。
-        if self.running && self.manual_mode() && self.hotkey_listener.is_none() && !self.busy {
+        if self.running && self.hotkey_listener.is_none() && !self.busy {
             if let Ok(hotkey) = Hotkey::parse(&self.config.ocr_hotkey) {
                 if hotkey.matches_egui(&ctx) {
                     self.manual_trigger();
