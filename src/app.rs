@@ -1651,15 +1651,27 @@ impl MhxyApp {
     fn flight_flag_style_ui(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
             ui.label("标注样式");
-            let mut background = color32_from_rgba(self.flight_flags.style.background);
-            if ui.color_edit_button_srgba(&mut background).changed() {
-                self.flight_flags.style.background = rgba_from_color32(background);
+            let mut background = hsva_for_blend_picker(
+                self.flight_flags.style.background,
+                self.flight_flags.style.background_normal_alpha,
+            );
+            if ui.color_edit_button_hsva(&mut background).changed() {
+                let (color, normal_alpha) =
+                    split_blend_alpha(background, self.flight_flags.style.background_normal_alpha);
+                self.flight_flags.style.background = hsva_to_array(color);
+                self.flight_flags.style.background_normal_alpha = normal_alpha;
                 self.save_flight_flags();
             }
             ui.label("背景");
-            let mut text = color32_from_rgba(self.flight_flags.style.text);
-            if ui.color_edit_button_srgba(&mut text).changed() {
-                self.flight_flags.style.text = rgba_from_color32(text);
+            let mut text = hsva_for_blend_picker(
+                self.flight_flags.style.text,
+                self.flight_flags.style.text_normal_alpha,
+            );
+            if ui.color_edit_button_hsva(&mut text).changed() {
+                let (color, normal_alpha) =
+                    split_blend_alpha(text, self.flight_flags.style.text_normal_alpha);
+                self.flight_flags.style.text = hsva_to_array(color);
+                self.flight_flags.style.text_normal_alpha = normal_alpha;
                 self.save_flight_flags();
             }
             ui.label("文字");
@@ -4038,12 +4050,41 @@ fn region_fields(
 /// 取点窗口的默认尺寸。
 const REGION_WINDOW_SIZE: Vec2 = Vec2::new(1000.0, 820.0);
 
-fn color32_from_rgba(rgba: [u8; 4]) -> Color32 {
-    Color32::from_rgba_unmultiplied(rgba[0], rgba[1], rgba[2], rgba[3])
+fn hsva_for_blend_picker([h, s, v, a]: [f32; 4], normal_alpha: f32) -> egui::ecolor::Hsva {
+    let additive = a.is_sign_negative();
+    let alpha = if additive {
+        -1.0
+    } else {
+        normal_alpha.max(f32::MIN_POSITIVE)
+    };
+    egui::ecolor::Hsva::new(h, s, v, alpha)
 }
 
-fn rgba_from_color32(color: Color32) -> [u8; 4] {
-    [color.r(), color.g(), color.b(), color.a()]
+fn split_blend_alpha(
+    mut hsva: egui::ecolor::Hsva,
+    previous_normal_alpha: f32,
+) -> (egui::ecolor::Hsva, f32) {
+    let additive = hsva.a.is_sign_negative();
+    let normal_alpha = if additive {
+        previous_normal_alpha
+    } else {
+        hsva.a
+    };
+    hsva.a = if additive { -1.0 } else { normal_alpha };
+    (hsva, normal_alpha)
+}
+
+fn marker_color([h, s, v, a]: [f32; 4], normal_alpha: f32) -> Color32 {
+    let alpha = if a.is_sign_negative() {
+        1.0
+    } else {
+        normal_alpha
+    };
+    Color32::from(egui::ecolor::Hsva::new(h, s, v, alpha))
+}
+
+fn hsva_to_array(hsva: egui::ecolor::Hsva) -> [f32; 4] {
+    [hsva.h, hsva.s, hsva.v, hsva.a]
 }
 
 fn draw_flight_flag_marker(
@@ -4053,19 +4094,19 @@ fn draw_flight_flag_marker(
     selected: bool,
     style: FlightFlagStyle,
 ) {
-    let radius = f32::from(style.size) * 0.5;
-    painter.circle_filled(center, radius, color32_from_rgba(style.background));
-    painter.circle_stroke(
+    // 只画背景圆和文字，不再描边；选中时稍微放大一点做区分。
+    let radius = f32::from(style.size) * 0.5 + if selected { 2.0 } else { 0.0 };
+    painter.circle_filled(
         center,
         radius,
-        egui::Stroke::new(if selected { 3.0 } else { 2.0 }, Color32::WHITE),
+        marker_color(style.background, style.background_normal_alpha),
     );
     painter.text(
         center,
         Align2::CENTER_CENTER,
         number.to_string(),
         FontId::proportional((f32::from(style.size) * 0.65).max(9.0)),
-        color32_from_rgba(style.text),
+        marker_color(style.text, style.text_normal_alpha),
     );
 }
 
@@ -4280,6 +4321,37 @@ mod tests {
     }
 
     #[test]
+    fn blend_mode_switching_preserves_normal_alpha_and_additive_markers_are_opaque() {
+        let normal = hsva_for_blend_picker([0.2, 0.5, 0.7, 0.0], 0.0);
+        assert_eq!(normal.a, f32::MIN_POSITIVE);
+        let mut normal_for_picker = hsva_for_blend_picker(hsva_to_array(normal), 0.4);
+        assert!(normal_for_picker.a > 0.0);
+        assert_eq!(normal_for_picker.a, 0.4);
+
+        normal_for_picker.a = -normal_for_picker.a.abs();
+        let (additive, remembered_alpha) = split_blend_alpha(normal_for_picker, 0.4);
+        assert!(additive.a.is_sign_negative());
+        assert_eq!(remembered_alpha, 0.4);
+        let additive_color = marker_color(hsva_to_array(additive), remembered_alpha);
+        assert_eq!(additive_color.a(), 255);
+
+        let mut switched_to_normal = additive;
+        switched_to_normal.a = remembered_alpha;
+        let (back_to_normal, restored_alpha) =
+            split_blend_alpha(switched_to_normal, remembered_alpha);
+        assert!(!back_to_normal.a.is_sign_negative());
+        assert_eq!(restored_alpha, 0.4);
+        assert_eq!(back_to_normal.a, 0.4);
+        let normal_color = marker_color(hsva_to_array(back_to_normal), restored_alpha);
+        assert_eq!(normal_color.a(), 102);
+
+        let nonzero = hsva_for_blend_picker([0.2, 0.5, 0.7, 0.25], 0.25);
+        assert_eq!(nonzero.a, 0.25);
+        let opaque_additive = hsva_for_blend_picker(hsva_to_array(additive), remembered_alpha);
+        assert_eq!(opaque_additive.a, -1.0);
+    }
+
+    #[test]
     fn flight_flag_editor_lists_supported_maps_and_local_file() {
         let mut app = app();
         let ctx = app.ctx.clone();
@@ -4312,6 +4384,19 @@ mod tests {
         assert!(texts
             .iter()
             .any(|text| text == "先新建一面合成旗，再点击地图添加点位"));
+        // 标注样式只保留背景和文字颜色，不再提供边框。
+        assert!(
+            texts.iter().any(|text| text == "背景"),
+            "样式区应保留背景颜色：{texts:?}"
+        );
+        assert!(
+            texts.iter().any(|text| text == "文字"),
+            "样式区应保留文字颜色：{texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|text| text == "边框"),
+            "合成旗标注不再有边框设置：{texts:?}"
+        );
     }
 
     #[test]

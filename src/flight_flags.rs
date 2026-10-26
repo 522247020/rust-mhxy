@@ -20,24 +20,55 @@ pub struct CompositeFlag {
     pub points: Vec<FlightPoint>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
 pub struct FlightFlagStyle {
-    pub background: [u8; 4],
-    pub text: [u8; 4],
+    pub background: [f32; 4],
+    #[serde(default = "opaque_alpha")]
+    pub background_normal_alpha: f32,
+    pub text: [f32; 4],
+    #[serde(default = "opaque_alpha")]
+    pub text_normal_alpha: f32,
     pub size: u8,
+}
+
+fn opaque_alpha() -> f32 {
+    1.0
 }
 
 impl Default for FlightFlagStyle {
     fn default() -> Self {
         Self {
-            background: [13, 148, 160, 255],
-            text: [255, 255, 255, 255],
+            background: [0.5, 0.0, 0.0, 1.0],
+            background_normal_alpha: 1.0,
+            text: [0.0, 0.0, 1.0, 1.0],
+            text_normal_alpha: 1.0,
             size: 20,
         }
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+impl FlightFlagStyle {
+    fn migrate_legacy_rgba(&mut self) {
+        if self.background.iter().any(|channel| *channel > 1.0) {
+            self.background = [
+                self.background[0] / 255.0,
+                self.background[1] / 255.0,
+                self.background[2] / 255.0,
+                1.0,
+            ];
+        }
+        if self.text.iter().any(|channel| *channel > 1.0) {
+            self.text = [
+                self.text[0] / 255.0,
+                self.text[1] / 255.0,
+                self.text[2] / 255.0,
+                1.0,
+            ];
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct FlightFlags {
     #[serde(default)]
     pub maps: BTreeMap<String, Vec<CompositeFlag>>,
@@ -183,6 +214,7 @@ impl FlightFlags {
     }
 
     fn normalize(&mut self) {
+        self.style.migrate_legacy_rgba();
         if let Some(flags) = self.maps.remove("朱子国") {
             self.maps
                 .entry("朱紫国".to_string())
@@ -305,8 +337,10 @@ mod tests {
         ));
         let flags = FlightFlags {
             style: FlightFlagStyle {
-                background: [20, 40, 60, 180],
-                text: [240, 220, 200, 255],
+                background: [0.8, 0.7, 0.6, -1.0],
+                background_normal_alpha: 0.35,
+                text: [0.2, 0.3, 0.4, 0.65],
+                text_normal_alpha: 0.65,
                 size: 32,
             },
             ..FlightFlags::default()
@@ -315,8 +349,18 @@ mod tests {
         assert_eq!(FlightFlags::load(&path).unwrap().style, flags.style);
         let _ = std::fs::remove_file(path);
 
-        let legacy: FlightFlags = serde_json::from_str(r#"{"maps":{}}"#).unwrap();
-        assert_eq!(legacy.style, FlightFlagStyle::default());
+        let legacy: FlightFlags = serde_json::from_str(
+            r#"{"maps":{},"style":{"background":[13,148,160,255],"text":[255,255,255,255],"size":20}}"#,
+        )
+        .unwrap();
+        let mut legacy_style = legacy.style;
+        legacy_style.migrate_legacy_rgba();
+        assert_eq!(
+            legacy_style.background,
+            [13.0 / 255.0, 148.0 / 255.0, 160.0 / 255.0, 1.0]
+        );
+        assert_eq!(legacy_style.text, [1.0; 4]);
+        assert_eq!(legacy_style.size, FlightFlagStyle::default().size);
     }
 
     #[test]
