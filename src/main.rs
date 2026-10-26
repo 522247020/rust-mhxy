@@ -6,6 +6,7 @@ mod app;
 mod capture;
 mod config;
 mod core;
+mod flight_flags;
 mod gate;
 mod hotkey;
 mod ocr;
