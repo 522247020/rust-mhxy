@@ -1264,7 +1264,7 @@ impl MhxyApp {
                 #[cfg(windows)]
                 if self.meditation_shadow_attempts < 30 {
                     self.meditation_shadow_attempts += 1;
-                    if disable_overlay_shadow() {
+                    if prepare_overlay_window() {
                         self.meditation_shadow_attempts = 30;
                     }
                 }
@@ -1305,7 +1305,8 @@ impl MhxyApp {
                 let painter = ui.painter();
                 let alpha = (self.config.meditation_opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
                 // 窗口按最长文字定尺寸，每一帧的背景按当前文字收紧并居中。
-                let background = Rect::from_center_size(rect.center(), capsule.min(size));
+                let background =
+                    Rect::from_center_size(rect.center(), capsule.min(size)).expand(1.0);
                 painter.rect_filled(
                     background,
                     CornerRadius::ZERO,
@@ -3818,7 +3819,7 @@ impl eframe::App for MhxyApp {
     /// 留下一层底色，窗口比绘制区域多出 1px 时就会表现为一条顶边线。
     /// 主窗口每个区域都有面板覆盖，alpha 为 0 不会露出黑色。
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        egui::Color32::from_rgba_unmultiplied(12, 12, 12, 0).to_normalized_gamma_f32()
+        [0.0, 0.0, 0.0, 0.0]
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -4606,16 +4607,21 @@ fn hsva_to_array(hsva: egui::ecolor::Hsva) -> [f32; 4] {
     [hsva.h, hsva.s, hsva.v, hsva.a]
 }
 
-/// 去掉悬浮窗的 DWM 投影。返回是否成功找到窗口。
+/// 修饰悬浮窗：去掉边框样式和 DWM 投影。返回是否成功找到窗口。
 #[cfg(windows)]
-fn disable_overlay_shadow() -> bool {
+fn prepare_overlay_window() -> bool {
     use std::ffi::c_void;
     use windows::core::PCWSTR;
     use windows::Win32::Graphics::Dwm::{
         DwmSetWindowAttribute, DWMNCRP_DISABLED, DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE,
         DWMWA_NCRENDERING_POLICY, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND,
     };
-    use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, GetWindowThreadProcessId};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        FindWindowW, GetWindowLongPtrW, GetWindowThreadProcessId, SetWindowLongPtrW, SetWindowPos,
+        GWL_EXSTYLE, GWL_STYLE, SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WS_BORDER,
+        WS_CAPTION, WS_DLGFRAME, WS_EX_TOOLWINDOW, WS_EX_WINDOWEDGE, WS_POPUP, WS_SYSMENU,
+        WS_THICKFRAME,
+    };
 
     let title: Vec<u16> = "打坐计时"
         .encode_utf16()
@@ -4631,16 +4637,36 @@ fn disable_overlay_shadow() -> bool {
         if pid != std::process::id() {
             return false;
         }
+
+        // winit 会给无边框窗口保留 WS_EX_WINDOWEDGE（3D 边框）和若干 frame 样式。
+        // Win11 上这会在背景全透明时留下一条顶边线，这里全部清掉。
+        let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
+        let style = (style
+            & !(WS_CAPTION.0 | WS_THICKFRAME.0 | WS_BORDER.0 | WS_DLGFRAME.0 | WS_SYSMENU.0))
+            | WS_POPUP.0;
+        SetWindowLongPtrW(hwnd, GWL_STYLE, style as isize);
+        let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+        let ex_style = (ex_style & !WS_EX_WINDOWEDGE.0) | WS_EX_TOOLWINDOW.0;
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex_style as isize);
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
+        );
+
+        // Win11 默认还会画一圈阴影和圆角，背景全透明时看得到。
+        // 这两个属性在 Win10 上会返回失败，忽略即可。
         let policy = DWMNCRP_DISABLED;
         let _ = DwmSetWindowAttribute(
             hwnd,
             DWMWA_NCRENDERING_POLICY,
             &policy as *const _ as *const c_void,
             std::mem::size_of_val(&policy) as u32,
-        )
-        .is_ok();
-        // Win11 默认给窗口加圆角和细边框，背景全透明时看得到一圈描边；一并关掉。
-        // 这两个属性在 Win10 上会返回失败，忽略即可。
+        );
         let corner = DWMWCP_DONOTROUND;
         let _ = DwmSetWindowAttribute(
             hwnd,
