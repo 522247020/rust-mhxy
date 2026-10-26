@@ -6,7 +6,7 @@ use crate::core::{
     map_coordinate, map_point, map_rect, parse_tasks, MapDefinition, TaskFilter, TaskLocation,
     HIGH_CHANCE_SIZE, MAP_COORDINATE_TOLERANCE,
 };
-use crate::flight_flags::{self, FlightFlags, FlightPoint, SUPPORTED_MAPS};
+use crate::flight_flags::{self, FlightFlagStyle, FlightFlags, FlightPoint, SUPPORTED_MAPS};
 use crate::gate::{self, ColorPoint, GateMode};
 use crate::hotkey::{self, GlobalHotkey, Hotkey};
 use crate::ocr::{self, LocalWorker, OcrEvent, OcrText};
@@ -1575,6 +1575,8 @@ impl MhxyApp {
         if self.flight_flag_index >= flag_names.len() && !flag_names.is_empty() {
             self.flight_flag_index = flag_names.len() - 1;
         }
+        self.flight_flag_style_ui(ui);
+
         ui.horizontal_wrapped(|ui| {
             ui.label("当前合成旗");
             for (index, name) in flag_names.iter().enumerate() {
@@ -1646,6 +1648,32 @@ impl MhxyApp {
         }
     }
 
+    fn flight_flag_style_ui(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            ui.label("标注样式");
+            let mut background = color32_from_rgba(self.flight_flags.style.background);
+            if ui.color_edit_button_srgba(&mut background).changed() {
+                self.flight_flags.style.background = rgba_from_color32(background);
+                self.save_flight_flags();
+            }
+            ui.label("背景");
+            let mut text = color32_from_rgba(self.flight_flags.style.text);
+            if ui.color_edit_button_srgba(&mut text).changed() {
+                self.flight_flags.style.text = rgba_from_color32(text);
+                self.save_flight_flags();
+            }
+            ui.label("文字");
+            let mut size = f32::from(self.flight_flags.style.size);
+            if ui
+                .add(egui::Slider::new(&mut size, 12.0..=40.0).text("大小"))
+                .changed()
+            {
+                self.flight_flags.style.size = size.round() as u8;
+                self.save_flight_flags();
+            }
+        });
+    }
+
     fn flight_flag_map_editor(
         &mut self,
         ui: &mut egui::Ui,
@@ -1690,6 +1718,7 @@ impl MhxyApp {
                         ),
                         flag_index + 1,
                         flag_index == self.flight_flag_index,
+                        self.flight_flags.style,
                     );
                 }
             }
@@ -1878,7 +1907,13 @@ impl MhxyApp {
                     texture_size.x,
                     texture_size.y,
                 ) {
-                    draw_flight_flag_marker(&painter, to_screen(point), flag_index + 1, false);
+                    draw_flight_flag_marker(
+                        &painter,
+                        to_screen(point),
+                        flag_index + 1,
+                        false,
+                        self.flight_flags.style,
+                    );
                 }
             }
         }
@@ -4003,29 +4038,34 @@ fn region_fields(
 /// 取点窗口的默认尺寸。
 const REGION_WINDOW_SIZE: Vec2 = Vec2::new(1000.0, 820.0);
 
+fn color32_from_rgba(rgba: [u8; 4]) -> Color32 {
+    Color32::from_rgba_unmultiplied(rgba[0], rgba[1], rgba[2], rgba[3])
+}
+
+fn rgba_from_color32(color: Color32) -> [u8; 4] {
+    [color.r(), color.g(), color.b(), color.a()]
+}
+
 fn draw_flight_flag_marker(
     painter: &egui::Painter,
     center: egui::Pos2,
     number: usize,
     selected: bool,
+    style: FlightFlagStyle,
 ) {
-    let fill = if selected {
-        Color32::from_rgb(9, 111, 121)
-    } else {
-        Color32::from_rgb(13, 148, 160)
-    };
-    painter.circle_filled(center, 10.0, fill);
+    let radius = f32::from(style.size) * 0.5;
+    painter.circle_filled(center, radius, color32_from_rgba(style.background));
     painter.circle_stroke(
         center,
-        10.0,
+        radius,
         egui::Stroke::new(if selected { 3.0 } else { 2.0 }, Color32::WHITE),
     );
     painter.text(
         center,
         Align2::CENTER_CENTER,
         number.to_string(),
-        FontId::proportional(13.0),
-        Color32::WHITE,
+        FontId::proportional((f32::from(style.size) * 0.65).max(9.0)),
+        color32_from_rgba(style.text),
     );
 }
 

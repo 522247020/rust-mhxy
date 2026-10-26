@@ -20,10 +20,29 @@ pub struct CompositeFlag {
     pub points: Vec<FlightPoint>,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct FlightFlagStyle {
+    pub background: [u8; 4],
+    pub text: [u8; 4],
+    pub size: u8,
+}
+
+impl Default for FlightFlagStyle {
+    fn default() -> Self {
+        Self {
+            background: [13, 148, 160, 255],
+            text: [255, 255, 255, 255],
+            size: 20,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct FlightFlags {
     #[serde(default)]
     pub maps: BTreeMap<String, Vec<CompositeFlag>>,
+    #[serde(default)]
+    pub style: FlightFlagStyle,
 }
 
 #[derive(Deserialize)]
@@ -45,6 +64,7 @@ impl FlightFlags {
                 let legacy: LegacyFlightFlags = serde_json::from_str(&text)
                     .map_err(|_| format!("飞行旗配置格式错误：{current_error}"))?;
                 Self {
+                    style: FlightFlagStyle::default(),
                     maps: legacy
                         .maps
                         .into_iter()
@@ -275,6 +295,28 @@ mod tests {
         assert_eq!(flags.flags_for("长寿村")[0].name, "合成旗 1");
         assert_eq!(flags.flags_for("长寿村")[0].points.len(), 2);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn style_settings_round_trip_and_legacy_files_use_defaults() {
+        let path = std::env::temp_dir().join(format!(
+            "rust-mhxy-flight-flags-style-{}.json",
+            std::process::id()
+        ));
+        let flags = FlightFlags {
+            style: FlightFlagStyle {
+                background: [20, 40, 60, 180],
+                text: [240, 220, 200, 255],
+                size: 32,
+            },
+            ..FlightFlags::default()
+        };
+        flags.save(&path).unwrap();
+        assert_eq!(FlightFlags::load(&path).unwrap().style, flags.style);
+        let _ = std::fs::remove_file(path);
+
+        let legacy: FlightFlags = serde_json::from_str(r#"{"maps":{}}"#).unwrap();
+        assert_eq!(legacy.style, FlightFlagStyle::default());
     }
 
     #[test]

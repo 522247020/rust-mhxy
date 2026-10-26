@@ -1,5 +1,6 @@
 /target
 /config.json
+/flight_flags.json
 *.tmp
 /dist
 /.ort-cache
