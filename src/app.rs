@@ -146,6 +146,9 @@ pub struct MhxyApp {
     hotkey_rx: Receiver<()>,
     hotkey_listener: Option<GlobalHotkey>,
     hotkey_attempted: Option<String>,
+    /// 最近一次 OCR 快捷键注册失败的原因。
+    hotkey_error: Option<String>,
+    hotkey_tried_at: Option<Instant>,
     recording_hotkey: bool,
     last_manual_trigger: Option<Instant>,
     logs: Vec<String>,
@@ -292,6 +295,8 @@ impl MhxyApp {
             hotkey_rx,
             hotkey_listener: None,
             hotkey_attempted: None,
+            hotkey_error: None,
+            hotkey_tried_at: None,
             recording_hotkey: false,
             last_manual_trigger: None,
             logs: Vec::new(),
@@ -689,6 +694,7 @@ impl MhxyApp {
             self.invalidate_scan();
             self.hotkey_listener = None;
             self.hotkey_attempted = None;
+            self.hotkey_error = None;
             self.log(if self.manual_mode() {
                 "已停止监听快捷键"
             } else {
@@ -1092,7 +1098,8 @@ impl MhxyApp {
 
     /// 快捷键 / 「识别一次」触发：手动模式下一次只识别一次，忽略图色门控。
     fn manual_trigger(&mut self) {
-        if !self.running || !self.manual_mode() || self.busy {
+        // 自动模式下手动按快捷键也强制识别一次，不用先切到手动模式。
+        if !self.running || self.busy {
             return;
         }
         if let Some(last) = self.last_manual_trigger {
@@ -1158,7 +1165,7 @@ impl MhxyApp {
         };
         // 先释放旧的，避免同一个键重复注册。
         self.meditation_hotkey_listener = None;
-        match hotkey::spawn(hotkey, self.meditation_hotkey_tx.clone()) {
+        match hotkey::spawn(hotkey, 2, self.meditation_hotkey_tx.clone()) {
             Ok(listener) => {
                 self.meditation_hotkey_listener = Some(listener);
                 self.meditation_hotkey_error = None;
@@ -1524,7 +1531,9 @@ impl MhxyApp {
 
     /// 按当前运行状态 / 模式 / 快捷键字符串同步全局快捷键注册。
     fn sync_hotkey(&mut self) {
-        let desired = if self.running && self.manual_mode() {
+        // 只要在运行就注册（自动模式下手动按一下也会立即识别一次），
+        // 不再依赖「手动模式」开关，避免切模式后忘记重新注册。
+        let desired = if self.running {
             Hotkey::parse(&self.config.ocr_hotkey)
                 .ok()
                 .map(|hotkey| (hotkey, hotkey.display()))
@@ -1532,22 +1541,36 @@ impl MhxyApp {
             None
         };
         let desired_label = desired.as_ref().map(|(_, label)| label.clone());
-        if desired_label == self.hotkey_attempted {
-            return;
+        let changed = desired_label != self.hotkey_attempted;
+        if !changed {
+            if self.hotkey_listener.is_some() || !self.running {
+                return;
+            }
+            // 注册失败后每 5 秒重试一次，避免被其他程序临时占用后一直无效。
+            if self
+                .hotkey_tried_at
+                .is_some_and(|at| at.elapsed() < Duration::from_secs(5))
+            {
+                return;
+            }
         }
         self.hotkey_attempted = desired_label;
+        self.hotkey_tried_at = Some(Instant::now());
         self.hotkey_listener = None;
         let Some((hotkey, label)) = desired else {
+            self.hotkey_error = None;
             return;
         };
-        match hotkey::spawn(hotkey, self.hotkey_tx.clone()) {
+        match hotkey::spawn(hotkey, 1, self.hotkey_tx.clone()) {
             Ok(listener) => {
                 self.hotkey_listener = Some(listener);
+                self.hotkey_error = None;
                 self.log_detail(format!("已注册全局快捷键：{label}"));
             }
             Err(err) => {
                 self.hotkey_listener = None;
-                self.log_detail(format!("{err}，窗口聚焦时仍可使用 {label}"));
+                self.log(err.clone());
+                self.hotkey_error = Some(err);
             }
         }
     }
@@ -2577,10 +2600,17 @@ impl MhxyApp {
                             Ok(hotkey) => {
                                 let status = if self.hotkey_listener.is_some() {
                                     "全局快捷键已注册"
-                                } else if self.running {
-                                    "窗口聚焦时可用"
-                                } else {
+                                } else if !self.running {
                                     "开始监听后生效"
+                                } else if let Some(err) = &self.hotkey_error {
+                                    err.as_str()
+                                } else {
+                                    "正在注册…"
+                                };
+                                let color = if self.hotkey_listener.is_some() {
+                                    theme::muted()
+                                } else {
+                                    theme::gold()
                                 };
                                 ui.label(
                                     egui::RichText::new(format!(
@@ -2588,7 +2618,7 @@ impl MhxyApp {
                                         hotkey.display()
                                     ))
                                     .small()
-                                    .weak(),
+                                    .color(color),
                                 );
                             }
                             Err(err) => {
@@ -5032,6 +5062,33 @@ mod tests {
         assert!(
             app.meditation.remaining() > Duration::from_secs(170),
             "重新开始后剩余时间应接近完整时长"
+        );
+    }
+
+    #[test]
+    fn ocr_hotkey_registers_while_running_in_auto_mode() {
+        let mut app = app();
+        app.config.trigger_mode = "auto".into();
+        app.config.ocr_hotkey = "Ctrl+Alt+F23".into();
+        app.running = true;
+        let ctx = app.ctx.clone();
+        let mut frame = eframe::Frame::_new_kittest();
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1120.0, 800.0))),
+                ..Default::default()
+            },
+            |ui| app.ui(ui, &mut frame),
+        );
+        output.textures_delta.clear();
+        assert_eq!(
+            app.hotkey_attempted.as_deref(),
+            Some("Ctrl+Alt+F23"),
+            "自动模式下运行中也要注册手动识别快捷键"
+        );
+        assert!(
+            app.hotkey_listener.is_some() || app.hotkey_error.is_some(),
+            "不能停在未注册也没有错误的状态"
         );
     }
 

@@ -396,14 +396,17 @@ pub struct GlobalHotkey {
 }
 
 /// 注册全局快捷键（目前仅 Windows）。成功时按下快捷键会向 `sender` 发送事件。
-pub fn spawn(hotkey: Hotkey, sender: Sender<()>) -> Result<GlobalHotkey, String> {
+///
+/// `id` 用来区分同一进程里的多个快捷键：WM_HOTKEY 只带 id，
+/// 每个监听线程各自用不同的 id，避免以后改成共享消息队列时互相覆盖。
+pub fn spawn(hotkey: Hotkey, id: i32, sender: Sender<()>) -> Result<GlobalHotkey, String> {
     #[cfg(windows)]
     {
-        windows_impl::spawn(hotkey, sender)
+        windows_impl::spawn(hotkey, id, sender)
     }
     #[cfg(not(windows))]
     {
-        let _ = (hotkey, sender);
+        let _ = (hotkey, id, sender);
         Err("全局快捷键目前仅支持 Windows".to_string())
     }
 }
@@ -424,7 +427,7 @@ mod windows_impl {
         GetMessageW, PeekMessageW, PostThreadMessageW, MSG, PM_NOREMOVE, WM_HOTKEY, WM_QUIT,
     };
 
-    pub fn spawn(hotkey: Hotkey, sender: Sender<()>) -> Result<GlobalHotkey, String> {
+    pub fn spawn(hotkey: Hotkey, id: i32, sender: Sender<()>) -> Result<GlobalHotkey, String> {
         let (ready_tx, ready_rx) = channel::<Result<u32, String>>();
         let handle = thread::spawn(move || unsafe {
             // 先创建线程消息队列，RegisterHotKey(NULL) 的 WM_HOTKEY 会投递到这里。
@@ -444,7 +447,7 @@ mod windows_impl {
             if hotkey.win {
                 bits |= MOD_WIN.0;
             }
-            if let Err(err) = RegisterHotKey(None, 1, HOT_KEY_MODIFIERS(bits), hotkey.key.vk()) {
+            if let Err(err) = RegisterHotKey(None, id, HOT_KEY_MODIFIERS(bits), hotkey.key.vk()) {
                 let _ = ready_tx.send(Err(format!("注册全局快捷键失败：{err}")));
                 return;
             }
@@ -461,7 +464,7 @@ mod windows_impl {
                     let _ = sender.send(());
                 }
             }
-            let _ = UnregisterHotKey(None, 1);
+            let _ = UnregisterHotKey(None, id);
         });
 
         match ready_rx.recv_timeout(Duration::from_secs(3)) {
