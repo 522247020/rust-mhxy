@@ -311,17 +311,10 @@ pub fn is_newer(candidate: &str, current: &str) -> bool {
     }
 }
 
-/// 生成更新脚本，等待本进程退出后解压覆盖并重启。仅 Windows 可用。
-#[cfg(windows)]
-pub fn apply_and_restart(zip: &Path) -> Result<(), String> {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
-    let exe = std::env::current_exe().map_err(|err| format!("无法定位程序：{err}"))?;
-    let install_dir = exe.parent().ok_or_else(|| "无法定位程序目录".to_string())?;
-    let script = update_dir().join("update.ps1");
-    // Windows PowerShell 5.1 需要 BOM 才能正确识别 UTF-8 路径。
-    let body = r#"param([int]$TargetPid, [string]$Zip, [string]$InstallDir, [string]$Exe)
+/// 更新脚本：等待本进程退出后解压覆盖，确认新版本真的跑起来再清理安装包。
+/// 单独抽出来是为了在非 Windows 上也能断言脚本里的步骤顺序。
+#[cfg(any(windows, test))]
+const UPDATE_SCRIPT: &str = r#"param([int]$TargetPid, [string]$Zip, [string]$InstallDir, [string]$Exe)
 $ErrorActionPreference = 'Stop'
 $base = if ($env:LOCALAPPDATA) {
     Join-Path $env:LOCALAPPDATA 'rust-mhxy\updates'
@@ -367,17 +360,30 @@ try {
         if (-not $copied) { throw "覆盖失败：$($item.Name)" }
     }
     Write-Log "已覆盖安装目录：$InstallDir"
-
     Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath $Zip -Force -ErrorAction SilentlyContinue
+
     if (-not (Test-Path -LiteralPath $Exe)) { throw "找不到可执行文件：$Exe" }
-    Start-Process -FilePath $Exe -WorkingDirectory $InstallDir
-    Write-Log "已启动新版本：$Exe"
+
+    # 先启动新版本并确认它没有立刻退出，再删除安装包：
+    # 万一新版本启动失败，安装包还在，可以直接重试安装。
+    $proc = Start-Process -FilePath $Exe -WorkingDirectory $InstallDir -PassThru
+    Start-Sleep -Seconds 3
+    if (-not (Get-Process -Id $proc.Id -ErrorAction SilentlyContinue)) {
+        throw "新版本启动后立即退出（pid=$($proc.Id)），安装包已保留：$Zip"
+    }
+    Write-Log "已启动新版本并确认运行：$Exe (pid=$($proc.Id))"
+
+    Remove-Item -LiteralPath $Zip -Force -ErrorAction SilentlyContinue
+    # 清理以前残留的安装包，只保留当前这一个之外的文件。
+    Get-ChildItem -LiteralPath $base -Filter 'rust-mhxy-*-update.zip' -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName -ne $Zip } |
+        Remove-Item -Force -ErrorAction SilentlyContinue
+    Write-Log "已清理旧安装包"
 } catch {
     Write-Log ("更新失败：" + $_.Exception.Message)
     try {
         Add-Type -AssemblyName PresentationFramework
-        $hint = "自动更新失败：" + $_.Exception.Message + "`n`n日志：" + $log + "`n安装包：" + $Zip + "`n`n可以手动解压覆盖，或把日志发给我。"
+        $hint = "自动更新失败：" + $_.Exception.Message + "`n`n日志：" + $log + "`n安装包：" + $Zip + "`n`n安装包和旧版本都还在，可以重试安装或手动解压覆盖。"
         if ($InstallDir -like '*Program Files*') {
             $hint = $hint + "`n程序装在 Program Files，可能需要用管理员权限运行一次。"
         }
@@ -385,7 +391,18 @@ try {
     } catch {}
 }
 "#;
-    std::fs::write(&script, format!("\u{feff}{body}"))
+
+/// 生成更新脚本，等待本进程退出后解压覆盖并重启。仅 Windows 可用。
+#[cfg(windows)]
+pub fn apply_and_restart(zip: &Path) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let exe = std::env::current_exe().map_err(|err| format!("无法定位程序：{err}"))?;
+    let install_dir = exe.parent().ok_or_else(|| "无法定位程序目录".to_string())?;
+    let script = update_dir().join("update.ps1");
+    // Windows PowerShell 5.1 需要 BOM 才能正确识别 UTF-8 路径。
+    std::fs::write(&script, format!("\u{feff}{UPDATE_SCRIPT}"))
         .map_err(|err| format!("写入更新脚本失败：{err}"))?;
     std::process::Command::new("powershell")
         .args([
@@ -445,6 +462,27 @@ pub fn temp_package(version: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_script_verifies_new_process_before_deleting_package() {
+        let start = UPDATE_SCRIPT.find("Start-Process").expect("应启动新版本");
+        let verify = UPDATE_SCRIPT
+            .find("Get-Process -Id $proc.Id")
+            .expect("应确认新进程仍在运行");
+        let delete = UPDATE_SCRIPT
+            .find("Remove-Item -LiteralPath $Zip -Force")
+            .expect("应清理安装包");
+        assert!(start < verify, "必须先启动再检查进程");
+        assert!(verify < delete, "确认新版本运行后才能删除安装包");
+        assert!(
+            UPDATE_SCRIPT.contains("-PassThru"),
+            "启动时要拿到进程对象才能确认存活"
+        );
+        assert!(
+            UPDATE_SCRIPT.contains("安装包已保留"),
+            "启动失败时要提示安装包仍然保留"
+        );
+    }
 
     #[test]
     fn compares_versions() {
