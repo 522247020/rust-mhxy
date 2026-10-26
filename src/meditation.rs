@@ -40,6 +40,10 @@ impl MeditationTimer {
         }
     }
 
+    pub fn duration_seconds(&self) -> u32 {
+        self.duration.as_secs() as u32
+    }
+
     pub fn state(&self) -> State {
         self.state
     }

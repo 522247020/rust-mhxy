@@ -166,6 +166,8 @@ pub struct MhxyApp {
     meditation_applied_on_top: Option<bool>,
     meditation_applied_passthrough: Option<bool>,
     meditation_applied_size: Option<Vec2>,
+    /// 窗口尺寸的防抖：待应用的尺寸与第一次观察到的时间。
+    meditation_pending_size: Option<(Vec2, Instant)>,
     /// 悬浮窗去阴影的尝试次数；窗口重建后归零重试。
     meditation_shadow_attempts: u8,
     /// 正在录制打坐计时的全局快捷键。
@@ -305,6 +307,7 @@ impl MhxyApp {
             meditation_applied_on_top: None,
             meditation_applied_passthrough: None,
             meditation_applied_size: None,
+            meditation_pending_size: None,
             meditation_shadow_attempts: 0,
             meditation_recording_hotkey: false,
             flight_flags,
@@ -1115,7 +1118,8 @@ impl MhxyApp {
             pressed = true;
         }
         if pressed {
-            self.meditation.toggle();
+            // 快捷键和原版一致：开始 / 重新计时；暂停、继续请点悬浮窗或设置里的按钮。
+            self.meditation.restart();
         }
     }
 
@@ -1168,7 +1172,11 @@ impl MhxyApp {
         }
     }
 
-    fn meditation_layout(&self, ctx: &egui::Context) -> (String, FontId, Color32, Vec2) {
+    /// 悬浮窗的文字、字体、胶囊尺寸和窗口尺寸。
+    ///
+    /// 窗口按「最宽的那一帧文字」定尺寸，倒计时数字变化时不需要重建窗口；
+    /// 胶囊按当前文字收紧，多余部分是透明的。
+    fn meditation_layout(&self, ctx: &egui::Context) -> (String, FontId, Color32, Vec2, Vec2) {
         let font_px = if self.config.meditation_font_px == 0 {
             24.0
         } else {
@@ -1183,42 +1191,59 @@ impl MhxyApp {
             egui::FontFamily::Proportional
         };
         let font = FontId::new(font_px, family);
-        let galley = ctx.fonts_mut(|fonts| fonts.layout_no_wrap(text.clone(), font.clone(), color));
         let padding = (font_px * 0.35).max(8.0);
-        // 没设置宽高时按文字自动收紧；设置后取两者较大值，避免文字被裁掉。
-        let auto = vec2(
-            galley.size().x + padding * 2.0,
-            galley.size().y + padding * 1.1,
-        );
-        let width = if self.config.meditation_width > 0.0 {
-            self.config.meditation_width
-        } else {
-            auto.x
+        let measure = |sample: String| {
+            ctx.fonts_mut(|fonts| fonts.layout_no_wrap(sample, font.clone(), color).size())
         };
-        let height = if self.config.meditation_height > 0.0 {
-            self.config.meditation_height
-        } else {
-            auto.y
+        let capsule_of = |size: Vec2| {
+            vec2(size.x + padding * 2.0, size.y + padding * 1.1).max(MEDITATION_MIN_SIZE)
         };
-        let size = vec2(width.max(auto.x), height.max(auto.y)).max(MEDITATION_MIN_SIZE);
-        (text, font, color, size)
+        let capsule = capsule_of(measure(text.clone()));
+        // 倒计时最长的一帧就是初始时长：秒数格式是 "180"，分:秒格式是 "03:00"。
+        let duration = self.meditation.duration_seconds();
+        let widest = if self.config.meditation_clock_format {
+            format!("{:02}:{:02}", duration / 60, duration % 60)
+        } else {
+            duration.to_string()
+        };
+        let window = capsule_of(measure(widest)).max(capsule);
+        (text, font, color, capsule, window)
     }
 
     /// 打坐倒计时悬浮窗：无边框、可透明、可置顶、可鼠标穿透。
     fn meditation_overlay(&mut self, ctx: &egui::Context) {
-        let (text, font, color, size) = self.meditation_layout(ctx);
-        // 窗口尺寸跟着字号走：尺寸变化时换一个 viewport id，让新窗口按新尺寸创建。
-        let key = (size.x.round() as u32, size.y.round() as u32);
-        if self.meditation_applied_size != Some(size) {
-            self.meditation_applied_size = Some(size);
-            self.meditation_applied_on_top = None;
-            self.meditation_applied_passthrough = None;
-            self.meditation_shadow_attempts = 0;
+        let (text, font, color, capsule, window) = self.meditation_layout(ctx);
+        // 改字号时窗口尺寸会连续变化，这里等 150ms 稳定后再重建，
+        // 否则拖动滑块会每帧销毁/创建一个窗口，Windows 上非常卡。
+        if self.meditation_applied_size != Some(window) {
+            let now = Instant::now();
+            // 尺寸还在变（拖字号滑块）就重置计时；稳定 150ms 后再换窗口。
+            let ready = match self.meditation_pending_size {
+                Some((pending, since)) if pending == window => {
+                    since.elapsed() >= Duration::from_millis(150)
+                }
+                Some(_) => false,
+                None => self.meditation_applied_size.is_none(),
+            };
+            if ready {
+                self.meditation_applied_size = Some(window);
+                self.meditation_pending_size = None;
+                self.meditation_applied_on_top = None;
+                self.meditation_applied_passthrough = None;
+                self.meditation_shadow_attempts = 0;
+            } else if self.meditation_pending_size.map(|(pending, _)| pending) != Some(window) {
+                self.meditation_pending_size = Some((window, now));
+            }
         }
+        let size = self.meditation_applied_size.unwrap_or(window);
+        let key = (size.x.round() as u32, size.y.round() as u32);
         let mut builder = egui::ViewportBuilder::default()
             .with_title("打坐计时")
             .with_decorations(false)
             .with_transparent(true)
+            // 可调整大小的窗口会带 WS_SIZEBOX 边框，全透明时顶边会露出 1px 线。
+            // 尺寸变化靠换 viewport id 重建窗口，不需要运行时可调。
+            .with_resizable(false)
             .with_inner_size(size);
         if self.config.meditation_on_top {
             builder = builder.with_always_on_top();
@@ -1279,8 +1304,10 @@ impl MhxyApp {
                 }
                 let painter = ui.painter();
                 let alpha = (self.config.meditation_opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
+                // 窗口按最长文字定尺寸，每一帧的背景按当前文字收紧并居中。
+                let background = Rect::from_center_size(rect.center(), capsule.min(size));
                 painter.rect_filled(
-                    rect,
+                    background,
                     CornerRadius::ZERO,
                     Color32::from_rgba_unmultiplied(0, 0, 0, alpha),
                 );
@@ -1409,24 +1436,6 @@ impl MhxyApp {
                 .checkbox(&mut self.config.meditation_bold, "加粗")
                 .changed()
             {
-                self.persist();
-            }
-            let mut width = self.config.meditation_width;
-            if ui
-                .add(egui::Slider::new(&mut width, 0.0..=960.0).text("背景宽度（0 = 自动）"))
-                .changed()
-            {
-                self.config.meditation_width = width;
-                self.meditation_applied_size = None;
-                self.persist();
-            }
-            let mut height = self.config.meditation_height;
-            if ui
-                .add(egui::Slider::new(&mut height, 0.0..=480.0).text("背景高度（0 = 自动）"))
-                .changed()
-            {
-                self.config.meditation_height = height;
-                self.meditation_applied_size = None;
                 self.persist();
             }
             ui.horizontal(|ui| {
@@ -3805,6 +3814,13 @@ impl MhxyApp {
 }
 
 impl eframe::App for MhxyApp {
+    /// 清屏色用全透明：默认值带 180 alpha，会在打坐悬浮窗背景全透明时
+    /// 留下一层底色，窗口比绘制区域多出 1px 时就会表现为一条顶边线。
+    /// 主窗口每个区域都有面板覆盖，alpha 为 0 不会露出黑色。
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        egui::Color32::from_rgba_unmultiplied(12, 12, 12, 0).to_normalized_gamma_f32()
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         // 跟随系统主题时，操作系统切换亮暗要即时生效。
@@ -4969,6 +4985,27 @@ mod tests {
         assert!(
             !texts.iter().any(|text| text == "边框"),
             "合成旗标注不再有边框设置：{texts:?}"
+        );
+    }
+
+    #[test]
+    fn meditation_hotkey_restarts_instead_of_pausing() {
+        let mut app = app();
+        app.meditation.restart();
+        app.meditation.pause();
+        assert_eq!(app.meditation.state(), MeditationState::Paused);
+
+        app.meditation_hotkey_tx.send(()).unwrap();
+        app.poll_meditation_hotkey();
+
+        assert_eq!(
+            app.meditation.state(),
+            MeditationState::Running,
+            "快捷键应重新开始计时，而不是继续暂停"
+        );
+        assert!(
+            app.meditation.remaining() > Duration::from_secs(170),
+            "重新开始后剩余时间应接近完整时长"
         );
     }
 
