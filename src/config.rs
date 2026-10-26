@@ -100,8 +100,10 @@ pub struct Config {
     pub meditation_on_top: bool,
     /// 锁定后悬浮窗鼠标穿透。
     pub meditation_locked: bool,
-    /// 是否显示悬浮窗。
-    pub meditation_visible: bool,
+    /// 启用打坐计时：显示悬浮窗并注册全局快捷键。
+    pub meditation_enabled: bool,
+    /// 悬浮窗文字加粗。
+    pub meditation_bold: bool,
     /// 悬浮窗外框位置（逻辑像素），None = 交给系统摆放。
     pub meditation_position: Option<(f32, f32)>,
 
@@ -161,7 +163,8 @@ impl Default for Config {
             meditation_hotkey: "F9".to_string(),
             meditation_on_top: true,
             meditation_locked: false,
-            meditation_visible: false,
+            meditation_enabled: false,
+            meditation_bold: false,
             meditation_position: None,
             update_enabled: true,
             update_manifest_url: crate::update::DEFAULT_MANIFEST_URL.to_string(),
@@ -330,7 +333,13 @@ impl Config {
         config.meditation_hotkey = get_string(map, "meditation/hotkey", "F9");
         config.meditation_on_top = get_bool(map, "meditation/on_top", true);
         config.meditation_locked = get_bool(map, "meditation/locked", false);
-        config.meditation_visible = get_bool(map, "meditation/visible", false);
+        // 旧配置只有「显示悬浮窗」，现在合并成总开关。
+        config.meditation_enabled = get_bool(
+            map,
+            "meditation/enabled",
+            get_bool(map, "meditation/visible", false),
+        );
+        config.meditation_bold = get_bool(map, "meditation/bold", false);
         config.meditation_position = get_string(map, "meditation/position", "")
             .split_once(',')
             .and_then(|(x, y)| Some((x.trim().parse::<f32>().ok()?, y.trim().parse::<f32>().ok()?)))
@@ -450,7 +459,8 @@ impl Config {
         );
         insert("meditation/on_top", Value::Bool(self.meditation_on_top));
         insert("meditation/locked", Value::Bool(self.meditation_locked));
-        insert("meditation/visible", Value::Bool(self.meditation_visible));
+        insert("meditation/enabled", Value::Bool(self.meditation_enabled));
+        insert("meditation/bold", Value::Bool(self.meditation_bold));
         insert(
             "meditation/position",
             Value::String(

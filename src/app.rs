@@ -24,10 +24,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const TASK_ORDER: [&str; 3] = ["抓鬼", "鬼王", "通用"];
-/// 打坐悬浮窗的默认逻辑尺寸与范围。
-const MEDITATION_SIZE: Vec2 = Vec2::new(176.0, 54.0);
-const MEDITATION_MIN_SIZE: Vec2 = Vec2::new(120.0, 40.0);
-const MEDITATION_MAX_SIZE: Vec2 = Vec2::new(320.0, 96.0);
+/// 打坐悬浮窗胶囊的最小尺寸。
+const MEDITATION_MIN_SIZE: Vec2 = Vec2::new(64.0, 36.0);
 /// 「附近」范围框的半径（游戏坐标），所以框的边长是 2 倍。
 const NEARBY_RADIUS: f32 = 50.0;
 /// 日志框的最小高度；实际高度随窗口高度变化。
@@ -163,6 +161,7 @@ pub struct MhxyApp {
     meditation_hotkey_attempted: Option<String>,
     meditation_applied_on_top: Option<bool>,
     meditation_applied_passthrough: Option<bool>,
+    meditation_applied_size: Option<Vec2>,
     /// 合成旗点位单独保存在用户本地目录，不进入主配置和更新包。
     flight_flags: FlightFlags,
     flight_flags_path: PathBuf,
@@ -295,6 +294,7 @@ impl MhxyApp {
             meditation_hotkey_attempted: None,
             meditation_applied_on_top: None,
             meditation_applied_passthrough: None,
+            meditation_applied_size: None,
             flight_flags,
             flight_flags_path,
             show_flight_flags_window: false,
@@ -1108,6 +1108,11 @@ impl MhxyApp {
     }
 
     fn sync_meditation_hotkey(&mut self) {
+        if !self.config.meditation_enabled {
+            self.meditation_hotkey_listener = None;
+            self.meditation_hotkey_attempted = None;
+            return;
+        }
         let raw = self.config.meditation_hotkey.trim().to_string();
         if self.meditation_hotkey_attempted.as_deref() == Some(raw.as_str()) {
             return;
@@ -1130,16 +1135,40 @@ impl MhxyApp {
         }
     }
 
+    /// 悬浮窗文字、字体与胶囊尺寸。窗口按这个尺寸创建，背景和文字自然贴合。
+    fn meditation_layout(&self, ctx: &egui::Context) -> (String, FontId, Color32, Vec2) {
+        let font_px = if self.config.meditation_font_px == 0 {
+            24.0
+        } else {
+            self.config.meditation_font_px as f32
+        };
+        let text = self.meditation.text(self.config.meditation_clock_format);
+        let color = self.meditation_text_color();
+        let font = FontId::proportional(font_px);
+        let galley = ctx.fonts_mut(|fonts| fonts.layout_no_wrap(text.clone(), font.clone(), color));
+        let padding = (font_px * 0.35).max(8.0);
+        let size = vec2(
+            (galley.size().x + padding * 2.0).max(MEDITATION_MIN_SIZE.x),
+            (galley.size().y + padding * 1.1).max(MEDITATION_MIN_SIZE.y),
+        );
+        (text, font, color, size)
+    }
+
     /// 打坐倒计时悬浮窗：无边框、可透明、可置顶、可鼠标穿透。
     fn meditation_overlay(&mut self, ctx: &egui::Context) {
+        let (text, font, color, size) = self.meditation_layout(ctx);
+        // 窗口尺寸跟着字号走：尺寸变化时换一个 viewport id，让新窗口按新尺寸创建。
+        let key = (size.x.round() as u32, size.y.round() as u32);
+        if self.meditation_applied_size != Some(size) {
+            self.meditation_applied_size = Some(size);
+            self.meditation_applied_on_top = None;
+            self.meditation_applied_passthrough = None;
+        }
         let mut builder = egui::ViewportBuilder::default()
             .with_title("打坐计时")
             .with_decorations(false)
             .with_transparent(true)
-            .with_resizable(false)
-            .with_inner_size(MEDITATION_SIZE)
-            .with_min_inner_size(MEDITATION_MIN_SIZE)
-            .with_max_inner_size(MEDITATION_MAX_SIZE);
+            .with_inner_size(size);
         if self.config.meditation_on_top {
             builder = builder.with_always_on_top();
         }
@@ -1147,7 +1176,7 @@ impl MhxyApp {
             builder = builder.with_position(pos2(x, y));
         }
         ctx.show_viewport_immediate(
-            egui::ViewportId::from_hash_of("meditation_overlay"),
+            egui::ViewportId::from_hash_of(("meditation_overlay", key)),
             builder,
             |ui, _class| {
                 if ui.ctx().viewport_id() == egui::ViewportId::ROOT {
@@ -1155,7 +1184,7 @@ impl MhxyApp {
                 }
                 let ctx = ui.ctx().clone();
                 if ctx.input(|input| input.viewport().close_requested()) {
-                    self.config.meditation_visible = false;
+                    self.config.meditation_enabled = false;
                     self.persist();
                     return;
                 }
@@ -1174,168 +1203,153 @@ impl MhxyApp {
                     ));
                     self.meditation_applied_passthrough = Some(self.config.meditation_locked);
                 }
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::NONE)
-                    .show(ui, |ui| {
-                        let rect = ui.max_rect();
-                        let response = ui.allocate_rect(rect, Sense::click_and_drag());
-                        if response.drag_started() {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
-                        }
-                        if response.clicked() {
-                            self.meditation.toggle();
-                        }
-                        if response.drag_stopped() {
-                            if let Some(outer) = ctx.input(|input| input.viewport().outer_rect) {
-                                self.config.meditation_position = Some((outer.min.x, outer.min.y));
-                                self.persist();
-                            }
-                        }
-                        let painter = ui.painter();
-                        let radius = (rect.height() * 0.5).min(rect.width() * 0.5);
-                        let alpha =
-                            (self.config.meditation_opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
-                        painter.rect_filled(
-                            rect,
-                            CornerRadius::same(radius as u8),
-                            Color32::from_rgba_unmultiplied(0, 0, 0, alpha),
-                        );
-                        let font_px = if self.config.meditation_font_px == 0 {
-                            rect.height() * 0.42
-                        } else {
-                            self.config.meditation_font_px as f32
-                        };
-                        let text = self.meditation.text(self.config.meditation_clock_format);
-                        let color = self.meditation_text_color();
-                        let font = FontId::proportional(font_px);
-                        painter.text(
-                            rect.center() + vec2(1.0, 1.0),
-                            Align2::CENTER_CENTER,
-                            &text,
-                            font.clone(),
-                            Color32::from_black_alpha(160),
-                        );
-                        painter.text(rect.center(), Align2::CENTER_CENTER, &text, font, color);
-                    });
+                let rect = ui.max_rect();
+                let response = ui.allocate_rect(rect, Sense::click_and_drag());
+                if response.drag_started() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                }
+                if response.clicked() {
+                    self.meditation.toggle();
+                }
+                if response.drag_stopped() {
+                    if let Some(outer) = ctx.input(|input| input.viewport().outer_rect) {
+                        self.config.meditation_position = Some((outer.min.x, outer.min.y));
+                        self.persist();
+                    }
+                }
+                let painter = ui.painter();
+                let alpha = (self.config.meditation_opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
+                painter.rect_filled(
+                    rect,
+                    CornerRadius::same((rect.height().min(rect.width()) * 0.5) as u8),
+                    Color32::from_rgba_unmultiplied(0, 0, 0, alpha),
+                );
+                let center = rect.center();
+                painter.text(
+                    center + vec2(1.0, 1.2),
+                    Align2::CENTER_CENTER,
+                    &text,
+                    font.clone(),
+                    Color32::from_black_alpha(160),
+                );
+                painter.text(center, Align2::CENTER_CENTER, &text, font.clone(), color);
+                if self.config.meditation_bold {
+                    painter.text(
+                        center + vec2(0.9, 0.0),
+                        Align2::CENTER_CENTER,
+                        &text,
+                        font.clone(),
+                        color,
+                    );
+                }
             },
         );
     }
 
     fn meditation_controls(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new(self.meditation.text(self.config.meditation_clock_format))
-                    .size(26.0)
-                    .strong()
-                    .color(self.meditation_text_color()),
-            );
-            ui.label(
-                egui::RichText::new(self.meditation_state_label())
-                    .small()
-                    .color(theme::muted()),
-            );
-        });
-        ui.horizontal(|ui| {
-            if ui.button(self.meditation_action_label()).clicked() {
-                self.meditation.toggle();
-            }
-            if ui.button("重置").clicked() {
+        if ui
+            .checkbox(&mut self.config.meditation_enabled, "启用打坐计时")
+            .on_hover_text("启用后显示悬浮窗并注册全局快捷键")
+            .changed()
+        {
+            if !self.config.meditation_enabled {
                 self.meditation.reset();
+                self.meditation_applied_size = None;
             }
-        });
-        if self.meditation.state() != MeditationState::Idle {
-            ui.add(
-                egui::ProgressBar::new(self.meditation.progress())
-                    .desired_height(4.0)
-                    .show_percentage(),
-            );
-        }
-        let mut minutes = (self.config.meditation_duration_seconds / 60).max(1);
-        if ui
-            .add(egui::Slider::new(&mut minutes, 1..=180).text("时长（分钟）"))
-            .changed()
-        {
-            self.config.meditation_duration_seconds = minutes * 60;
-            self.meditation.set_duration_seconds(minutes * 60);
-            self.persist();
-        }
-        if ui
-            .checkbox(&mut self.config.meditation_visible, "显示悬浮窗")
-            .on_hover_text("无边框、可拖动；单击悬浮窗开始 / 暂停 / 继续")
-            .changed()
-        {
             self.persist();
             ui.ctx().request_repaint();
         }
-        if ui
-            .checkbox(&mut self.config.meditation_locked, "锁定（鼠标穿透）")
-            .on_hover_text("锁定后悬浮窗点不到、拖不动，只能在主界面取消")
-            .changed()
-        {
-            self.persist();
-            ui.ctx().request_repaint();
-        }
-        ui.horizontal(|ui| {
-            ui.label("显示");
-            let mut clock = self.config.meditation_clock_format;
-            if ui.radio_value(&mut clock, false, "秒数").changed() {
-                self.config.meditation_clock_format = clock;
-                self.persist();
-            }
-            if ui.radio_value(&mut clock, true, "分:秒").changed() {
-                self.config.meditation_clock_format = clock;
-                self.persist();
-            }
-        });
-        ui.horizontal(|ui| {
-            ui.label("文字颜色");
-            let mut color = Color32::from_rgb(
-                self.config.meditation_text_color[0],
-                self.config.meditation_text_color[1],
-                self.config.meditation_text_color[2],
-            );
-            if ui.color_edit_button_srgba(&mut color).changed() {
-                self.config.meditation_text_color = [color.r(), color.g(), color.b()];
-                self.persist();
-            }
-        });
-        let mut opacity = self.config.meditation_opacity;
-        if ui
-            .add(egui::Slider::new(&mut opacity, 0.0..=1.0).text("背景不透明度"))
-            .changed()
-        {
-            self.config.meditation_opacity = opacity;
-            self.persist();
-        }
-        let mut font_px = self.config.meditation_font_px;
-        if ui
-            .add(egui::Slider::new(&mut font_px, 0..=96).text("字号（0 = 自动）"))
-            .changed()
-        {
-            self.config.meditation_font_px = font_px;
-            self.persist();
-        }
-        ui.horizontal(|ui| {
-            ui.label("快捷键");
+        ui.add_enabled_ui(self.config.meditation_enabled, |ui| {
+            ui.horizontal(|ui| {
+                if ui.button(self.meditation_action_label()).clicked() {
+                    self.meditation.toggle();
+                }
+                if ui.button("重置").clicked() {
+                    self.meditation.reset();
+                }
+            });
+            let mut minutes = (self.config.meditation_duration_seconds / 60).max(1);
             if ui
-                .add(
-                    egui::TextEdit::singleline(&mut self.config.meditation_hotkey)
-                        .desired_width(80.0),
-                )
+                .add(egui::Slider::new(&mut minutes, 1..=180).text("时长（分钟）"))
+                .changed()
+            {
+                self.config.meditation_duration_seconds = minutes * 60;
+                self.meditation.set_duration_seconds(minutes * 60);
+                self.persist();
+            }
+            if ui
+                .checkbox(&mut self.config.meditation_on_top, "悬浮窗置顶")
                 .changed()
             {
                 self.persist();
             }
+            if ui
+                .checkbox(&mut self.config.meditation_locked, "锁定（鼠标穿透）")
+                .on_hover_text("锁定后悬浮窗点不到、拖不动，只能在主界面取消")
+                .changed()
+            {
+                self.persist();
+            }
+            ui.horizontal(|ui| {
+                ui.label("显示");
+                let mut clock = self.config.meditation_clock_format;
+                if ui.radio_value(&mut clock, false, "秒数").changed() {
+                    self.config.meditation_clock_format = clock;
+                    self.persist();
+                }
+                if ui.radio_value(&mut clock, true, "分:秒").changed() {
+                    self.config.meditation_clock_format = clock;
+                    self.persist();
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("文字颜色");
+                let mut color = Color32::from_rgb(
+                    self.config.meditation_text_color[0],
+                    self.config.meditation_text_color[1],
+                    self.config.meditation_text_color[2],
+                );
+                if ui.color_edit_button_srgba(&mut color).changed() {
+                    self.config.meditation_text_color = [color.r(), color.g(), color.b()];
+                    self.persist();
+                }
+            });
+            let mut opacity = self.config.meditation_opacity;
+            if ui
+                .add(egui::Slider::new(&mut opacity, 0.0..=1.0).text("背景不透明度"))
+                .changed()
+            {
+                self.config.meditation_opacity = opacity;
+                self.persist();
+            }
+            let mut font_px = self.config.meditation_font_px;
+            if ui
+                .add(egui::Slider::new(&mut font_px, 0..=96).text("字号（0 = 自动）"))
+                .changed()
+            {
+                self.config.meditation_font_px = font_px;
+                self.meditation_applied_size = None;
+                self.persist();
+            }
+            if ui
+                .checkbox(&mut self.config.meditation_bold, "加粗")
+                .changed()
+            {
+                self.persist();
+            }
+            ui.horizontal(|ui| {
+                ui.label("快捷键");
+                if ui
+                    .add(
+                        egui::TextEdit::singleline(&mut self.config.meditation_hotkey)
+                            .desired_width(80.0),
+                    )
+                    .changed()
+                {
+                    self.persist();
+                }
+            });
         });
-    }
-
-    fn meditation_state_label(&self) -> &'static str {
-        match self.meditation.state() {
-            MeditationState::Idle => "待开始",
-            MeditationState::Running => "计时中",
-            MeditationState::Paused => "已暂停",
-            MeditationState::Finished => "已结束",
-        }
     }
 
     fn meditation_action_label(&self) -> &'static str {
@@ -3723,16 +3737,18 @@ impl eframe::App for MhxyApp {
         self.poll_events();
         self.poll_hotkey();
         self.poll_meditation_hotkey();
-        self.meditation.tick();
-        if self.meditation.state() == MeditationState::Running {
-            ctx.request_repaint_after(Duration::from_millis(100));
-        }
-        if self
-            .meditation
-            .finished_elapsed()
-            .is_some_and(|elapsed| elapsed < meditation::FINISH_FLASH)
-        {
-            ctx.request_repaint_after(Duration::from_millis(80));
+        if self.config.meditation_enabled {
+            self.meditation.tick();
+            if self.meditation.state() == MeditationState::Running {
+                ctx.request_repaint_after(Duration::from_millis(100));
+            }
+            if self
+                .meditation
+                .finished_elapsed()
+                .is_some_and(|elapsed| elapsed < meditation::FINISH_FLASH)
+            {
+                ctx.request_repaint_after(Duration::from_millis(80));
+            }
         }
         // 精简模式下按 Esc 回到默认界面；正在录制快捷键时 Esc 只用于取消录制。
         if self.compact && !self.recording_hotkey && ctx.input(|i| i.key_pressed(egui::Key::Escape))
@@ -4279,7 +4295,7 @@ impl eframe::App for MhxyApp {
         if !self.show_region_window {
             self.release_preview();
         }
-        if self.config.meditation_visible {
+        if self.config.meditation_enabled {
             self.meditation_overlay(&ctx);
         }
         if self.show_region_window {
@@ -4776,8 +4792,8 @@ mod tests {
             "侧栏应有打坐计时分组：{texts:?}"
         );
         assert!(
-            texts.iter().any(|text| text == "180"),
-            "默认应显示 180 秒：{texts:?}"
+            texts.iter().any(|text| text == "启用打坐计时"),
+            "应有功能的启用开关：{texts:?}"
         );
         assert!(
             texts.iter().any(|text| text == "开始"),

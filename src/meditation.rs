@@ -116,14 +116,6 @@ impl MeditationTimer {
         }
     }
 
-    /// 剩余比例 0~1。
-    pub fn progress(&self) -> f32 {
-        if self.duration.is_zero() {
-            return 0.0;
-        }
-        (self.remaining().as_secs_f32() / self.duration.as_secs_f32()).clamp(0.0, 1.0)
-    }
-
     /// 悬浮窗文字：`seconds` 只显示秒数，`clock` 显示分:秒。
     pub fn text(&self, clock: bool) -> String {
         let millis = self.remaining().as_millis() as u64;
