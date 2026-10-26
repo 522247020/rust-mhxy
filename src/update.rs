@@ -110,6 +110,8 @@ pub fn check(manifest_url: &str, current_version: &str) -> Result<Option<UpdateI
             )
         });
     }
+    validate_version(&manifest.version)?;
+    validate_sha256(&platform.sha256)?;
     Ok(Some(UpdateInfo {
         version: manifest.version,
         notes: manifest.notes,
@@ -254,11 +256,28 @@ pub fn sha256_file(path: &Path) -> Result<String, String> {
     Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
-fn verify_sha256(path: &Path, expected: &str) -> Result<(), String> {
-    let expected = expected.trim();
-    if expected.is_empty() {
-        return Ok(());
+fn validate_sha256(value: &str) -> Result<&str, String> {
+    let value = value.trim();
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("版本清单缺少有效的 SHA256（必须是 64 位十六进制）".to_string());
     }
+    Ok(value)
+}
+
+fn validate_version(value: &str) -> Result<(), String> {
+    let trimmed = value.trim();
+    if parse_version(trimmed).is_none()
+        || !trimmed
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+'))
+    {
+        return Err(format!("版本清单里的版本号无效：{value}"));
+    }
+    Ok(())
+}
+
+fn verify_sha256(path: &Path, expected: &str) -> Result<(), String> {
+    let expected = validate_sha256(expected)?;
     let actual = sha256_file(path)?;
     if !actual.eq_ignore_ascii_case(expected) {
         let _ = std::fs::remove_file(path);
@@ -454,7 +473,11 @@ mod tests {
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         )
         .is_ok());
-        assert!(verify_sha256(&path, "deadbeef").is_err());
+        assert!(verify_sha256(
+            &path,
+            "0000000000000000000000000000000000000000000000000000000000000000"
+        )
+        .is_err());
         assert!(!path.exists(), "校验失败应删除文件");
     }
 
@@ -464,7 +487,7 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         // 只声明 Windows 平台的清单：单平台时其它系统也应直接使用。
-        let body = r#"{"version":"v9.9.9","notes":"test","platforms":{"windows-x86_64":{"url":"http://example.com/a.zip","sha256":"abc","size":1}}}"#.to_string();
+        let body = r#"{"version":"v9.9.9","notes":"test","platforms":{"windows-x86_64":{"url":"http://example.com/a.zip","sha256":"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad","size":1}}}"#.to_string();
         let server = std::thread::spawn(move || {
             if let Ok((mut stream, _)) = listener.accept() {
                 let mut buffer = [0u8; 2048];
@@ -482,8 +505,26 @@ mod tests {
             .expect("应有新版本");
         assert_eq!(info.version, "v9.9.9");
         assert_eq!(info.url, "http://example.com/a.zip");
-        assert_eq!(info.sha256, "abc");
+        assert_eq!(
+            info.sha256,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
         server.join().unwrap();
+    }
+
+    #[test]
+    fn rejects_unsafe_update_metadata() {
+        assert!(validate_sha256("").is_err());
+        assert!(validate_sha256("abc").is_err());
+        assert!(validate_sha256(
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        )
+        .is_ok());
+
+        assert!(validate_version("v0.2.3").is_ok());
+        assert!(validate_version("v0.2.3-beta+1").is_ok());
+        assert!(validate_version("../../payload").is_err());
+        assert!(validate_version("v0.2.3/update").is_err());
     }
 
     #[test]

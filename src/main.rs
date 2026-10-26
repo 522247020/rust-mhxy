@@ -23,7 +23,8 @@ fn main() -> eframe::Result {
     let mut viewport = egui::ViewportBuilder::default()
         .with_title(format!("梦幻西游任务坐标辅助（rust-mhxy {APP_VERSION}）"))
         .with_inner_size([1120.0, 800.0])
-        .with_min_inner_size([760.0, 540.0]);
+        .with_min_inner_size([760.0, 540.0])
+        .with_icon(app_icon());
     if config.on_top {
         viewport = viewport.with_always_on_top();
     }
@@ -42,6 +43,11 @@ fn main() -> eframe::Result {
             Ok(Box::new(app::MhxyApp::new(cc)))
         }),
     )
+}
+
+fn app_icon() -> egui::IconData {
+    eframe::icon_data::from_png_bytes(include_bytes!("../assets/icons/app-icon.png"))
+        .expect("内置应用图标必须是有效的 PNG")
 }
 
 /// 把字体文件只读映射到内存。字体页由系统按需调入，属于文件缓存而不是进程私有内存，

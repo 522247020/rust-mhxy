@@ -2936,6 +2936,65 @@ impl MhxyApp {
             theme::card().show(ui, |ui| draw(self, ui));
         }
     }
+
+    fn header_overflow_menu(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let update_label = match self.update_phase {
+            UpdatePhase::Checking => "正在检查…".to_string(),
+            UpdatePhase::Available => format!(
+                "更新到 {}",
+                self.update_info
+                    .as_ref()
+                    .map(|info| info.version.as_str())
+                    .unwrap_or("")
+            ),
+            UpdatePhase::Downloading => "查看下载进度".to_string(),
+            UpdatePhase::Downloaded => "重启并更新".to_string(),
+            UpdatePhase::Failed => "重新检查更新".to_string(),
+            UpdatePhase::Idle => "检查更新".to_string(),
+        };
+        let update_enabled = self.update_phase != UpdatePhase::Checking;
+        if ui
+            .add_enabled(update_enabled, egui::Button::new(update_label))
+            .clicked()
+        {
+            match self.update_phase {
+                UpdatePhase::Available | UpdatePhase::Downloading | UpdatePhase::Downloaded => {
+                    self.show_update_dialog = true;
+                    self.update_window_pos =
+                        Some(centered_window_position(ctx, UPDATE_WINDOW_SIZE));
+                }
+                _ => self.start_update_check(true),
+            }
+            ui.close();
+        }
+        if ui.button("说明").clicked() {
+            let opening = !self.show_help;
+            self.show_help = opening;
+            if opening {
+                self.help_window_pos = Some(centered_window_position(ctx, HELP_WINDOW_SIZE));
+            }
+            ui.close();
+        }
+        ui.menu_button("界面主题", |ui| {
+            for (value, label) in [("system", "跟随系统"), ("light", "亮色"), ("dark", "暗色")]
+            {
+                if ui.radio(self.config.theme == value, label).clicked() {
+                    self.config.theme = value.to_string();
+                    self.persist();
+                    ui.close();
+                }
+            }
+        });
+        let mut on_top = self.config.on_top;
+        if ui.checkbox(&mut on_top, "窗口置顶").changed() {
+            self.set_on_top(on_top, ctx);
+        }
+        ui.separator();
+        if ui.button("精简界面").clicked() {
+            self.compact = true;
+            ui.close();
+        }
+    }
 }
 
 impl eframe::App for MhxyApp {
@@ -3063,12 +3122,20 @@ impl eframe::App for MhxyApp {
                         .inner_margin(egui::Margin::symmetric(16, 12)),
                 )
                 .show(ui, |ui| {
-                    let narrow = ui.available_width() < 560.0;
+                    // Below this width the title and all utilities no longer fit in one row.
+                    // Keep primary controls visible and move secondary actions into a menu.
+                    let narrow = ui.available_width() < 900.0;
                     ui.horizontal(|ui| {
                         if ui
                             .add(
                                 egui::Button::new(if self.config.sidebar_expanded {
-                                    "收起设置"
+                                    if narrow {
+                                        "收起"
+                                    } else {
+                                        "收起设置"
+                                    }
+                                } else if narrow {
+                                    "设置"
                                 } else {
                                     "展开设置"
                                 })
@@ -3100,45 +3167,59 @@ impl eframe::App for MhxyApp {
                             {
                                 self.toggle_running();
                             }
-                            if ui
-                                .add(header_button("精简界面", false))
-                                .on_hover_text(
-                                    "只显示地图，隐藏顶部按钮、状态栏和设置侧栏；按 Esc 退出",
-                                )
-                                .clicked()
+                            if narrow {
+                                ui.scope(|ui| {
+                                    ui.spacing_mut().interact_size.y = 34.0;
+                                    ui.menu_button("更多", |ui| {
+                                        self.header_overflow_menu(ui, &ctx)
+                                    });
+                                });
+                            }
+                            if !narrow
+                                && ui
+                                    .add(header_button("精简界面", false))
+                                    .on_hover_text(
+                                        "只显示地图，隐藏顶部按钮、状态栏和设置侧栏；按 Esc 退出",
+                                    )
+                                    .clicked()
                             {
                                 self.compact = true;
                             }
                             let on_top = self.config.on_top;
-                            if ui
-                                .add(header_button("置顶", on_top))
-                                .on_hover_text("让本窗口始终显示在游戏窗口前面")
-                                .clicked()
+                            if !narrow
+                                && ui
+                                    .add(header_button("置顶", on_top))
+                                    .on_hover_text("让本窗口始终显示在游戏窗口前面")
+                                    .clicked()
                             {
                                 self.set_on_top(!on_top, &ctx);
                             }
-                            ui.scope(|ui| {
-                                ui.spacing_mut().interact_size.y = 34.0;
-                                ui.menu_button("界面主题", |ui| {
-                                    for (value, label) in [
-                                        ("system", "跟随系统"),
-                                        ("light", "亮色"),
-                                        ("dark", "暗色"),
-                                    ] {
-                                        if ui.radio(self.config.theme == value, label).clicked() {
-                                            self.config.theme = value.to_string();
-                                            self.persist();
-                                            ui.close();
+                            if !narrow {
+                                ui.scope(|ui| {
+                                    ui.spacing_mut().interact_size.y = 34.0;
+                                    ui.menu_button("界面主题", |ui| {
+                                        for (value, label) in [
+                                            ("system", "跟随系统"),
+                                            ("light", "亮色"),
+                                            ("dark", "暗色"),
+                                        ] {
+                                            if ui.radio(self.config.theme == value, label).clicked()
+                                            {
+                                                self.config.theme = value.to_string();
+                                                self.persist();
+                                                ui.close();
+                                            }
                                         }
-                                    }
-                                })
-                                .response
-                                .on_hover_text("默认跟随系统，也可以固定亮色或暗色");
-                            });
-                            if ui
-                                .add(header_button("说明", self.show_help))
-                                .on_hover_text("使用说明")
-                                .clicked()
+                                    })
+                                    .response
+                                    .on_hover_text("默认跟随系统，也可以固定亮色或暗色");
+                                });
+                            }
+                            if !narrow
+                                && ui
+                                    .add(header_button("说明", self.show_help))
+                                    .on_hover_text("使用说明")
+                                    .clicked()
                             {
                                 let opening = !self.show_help;
                                 self.show_help = opening;
@@ -3236,10 +3317,11 @@ impl eframe::App for MhxyApp {
                             if highlight {
                                 button = button.fill(theme::gold());
                             }
-                            if ui
-                                .add_enabled(enabled, button)
-                                .on_hover_text(tooltip)
-                                .clicked()
+                            if !narrow
+                                && ui
+                                    .add_enabled(enabled, button)
+                                    .on_hover_text(tooltip)
+                                    .clicked()
                             {
                                 match self.update_phase {
                                     UpdatePhase::Available
@@ -3871,6 +3953,38 @@ mod tests {
              update={update:?} help={help:?} theme={theme:?} on_top={on_top:?} \
              compact={compact:?} start={start:?}"
         );
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn narrow_header_moves_secondary_actions_into_more_menu() {
+        let mut app = app();
+        app.config.sidebar_expanded = false;
+        let ctx = app.ctx.clone();
+        let mut frame = eframe::Frame::_new_kittest();
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                pos2(0.0, 0.0),
+                MIN_WINDOW_SIZE_COLLAPSED,
+            )),
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| app.ui(ui, &mut frame));
+        let texts = collect_texts(&output.shapes);
+        assert!(
+            texts.iter().any(|text| text == "更多"),
+            "窄窗口应显示更多菜单：{texts:?}"
+        );
+        assert!(
+            texts.iter().any(|text| text == "开始识别"),
+            "窄窗口仍应保留主操作：{texts:?}"
+        );
+        for hidden in ["检查更新", "说明", "界面主题", "置顶", "精简界面"] {
+            assert!(
+                !texts.iter().any(|text| text == hidden),
+                "窄窗口不应在顶栏直接显示 {hidden}：{texts:?}"
+            );
+        }
         output.textures_delta.clear();
     }
 
