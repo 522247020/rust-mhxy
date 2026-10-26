@@ -106,6 +106,9 @@ pub struct Config {
     pub meditation_bold: bool,
     /// 悬浮窗外框位置（逻辑像素），None = 交给系统摆放。
     pub meditation_position: Option<(f32, f32)>,
+    /// 悬浮窗背景宽高（逻辑像素），0 = 按文字自动。
+    pub meditation_width: f32,
+    pub meditation_height: f32,
 
     /// 启动时检查更新。
     pub update_enabled: bool,
@@ -166,6 +169,8 @@ impl Default for Config {
             meditation_enabled: false,
             meditation_bold: false,
             meditation_position: None,
+            meditation_width: 0.0,
+            meditation_height: 0.0,
             update_enabled: true,
             update_manifest_url: crate::update::DEFAULT_MANIFEST_URL.to_string(),
             region_scope_open: true,
@@ -340,6 +345,8 @@ impl Config {
             get_bool(map, "meditation/visible", false),
         );
         config.meditation_bold = get_bool(map, "meditation/bold", false);
+        config.meditation_width = get_f32(map, "meditation/width", 0.0).clamp(0.0, 960.0);
+        config.meditation_height = get_f32(map, "meditation/height", 0.0).clamp(0.0, 480.0);
         config.meditation_position = get_string(map, "meditation/position", "")
             .split_once(',')
             .and_then(|(x, y)| Some((x.trim().parse::<f32>().ok()?, y.trim().parse::<f32>().ok()?)))
@@ -461,6 +468,8 @@ impl Config {
         insert("meditation/locked", Value::Bool(self.meditation_locked));
         insert("meditation/enabled", Value::Bool(self.meditation_enabled));
         insert("meditation/bold", Value::Bool(self.meditation_bold));
+        insert("meditation/width", Value::from(self.meditation_width));
+        insert("meditation/height", Value::from(self.meditation_height));
         insert(
             "meditation/position",
             Value::String(

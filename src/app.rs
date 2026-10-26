@@ -1150,10 +1150,22 @@ impl MhxyApp {
         let font = FontId::proportional(font_px);
         let galley = ctx.fonts_mut(|fonts| fonts.layout_no_wrap(text.clone(), font.clone(), color));
         let padding = (font_px * 0.35).max(8.0);
-        let size = vec2(
-            (galley.size().x + padding * 2.0).max(MEDITATION_MIN_SIZE.x),
-            (galley.size().y + padding * 1.1).max(MEDITATION_MIN_SIZE.y),
+        // 没设置宽高时按文字自动收紧；设置后取两者较大值，避免文字被裁掉。
+        let auto = vec2(
+            galley.size().x + padding * 2.0,
+            galley.size().y + padding * 1.1,
         );
+        let width = if self.config.meditation_width > 0.0 {
+            self.config.meditation_width
+        } else {
+            auto.x
+        };
+        let height = if self.config.meditation_height > 0.0 {
+            self.config.meditation_height
+        } else {
+            auto.y
+        };
+        let size = vec2(width.max(auto.x), height.max(auto.y)).max(MEDITATION_MIN_SIZE);
         (text, font, color, size)
     }
 
@@ -1349,6 +1361,24 @@ impl MhxyApp {
                 .checkbox(&mut self.config.meditation_bold, "加粗")
                 .changed()
             {
+                self.persist();
+            }
+            let mut width = self.config.meditation_width;
+            if ui
+                .add(egui::Slider::new(&mut width, 0.0..=960.0).text("背景宽度（0 = 自动）"))
+                .changed()
+            {
+                self.config.meditation_width = width;
+                self.meditation_applied_size = None;
+                self.persist();
+            }
+            let mut height = self.config.meditation_height;
+            if ui
+                .add(egui::Slider::new(&mut height, 0.0..=480.0).text("背景高度（0 = 自动）"))
+                .changed()
+            {
+                self.config.meditation_height = height;
+                self.meditation_applied_size = None;
                 self.persist();
             }
             ui.horizontal(|ui| {
