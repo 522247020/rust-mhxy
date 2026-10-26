@@ -398,10 +398,16 @@ mod tests {
 
     #[test]
     fn round_trips_local_file() {
+        // 线程名是模块路径（含 `::`），Windows 不允许文件名里出现冒号。
+        let thread: String = std::thread::current()
+            .name()
+            .unwrap_or("test")
+            .chars()
+            .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+            .collect();
         let path = std::env::temp_dir().join(format!(
-            "rust-mhxy-flight-flags-{}-{}.json",
+            "rust-mhxy-flight-flags-{}-{thread}.json",
             std::process::id(),
-            std::thread::current().name().unwrap_or("test")
         ));
         let mut flags = FlightFlags::default();
         let index = flags.add_flag("傲来国", "测试旗").unwrap();
