@@ -162,6 +162,8 @@ pub struct MhxyApp {
     meditation_applied_on_top: Option<bool>,
     meditation_applied_passthrough: Option<bool>,
     meditation_applied_size: Option<Vec2>,
+    /// 正在录制打坐计时的全局快捷键。
+    meditation_recording_hotkey: bool,
     /// 合成旗点位单独保存在用户本地目录，不进入主配置和更新包。
     flight_flags: FlightFlags,
     flight_flags_path: PathBuf,
@@ -295,6 +297,7 @@ impl MhxyApp {
             meditation_applied_on_top: None,
             meditation_applied_passthrough: None,
             meditation_applied_size: None,
+            meditation_recording_hotkey: false,
             flight_flags,
             flight_flags_path,
             show_flight_flags_window: false,
@@ -1221,7 +1224,7 @@ impl MhxyApp {
                 let alpha = (self.config.meditation_opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
                 painter.rect_filled(
                     rect,
-                    CornerRadius::same((rect.height().min(rect.width()) * 0.5) as u8),
+                    CornerRadius::ZERO,
                     Color32::from_rgba_unmultiplied(0, 0, 0, alpha),
                 );
                 let center = rect.center();
@@ -1279,9 +1282,20 @@ impl MhxyApp {
             }
             if ui
                 .checkbox(&mut self.config.meditation_on_top, "悬浮窗置顶")
+                .on_hover_text("Windows 上始终生效；Linux Wayland 由桌面环境决定")
                 .changed()
             {
                 self.persist();
+            }
+            #[cfg(target_os = "linux")]
+            if self.config.meditation_on_top && std::env::var_os("WAYLAND_DISPLAY").is_some() {
+                ui.label(
+                    egui::RichText::new(
+                        "Wayland 不允许程序强制置顶，可在窗口规则里设为「保持在其他窗口之上」",
+                    )
+                    .small()
+                    .color(theme::gold()),
+                );
             }
             if ui
                 .checkbox(&mut self.config.meditation_locked, "锁定（鼠标穿透）")
@@ -1342,13 +1356,43 @@ impl MhxyApp {
                 if ui
                     .add(
                         egui::TextEdit::singleline(&mut self.config.meditation_hotkey)
-                            .desired_width(80.0),
+                            .desired_width(72.0),
                     )
                     .changed()
                 {
                     self.persist();
                 }
+                let record_label = if self.meditation_recording_hotkey {
+                    "按键…"
+                } else {
+                    "录制"
+                };
+                if ui.button(record_label).clicked() {
+                    self.meditation_recording_hotkey = !self.meditation_recording_hotkey;
+                    if self.meditation_recording_hotkey {
+                        self.recording_hotkey = false;
+                    }
+                }
             });
+            match Hotkey::parse(&self.config.meditation_hotkey) {
+                Ok(hotkey) => {
+                    let status = if self.meditation_recording_hotkey {
+                        "请按下要绑定的按键（Esc 取消）"
+                    } else if self.meditation_hotkey_listener.is_some() {
+                        "全局快捷键已注册"
+                    } else {
+                        "未注册（检查格式或权限）"
+                    };
+                    ui.label(
+                        egui::RichText::new(format!("{} · {status}", hotkey.display()))
+                            .small()
+                            .weak(),
+                    );
+                }
+                Err(err) => {
+                    ui.label(egui::RichText::new(err).small().color(theme::red()));
+                }
+            }
         });
     }
 
@@ -3751,7 +3795,10 @@ impl eframe::App for MhxyApp {
             }
         }
         // 精简模式下按 Esc 回到默认界面；正在录制快捷键时 Esc 只用于取消录制。
-        if self.compact && !self.recording_hotkey && ctx.input(|i| i.key_pressed(egui::Key::Escape))
+        if self.compact
+            && !self.recording_hotkey
+            && !self.meditation_recording_hotkey
+            && ctx.input(|i| i.key_pressed(egui::Key::Escape))
         {
             self.compact = false;
             self.notice = Some("已退出精简模式".to_string());
@@ -3762,6 +3809,16 @@ impl eframe::App for MhxyApp {
                 if captured != "Escape" {
                     self.config.ocr_hotkey = captured;
                     self.persist();
+                }
+            }
+        }
+        if self.meditation_recording_hotkey {
+            if let Some(captured) = hotkey::capture_egui(&ctx) {
+                self.meditation_recording_hotkey = false;
+                if captured != "Escape" {
+                    self.config.meditation_hotkey = captured;
+                    self.persist();
+                    self.meditation_hotkey_attempted = None;
                 }
             }
         }
