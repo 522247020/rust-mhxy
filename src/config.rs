@@ -86,6 +86,25 @@ pub struct Config {
     pub theme: String,
     /// 侧栏各分组折叠状态，逗号分隔的 id（如 "window,task"）。
     pub sidebar_folded: String,
+    /// 打坐倒计时：时长（秒）、显示格式、悬浮窗样式。
+    pub meditation_duration_seconds: u32,
+    /// 悬浮窗显示分:秒（false = 只显示秒数）。
+    pub meditation_clock_format: bool,
+    /// 悬浮窗背景不透明度 0~1。
+    pub meditation_opacity: f32,
+    /// 悬浮窗字号（像素），0 = 跟随窗口高度。
+    pub meditation_font_px: u32,
+    pub meditation_text_color: [u8; 3],
+    /// 开始 / 重置倒计时的全局快捷键。
+    pub meditation_hotkey: String,
+    pub meditation_on_top: bool,
+    /// 锁定后悬浮窗鼠标穿透。
+    pub meditation_locked: bool,
+    /// 是否显示悬浮窗。
+    pub meditation_visible: bool,
+    /// 悬浮窗外框位置（逻辑像素），None = 交给系统摆放。
+    pub meditation_position: Option<(f32, f32)>,
+
     /// 启动时检查更新。
     pub update_enabled: bool,
     /// 更新清单地址（自建站点）。
@@ -134,6 +153,16 @@ impl Default for Config {
             extra_preprocess_tolerance: 24,
             theme: "system".into(),
             sidebar_folded: String::new(),
+            meditation_duration_seconds: crate::meditation::DEFAULT_DURATION_SECONDS,
+            meditation_clock_format: false,
+            meditation_opacity: 0.85,
+            meditation_font_px: 0,
+            meditation_text_color: [255, 255, 255],
+            meditation_hotkey: "F9".to_string(),
+            meditation_on_top: true,
+            meditation_locked: false,
+            meditation_visible: false,
+            meditation_position: None,
             update_enabled: true,
             update_manifest_url: crate::update::DEFAULT_MANIFEST_URL.to_string(),
             region_scope_open: true,
@@ -287,6 +316,25 @@ impl Config {
         config.region_gate_open = get_bool(map, "window/region/gate_open", true);
         config.region_preprocess_open = get_bool(map, "window/region/preprocess_open", true);
         config.on_top = get_bool(map, "window/coordinate/on_top", true);
+        config.meditation_duration_seconds = crate::meditation::clamp_duration(get_u32(
+            map,
+            "meditation/duration_seconds",
+            crate::meditation::DEFAULT_DURATION_SECONDS,
+        ));
+        config.meditation_clock_format = get_bool(map, "meditation/clock_format", false);
+        config.meditation_opacity = get_f32(map, "meditation/opacity", 0.85).clamp(0.0, 1.0);
+        config.meditation_font_px = get_u32(map, "meditation/font_px", 0).min(200);
+        config.meditation_text_color =
+            parse_hex(&get_string(map, "meditation/text_color", "#ffffff"))
+                .unwrap_or([255, 255, 255]);
+        config.meditation_hotkey = get_string(map, "meditation/hotkey", "F9");
+        config.meditation_on_top = get_bool(map, "meditation/on_top", true);
+        config.meditation_locked = get_bool(map, "meditation/locked", false);
+        config.meditation_visible = get_bool(map, "meditation/visible", false);
+        config.meditation_position = get_string(map, "meditation/position", "")
+            .split_once(',')
+            .and_then(|(x, y)| Some((x.trim().parse::<f32>().ok()?, y.trim().parse::<f32>().ok()?)))
+            .filter(|(x, y)| x.is_finite() && y.is_finite());
         // 通用任务与抓鬼/鬼王互斥；手改配置或旧配置里同时为真时，以通用任务为准。
         if config.generic_enabled {
             config.zhuagui_enabled = false;
@@ -382,6 +430,35 @@ impl Config {
             "window/sidebar/folded",
             Value::String(self.sidebar_folded.clone()),
         );
+        insert(
+            "meditation/duration_seconds",
+            Value::from(self.meditation_duration_seconds),
+        );
+        insert(
+            "meditation/clock_format",
+            Value::Bool(self.meditation_clock_format),
+        );
+        insert("meditation/opacity", Value::from(self.meditation_opacity));
+        insert("meditation/font_px", Value::from(self.meditation_font_px));
+        insert(
+            "meditation/text_color",
+            Value::String(to_hex(self.meditation_text_color)),
+        );
+        insert(
+            "meditation/hotkey",
+            Value::String(self.meditation_hotkey.clone()),
+        );
+        insert("meditation/on_top", Value::Bool(self.meditation_on_top));
+        insert("meditation/locked", Value::Bool(self.meditation_locked));
+        insert("meditation/visible", Value::Bool(self.meditation_visible));
+        insert(
+            "meditation/position",
+            Value::String(
+                self.meditation_position
+                    .map(|(x, y)| format!("{x:.0},{y:.0}"))
+                    .unwrap_or_default(),
+            ),
+        );
         insert("update/enabled", Value::Bool(self.update_enabled));
         insert(
             "update/manifest_url",
@@ -448,6 +525,23 @@ fn get_u32(map: &Map<String, Value>, key: &str, default: u32) -> u32 {
             .and_then(|v| u32::try_from(v).ok())
             .unwrap_or(default),
         Some(Value::String(value)) => value.trim().parse().unwrap_or(default),
+        _ => default,
+    }
+}
+
+fn get_f32(map: &Map<String, Value>, key: &str, default: f32) -> f32 {
+    match map.get(key) {
+        Some(Value::Number(value)) => value
+            .as_f64()
+            .map(|v| v as f32)
+            .filter(|v| v.is_finite())
+            .unwrap_or(default),
+        Some(Value::String(value)) => value
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .filter(|v| v.is_finite())
+            .unwrap_or(default),
         _ => default,
     }
 }
