@@ -3910,6 +3910,8 @@ impl eframe::App for MhxyApp {
             }
         }
         self.sync_hotkey();
+        // 打坐计时不依赖识别是否在跑，每帧都同步一次（失败会按 5 秒间隔重试）。
+        self.sync_meditation_hotkey();
         // 非 Windows 或全局注册失败时，窗口聚焦也能用快捷键。
         if self.running && self.manual_mode() && self.hotkey_listener.is_none() && !self.busy {
             if let Ok(hotkey) = Hotkey::parse(&self.config.ocr_hotkey) {
@@ -4967,6 +4969,32 @@ mod tests {
         assert!(
             !texts.iter().any(|text| text == "边框"),
             "合成旗标注不再有边框设置：{texts:?}"
+        );
+    }
+
+    #[test]
+    fn meditation_hotkey_registers_without_starting_ocr() {
+        let mut app = app();
+        app.config.meditation_enabled = true;
+        app.config.meditation_hotkey = "Ctrl+Alt+F24".into();
+        let ctx = app.ctx.clone();
+        let mut frame = eframe::Frame::_new_kittest();
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1120.0, 800.0))),
+                ..Default::default()
+            },
+            |ui| app.ui(ui, &mut frame),
+        );
+        output.textures_delta.clear();
+        assert_eq!(
+            app.meditation_hotkey_attempted.as_deref(),
+            Some("Ctrl+Alt+F24"),
+            "启用打坐计时后应尝试注册快捷键，不需要先开始识别"
+        );
+        assert!(
+            app.meditation_hotkey_listener.is_some() || app.meditation_hotkey_error.is_some(),
+            "不能停留在「正在注册」状态"
         );
     }
 
