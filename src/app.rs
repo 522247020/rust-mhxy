@@ -37,6 +37,7 @@ const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(30 * 60);
 /// 说明 / 更新窗口的默认尺寸。
 const HELP_WINDOW_SIZE: Vec2 = Vec2::new(560.0, 640.0);
 const UPDATE_WINDOW_SIZE: Vec2 = Vec2::new(480.0, 540.0);
+const FLIGHT_FLAGS_WINDOW_SIZE: Vec2 = Vec2::new(900.0, 760.0);
 /// 检查结果在按钮上停留的时间。
 const UPDATE_FLASH_DURATION: Duration = Duration::from_secs(4);
 
@@ -152,9 +153,10 @@ pub struct MhxyApp {
     /// 合成旗点位单独保存在用户本地目录，不进入主配置和更新包。
     flight_flags: FlightFlags,
     flight_flags_path: PathBuf,
+    show_flight_flags_window: bool,
     flight_map_edit: String,
-    flight_x_edit: i32,
-    flight_y_edit: i32,
+    flight_flag_index: usize,
+    flight_flag_name_edit: String,
     flight_feedback: Option<Result<String, String>>,
 }
 
@@ -273,9 +275,10 @@ impl MhxyApp {
             applied_light: None,
             flight_flags,
             flight_flags_path,
+            show_flight_flags_window: false,
             flight_map_edit: SUPPORTED_MAPS[0].to_string(),
-            flight_x_edit: 0,
-            flight_y_edit: 0,
+            flight_flag_index: 0,
+            flight_flag_name_edit: String::new(),
             flight_feedback,
         };
         app.log(format!("程序启动，加载 {} 张地图", app.maps.len()));
@@ -1497,90 +1500,141 @@ impl MhxyApp {
     }
 
     fn flight_flags_ui(&mut self, ui: &mut egui::Ui) {
-        egui::ComboBox::from_id_salt("flight_flag_map")
-            .selected_text(&self.flight_map_edit)
-            .width(ui.available_width())
-            .show_ui(ui, |ui| {
-                for map in SUPPORTED_MAPS {
-                    ui.selectable_value(&mut self.flight_map_edit, map.to_string(), map);
-                }
-            });
-        if self.flight_map_edit == "长安城" && !self.maps.iter().any(|map| map.name == "长安城")
+        let flag_count: usize = SUPPORTED_MAPS
+            .iter()
+            .map(|map| self.flight_flags.flags_for(map).len())
+            .sum();
+        ui.label(
+            egui::RichText::new(format!("已配置 {flag_count} 面合成旗"))
+                .small()
+                .weak(),
+        );
+        if ui
+            .add_sized(
+                [ui.available_width(), 32.0],
+                egui::Button::new(if self.show_flight_flags_window {
+                    "关闭合成旗编辑器"
+                } else {
+                    "打开合成旗编辑器"
+                }),
+            )
+            .clicked()
         {
-            ui.label(
-                egui::RichText::new("当前版本缺少长安城地图资源，点位可保存，暂时无法绘制")
-                    .small()
-                    .color(theme::gold()),
-            );
+            self.show_flight_flags_window = !self.show_flight_flags_window;
         }
+        ui.label(
+            egui::RichText::new(format!("本地文件：{}", self.flight_flags_path.display()))
+                .small()
+                .weak(),
+        );
+    }
+
+    fn flight_flags_editor_ui(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.label("坐标");
+            ui.label("地图");
+            let previous = self.flight_map_edit.clone();
+            egui::ComboBox::from_id_salt("flight_flag_editor_map")
+                .selected_text(&self.flight_map_edit)
+                .show_ui(ui, |ui| {
+                    for map in SUPPORTED_MAPS {
+                        ui.selectable_value(&mut self.flight_map_edit, map.to_string(), map);
+                    }
+                });
+            if previous != self.flight_map_edit {
+                self.flight_flag_index = 0;
+                self.flight_feedback = None;
+            }
+            ui.separator();
+            ui.label("新建合成旗");
             ui.add(
-                egui::DragValue::new(&mut self.flight_x_edit)
-                    .range(0..=999)
-                    .prefix("X "),
+                egui::TextEdit::singleline(&mut self.flight_flag_name_edit)
+                    .desired_width(140.0)
+                    .hint_text("例如：酒店旗"),
             );
-            ui.add(
-                egui::DragValue::new(&mut self.flight_y_edit)
-                    .range(0..=999)
-                    .prefix("Y "),
-            );
-            if ui.button("添加").clicked() {
-                let point = FlightPoint {
-                    x: self.flight_x_edit,
-                    y: self.flight_y_edit,
-                };
-                let result = self
-                    .maps
-                    .iter()
-                    .find(|map| map.name == self.flight_map_edit)
-                    .map(|map| {
-                        if coordinate_in_map(map, point.x as f32, point.y as f32, 0.0) {
-                            Ok(())
-                        } else {
-                            Err(format!(
-                                "坐标超出 {} 范围（X {}–{}，Y {}–{}）",
-                                map.name,
-                                map.left_x.min(map.right_x) as i32,
-                                map.left_x.max(map.right_x) as i32,
-                                map.bottom_y.min(map.top_y) as i32,
-                                map.bottom_y.max(map.top_y) as i32
-                            ))
-                        }
-                    })
-                    .unwrap_or(Ok(()))
-                    .and_then(|()| self.flight_flags.add(&self.flight_map_edit, point));
-                match result {
-                    Ok(()) => {
+            if ui.button("新建").clicked() {
+                match self
+                    .flight_flags
+                    .add_flag(&self.flight_map_edit, &self.flight_flag_name_edit)
+                {
+                    Ok(index) => {
+                        self.flight_flag_index = index;
+                        self.flight_flag_name_edit.clear();
                         self.save_flight_flags();
                     }
                     Err(err) => self.flight_feedback = Some(Err(err)),
                 }
             }
         });
-        ui.separator();
-        let points = self.flight_flags.points_for(&self.flight_map_edit).to_vec();
-        if points.is_empty() {
-            ui.label(egui::RichText::new("还没有点位").small().weak());
+
+        let flag_names: Vec<String> = self
+            .flight_flags
+            .flags_for(&self.flight_map_edit)
+            .iter()
+            .map(|flag| flag.name.clone())
+            .collect();
+        if self.flight_flag_index >= flag_names.len() && !flag_names.is_empty() {
+            self.flight_flag_index = flag_names.len() - 1;
         }
-        let mut remove = None;
-        for (index, point) in points.iter().enumerate() {
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new(format!("{}", index + 1))
-                        .strong()
-                        .color(Color32::from_rgb(61, 214, 224)),
+        ui.horizontal_wrapped(|ui| {
+            ui.label("当前合成旗");
+            for (index, name) in flag_names.iter().enumerate() {
+                ui.selectable_value(
+                    &mut self.flight_flag_index,
+                    index,
+                    format!("{} · {name}", index + 1),
                 );
-                ui.label(format!("({}, {})", point.x, point.y));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button("删除").clicked() {
-                        remove = Some(index);
-                    }
-                });
-            });
+            }
+            if !flag_names.is_empty() && ui.button("删除当前旗").clicked() {
+                self.flight_flags
+                    .remove_flag(&self.flight_map_edit, self.flight_flag_index);
+                self.flight_flag_index = self.flight_flag_index.saturating_sub(1);
+                self.save_flight_flags();
+            }
+        });
+
+        if flag_names.is_empty() {
+            ui.label(
+                egui::RichText::new("先新建一面合成旗，再点击地图添加点位").color(theme::gold()),
+            );
         }
+        let definition = self
+            .maps
+            .iter()
+            .find(|map| map.name == self.flight_map_edit)
+            .cloned();
+        if let Some(definition) = definition {
+            self.flight_flag_map_editor(ui, &definition, !flag_names.is_empty());
+        } else {
+            ui.add_space(12.0);
+            ui.label(
+                egui::RichText::new("当前版本缺少长安城地图资源，暂时无法点击取点")
+                    .color(theme::gold()),
+            );
+        }
+
+        let points = self
+            .flight_flags
+            .flags_for(&self.flight_map_edit)
+            .get(self.flight_flag_index)
+            .map(|flag| flag.points.clone())
+            .unwrap_or_default();
+        ui.separator();
+        ui.label(egui::RichText::new("当前合成旗点位").strong());
+        let mut remove = None;
+        ui.horizontal_wrapped(|ui| {
+            for (index, point) in points.iter().enumerate() {
+                if ui
+                    .button(format!("({}, {})  ×", point.x, point.y))
+                    .on_hover_text("删除这个点位")
+                    .clicked()
+                {
+                    remove = Some(index);
+                }
+            }
+        });
         if let Some(index) = remove {
-            self.flight_flags.remove(&self.flight_map_edit, index);
+            self.flight_flags
+                .remove_point(&self.flight_map_edit, self.flight_flag_index, index);
             self.save_flight_flags();
         }
         if let Some(result) = &self.flight_feedback {
@@ -1590,11 +1644,79 @@ impl MhxyApp {
             };
             ui.label(egui::RichText::new(text).small().color(color));
         }
-        ui.label(
-            egui::RichText::new(format!("本地文件：{}", self.flight_flags_path.display()))
-                .small()
-                .weak(),
+    }
+
+    fn flight_flag_map_editor(
+        &mut self,
+        ui: &mut egui::Ui,
+        definition: &MapDefinition,
+        can_add: bool,
+    ) {
+        let Some(texture) = self.map_texture(ui.ctx(), definition) else {
+            ui.colored_label(theme::gold(), "地图图片未配置");
+            return;
+        };
+        let texture_size = texture.size_vec2();
+        let available = vec2(
+            ui.available_width(),
+            (ui.available_height() - 100.0).max(260.0),
         );
+        let (rect, response) = ui.allocate_exact_size(available, Sense::click());
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, CornerRadius::same(8), theme::inset());
+        let image_rect = fit_rect(rect.shrink(8.0), texture_size);
+        painter.image(
+            texture.id(),
+            image_rect,
+            Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+            Color32::WHITE,
+        );
+        let scale = image_rect.width() / texture_size.x;
+        let flags = self.flight_flags.flags_for(&definition.name).to_vec();
+        for (flag_index, flag) in flags.iter().enumerate() {
+            for point in &flag.points {
+                if let Some(pixel) = map_point(
+                    definition,
+                    point.x as f32,
+                    point.y as f32,
+                    texture_size.x,
+                    texture_size.y,
+                ) {
+                    draw_flight_flag_marker(
+                        &painter,
+                        pos2(
+                            image_rect.min.x + pixel.0 * scale,
+                            image_rect.min.y + pixel.1 * scale,
+                        ),
+                        flag_index + 1,
+                        flag_index == self.flight_flag_index,
+                    );
+                }
+            }
+        }
+        if can_add && response.clicked() {
+            if let Some(pointer) = response
+                .interact_pointer_pos()
+                .filter(|p| image_rect.contains(*p))
+            {
+                let pixel_x = (pointer.x - image_rect.min.x) / scale;
+                let pixel_y = (pointer.y - image_rect.min.y) / scale;
+                if let Some((x, y)) =
+                    map_coordinate(definition, pixel_x, pixel_y, texture_size.x, texture_size.y)
+                {
+                    match self.flight_flags.add_point(
+                        &self.flight_map_edit,
+                        self.flight_flag_index,
+                        FlightPoint { x, y },
+                    ) {
+                        Ok(()) => {
+                            self.save_flight_flags();
+                        }
+                        Err(err) => self.flight_feedback = Some(Err(err)),
+                    }
+                }
+            }
+        }
     }
 
     fn render_map(
@@ -1742,31 +1864,22 @@ impl MhxyApp {
             );
         }
 
-        for (index, flight) in self
+        for (flag_index, flag) in self
             .flight_flags
-            .points_for(&definition.name)
+            .flags_for(&definition.name)
             .iter()
             .enumerate()
         {
-            let (flight_x, flight_y) = clamp_to_map(definition, flight.x as f32, flight.y as f32);
-            if let Some(point) = map_point(
-                definition,
-                flight_x,
-                flight_y,
-                texture_size.x,
-                texture_size.y,
-            ) {
-                let center = to_screen(point);
-                let radius = 10.0;
-                painter.circle_filled(center, radius, Color32::from_rgb(13, 148, 160));
-                painter.circle_stroke(center, radius, egui::Stroke::new(2.0, Color32::WHITE));
-                painter.text(
-                    center,
-                    Align2::CENTER_CENTER,
-                    (index + 1).to_string(),
-                    FontId::proportional(13.0),
-                    Color32::WHITE,
-                );
+            for flight in &flag.points {
+                if let Some(point) = map_point(
+                    definition,
+                    flight.x as f32,
+                    flight.y as f32,
+                    texture_size.x,
+                    texture_size.y,
+                ) {
+                    draw_flight_flag_marker(&painter, to_screen(point), flag_index + 1, false);
+                }
             }
         }
 
@@ -3748,6 +3861,36 @@ impl eframe::App for MhxyApp {
                 },
             );
         }
+        if self.show_flight_flags_window {
+            let mut builder = egui::ViewportBuilder::default()
+                .with_title("合成旗编辑器")
+                .with_inner_size(FLIGHT_FLAGS_WINDOW_SIZE)
+                .with_min_inner_size([680.0, 560.0]);
+            if self.config.on_top {
+                builder = builder.with_always_on_top();
+            }
+            ctx.show_viewport_immediate(
+                egui::ViewportId::from_hash_of("flight_flags_window"),
+                builder,
+                |ui, _class| {
+                    if ui.ctx().viewport_id() == egui::ViewportId::ROOT {
+                        egui::Window::new("合成旗编辑器")
+                            .default_size(FLIGHT_FLAGS_WINDOW_SIZE)
+                            .show(ui.ctx(), |ui| self.flight_flags_editor_ui(ui));
+                    } else {
+                        if ui.ctx().input(|input| input.viewport().close_requested()) {
+                            self.show_flight_flags_window = false;
+                        }
+                        egui::Frame::central_panel(ui.style())
+                            .inner_margin(16)
+                            .show(ui, |ui| {
+                                ui.set_min_size(ui.available_size());
+                                self.flight_flags_editor_ui(ui);
+                            });
+                    }
+                },
+            );
+        }
         if !self.show_region_window {
             self.release_preview();
         }
@@ -3859,6 +4002,32 @@ fn region_fields(
 
 /// 取点窗口的默认尺寸。
 const REGION_WINDOW_SIZE: Vec2 = Vec2::new(1000.0, 820.0);
+
+fn draw_flight_flag_marker(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    number: usize,
+    selected: bool,
+) {
+    let fill = if selected {
+        Color32::from_rgb(9, 111, 121)
+    } else {
+        Color32::from_rgb(13, 148, 160)
+    };
+    painter.circle_filled(center, 10.0, fill);
+    painter.circle_stroke(
+        center,
+        10.0,
+        egui::Stroke::new(if selected { 3.0 } else { 2.0 }, Color32::WHITE),
+    );
+    painter.text(
+        center,
+        Align2::CENTER_CENTER,
+        number.to_string(),
+        FontId::proportional(13.0),
+        Color32::WHITE,
+    );
+}
 
 /// 顶部栏统一按钮格式：统一样式与高度，用 selected 表示开关状态。
 fn header_button(text: &str, selected: bool) -> egui::Button<'static> {
@@ -4082,13 +4251,27 @@ mod tests {
         let texts = collect_texts(&output.shapes);
         output.textures_delta.clear();
         assert!(
-            texts.iter().any(|text| text == "长安城"),
-            "编辑器应显示当前飞行旗地图：{texts:?}"
+            texts.iter().any(|text| text == "打开合成旗编辑器"),
+            "侧栏应提供独立编辑窗口入口：{texts:?}"
         );
         assert!(
             texts.iter().any(|text| text.contains("flight_flags.json")),
             "编辑区应说明独立本地配置文件：{texts:?}"
         );
+
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 760.0))),
+                ..Default::default()
+            },
+            |ui| app.flight_flags_editor_ui(ui),
+        );
+        let texts = collect_texts(&output.shapes);
+        output.textures_delta.clear();
+        assert!(texts.iter().any(|text| text == "新建合成旗"));
+        assert!(texts
+            .iter()
+            .any(|text| text == "先新建一面合成旗，再点击地图添加点位"));
     }
 
     #[test]

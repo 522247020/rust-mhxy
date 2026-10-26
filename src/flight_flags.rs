@@ -1,4 +1,4 @@
-//! 本地合成旗点位配置。该文件放在用户数据目录，不随安装包分发或更新。
+//! 本地飞行旗配置。合成旗是多个飞行点的集合，同一合成旗共享地图标注编号。
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -13,10 +13,23 @@ pub struct FlightPoint {
     pub y: i32,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct CompositeFlag {
+    pub name: String,
+    #[serde(default)]
+    pub points: Vec<FlightPoint>,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct FlightFlags {
     #[serde(default)]
-    pub maps: BTreeMap<String, Vec<FlightPoint>>,
+    pub maps: BTreeMap<String, Vec<CompositeFlag>>,
+}
+
+#[derive(Deserialize)]
+struct LegacyFlightFlags {
+    #[serde(default)]
+    maps: BTreeMap<String, Vec<FlightPoint>>,
 }
 
 impl FlightFlags {
@@ -26,8 +39,29 @@ impl FlightFlags {
         }
         let text =
             std::fs::read_to_string(path).map_err(|err| format!("读取飞行旗配置失败：{err}"))?;
-        let mut flags: Self =
-            serde_json::from_str(&text).map_err(|err| format!("飞行旗配置格式错误：{err}"))?;
+        let mut flags: Self = match serde_json::from_str(&text) {
+            Ok(flags) => flags,
+            Err(current_error) => {
+                let legacy: LegacyFlightFlags = serde_json::from_str(&text)
+                    .map_err(|_| format!("飞行旗配置格式错误：{current_error}"))?;
+                Self {
+                    maps: legacy
+                        .maps
+                        .into_iter()
+                        .filter(|(_, points)| !points.is_empty())
+                        .map(|(map, points)| {
+                            (
+                                map,
+                                vec![CompositeFlag {
+                                    name: "合成旗 1".to_string(),
+                                    points,
+                                }],
+                            )
+                        })
+                        .collect(),
+                }
+            }
+        };
         flags.normalize();
         Ok(flags)
     }
@@ -51,55 +85,99 @@ impl FlightFlags {
         })
     }
 
-    pub fn points_for(&self, map: &str) -> &[FlightPoint] {
+    pub fn flags_for(&self, map: &str) -> &[CompositeFlag] {
         self.maps
             .get(normalize_map_name(map))
             .map_or(&[], Vec::as_slice)
     }
 
-    pub fn add(&mut self, map: &str, point: FlightPoint) -> Result<(), String> {
-        let map = normalize_map_name(map);
-        if !SUPPORTED_MAPS.contains(&map) {
-            return Err(format!("{map} 不支持飞行旗标注"));
+    pub fn add_flag(&mut self, map: &str, name: &str) -> Result<usize, String> {
+        let map = checked_map(map)?;
+        let flags = self.maps.entry(map.to_string()).or_default();
+        let name = name.trim();
+        let name = if name.is_empty() {
+            format!("合成旗 {}", flags.len() + 1)
+        } else {
+            name.to_string()
+        };
+        if flags.iter().any(|flag| flag.name == name) {
+            return Err(format!("{map} 已有名为“{name}”的合成旗"));
         }
-        if point.x < 0 || point.y < 0 {
-            return Err("飞行旗坐标不能小于 0".to_string());
-        }
-        let points = self.maps.entry(map.to_string()).or_default();
-        if points.contains(&point) {
-            return Err(format!("点位 ({}, {}) 已存在", point.x, point.y));
-        }
-        points.push(point);
-        Ok(())
+        flags.push(CompositeFlag {
+            name,
+            points: Vec::new(),
+        });
+        Ok(flags.len() - 1)
     }
 
-    pub fn remove(&mut self, map: &str, index: usize) -> bool {
+    pub fn remove_flag(&mut self, map: &str, flag_index: usize) -> bool {
         let map = normalize_map_name(map);
-        let Some(points) = self.maps.get_mut(map) else {
+        let Some(flags) = self.maps.get_mut(map) else {
             return false;
         };
-        if index >= points.len() {
+        if flag_index >= flags.len() {
             return false;
         }
-        points.remove(index);
-        if points.is_empty() {
+        flags.remove(flag_index);
+        if flags.is_empty() {
             self.maps.remove(map);
         }
         true
     }
 
+    pub fn add_point(
+        &mut self,
+        map: &str,
+        flag_index: usize,
+        point: FlightPoint,
+    ) -> Result<(), String> {
+        let map = checked_map(map)?;
+        if point.x < 0 || point.y < 0 {
+            return Err("飞行旗坐标不能小于 0".to_string());
+        }
+        let flag = self
+            .maps
+            .get_mut(map)
+            .and_then(|flags| flags.get_mut(flag_index))
+            .ok_or_else(|| "请先新建或选择一个合成旗".to_string())?;
+        if flag.points.contains(&point) {
+            return Err(format!("点位 ({}, {}) 已存在", point.x, point.y));
+        }
+        flag.points.push(point);
+        Ok(())
+    }
+
+    pub fn remove_point(&mut self, map: &str, flag_index: usize, point_index: usize) -> bool {
+        let Some(flag) = self
+            .maps
+            .get_mut(normalize_map_name(map))
+            .and_then(|flags| flags.get_mut(flag_index))
+        else {
+            return false;
+        };
+        if point_index >= flag.points.len() {
+            return false;
+        }
+        flag.points.remove(point_index);
+        true
+    }
+
     fn normalize(&mut self) {
-        if let Some(points) = self.maps.remove("朱子国") {
+        if let Some(flags) = self.maps.remove("朱子国") {
             self.maps
                 .entry("朱紫国".to_string())
                 .or_default()
-                .extend(points);
+                .extend(flags);
         }
-        self.maps.retain(|map, points| {
-            SUPPORTED_MAPS.contains(&map.as_str()) && {
-                points.retain(|point| point.x >= 0 && point.y >= 0);
-                let mut unique = Vec::with_capacity(points.len());
-                points.retain(|point| {
+        self.maps.retain(|map, flags| {
+            if !SUPPORTED_MAPS.contains(&map.as_str()) {
+                return false;
+            }
+            flags.retain_mut(|flag| {
+                flag.name = flag.name.trim().to_string();
+                flag.points.retain(|point| point.x >= 0 && point.y >= 0);
+                let mut unique = Vec::with_capacity(flag.points.len());
+                flag.points.retain(|point| {
                     if unique.contains(point) {
                         false
                     } else {
@@ -107,9 +185,19 @@ impl FlightFlags {
                         true
                     }
                 });
-                !points.is_empty()
-            }
+                !flag.name.is_empty()
+            });
+            !flags.is_empty()
         });
+    }
+}
+
+fn checked_map(map: &str) -> Result<&str, String> {
+    let map = normalize_map_name(map);
+    if SUPPORTED_MAPS.contains(&map) {
+        Ok(map)
+    } else {
+        Err(format!("{map} 不支持飞行旗标注"))
     }
 }
 
@@ -146,16 +234,47 @@ mod tests {
     use super::*;
 
     #[test]
-    fn adds_numbers_and_normalizes_supported_maps() {
+    fn one_composite_flag_groups_multiple_points_under_one_number() {
         let mut flags = FlightFlags::default();
-        flags.add("朱子国", FlightPoint { x: 10, y: 20 }).unwrap();
-        flags.add("朱紫国", FlightPoint { x: 30, y: 40 }).unwrap();
-        assert_eq!(
-            flags.points_for("朱紫国"),
-            [FlightPoint { x: 10, y: 20 }, FlightPoint { x: 30, y: 40 }]
-        );
-        assert!(flags.add("建邺城", FlightPoint { x: 1, y: 2 }).is_err());
-        assert!(flags.add("朱紫国", FlightPoint { x: 10, y: 20 }).is_err());
+        let first = flags.add_flag("朱子国", "酒店旗").unwrap();
+        flags
+            .add_point("朱紫国", first, FlightPoint { x: 10, y: 20 })
+            .unwrap();
+        flags
+            .add_point("朱紫国", first, FlightPoint { x: 30, y: 40 })
+            .unwrap();
+        assert_eq!(flags.flags_for("朱紫国")[0].points.len(), 2);
+        assert_eq!(flags.flags_for("朱紫国")[0].name, "酒店旗");
+    }
+
+    #[test]
+    fn different_composite_flags_keep_separate_numbers() {
+        let mut flags = FlightFlags::default();
+        assert_eq!(flags.add_flag("傲来国", "一号旗").unwrap(), 0);
+        assert_eq!(flags.add_flag("傲来国", "二号旗").unwrap(), 1);
+        flags
+            .add_point("傲来国", 1, FlightPoint { x: 12, y: 34 })
+            .unwrap();
+        assert_eq!(flags.flags_for("傲来国").len(), 2);
+        assert_eq!(flags.flags_for("傲来国")[1].points.len(), 1);
+    }
+
+    #[test]
+    fn migrates_legacy_point_lists_into_one_composite_flag() {
+        let path = std::env::temp_dir().join(format!(
+            "rust-mhxy-flight-flags-legacy-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            r#"{"maps":{"长寿村":[{"x":10,"y":20},{"x":30,"y":40}]}}"#,
+        )
+        .unwrap();
+        let flags = FlightFlags::load(&path).unwrap();
+        assert_eq!(flags.flags_for("长寿村").len(), 1);
+        assert_eq!(flags.flags_for("长寿村")[0].name, "合成旗 1");
+        assert_eq!(flags.flags_for("长寿村")[0].points.len(), 2);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -166,7 +285,10 @@ mod tests {
             std::thread::current().name().unwrap_or("test")
         ));
         let mut flags = FlightFlags::default();
-        flags.add("傲来国", FlightPoint { x: 12, y: 34 }).unwrap();
+        let index = flags.add_flag("傲来国", "测试旗").unwrap();
+        flags
+            .add_point("傲来国", index, FlightPoint { x: 12, y: 34 })
+            .unwrap();
         flags.save(&path).unwrap();
         assert_eq!(FlightFlags::load(&path).unwrap(), flags);
         let _ = std::fs::remove_file(path);
