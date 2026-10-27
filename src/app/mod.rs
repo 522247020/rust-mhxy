@@ -821,6 +821,19 @@ impl MhxyApp {
         }
     }
 
+    /// 采纳一个新的快捷键：写入配置并立即重新注册（用于“改用空闲快捷键”）。
+    fn adopt_hotkey(&mut self, label: String) {
+        if self.config.ocr_hotkey == label {
+            return;
+        }
+        self.config.ocr_hotkey = label;
+        self.hotkey_attempted = None;
+        self.hotkey_tried_at = None;
+        self.hotkey_error = None;
+        self.persist();
+        self.sync_hotkey();
+    }
+
     /// 按当前运行状态 / 模式 / 快捷键字符串同步全局快捷键注册。
     fn sync_hotkey(&mut self) {
         // 只要在运行就注册（自动模式下手动按一下也会立即识别一次），
@@ -866,9 +879,12 @@ impl MhxyApp {
         };
         match hotkey::spawn(hotkey, next_hotkey_id(), self.hotkey_tx.clone()) {
             Ok(listener) => {
+                match &listener.warning {
+                    Some(warn) => self.log_detail(format!("快捷键提示：{warn}")),
+                    None => self.log_detail(format!("已注册全局快捷键：{label}")),
+                }
                 self.hotkey_listener = Some(listener);
                 self.hotkey_error = None;
-                self.log_detail(format!("已注册全局快捷键：{label}"));
             }
             Err(err) => {
                 self.hotkey_listener = None;

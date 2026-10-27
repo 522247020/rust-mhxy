@@ -455,29 +455,63 @@ impl MhxyApp {
                     });
                     match Hotkey::parse(&self.config.ocr_hotkey) {
                         Ok(hotkey) => {
-                            let registered = self
-                                .hotkey_listener
-                                .as_ref()
-                                .is_some_and(|listener| listener.is_alive());
-                            let status = if registered {
-                                "全局快捷键已注册"
+                            let (registered, warning) = match &self.hotkey_listener {
+                                Some(listener) => (listener.is_alive(), listener.warning.clone()),
+                                None => (false, None),
+                            };
+                            if registered {
+                                if let Some(warn) = warning {
+                                    ui.colored_label(
+                                        theme::gold(),
+                                        format!("⚠ {}：{}", hotkey.display(), warn),
+                                    );
+                                    if let Some(alt) = hotkey::suggest_available(hotkey) {
+                                        if ui
+                                            .button(format!("改用 {}（空闲）", alt.display()))
+                                            .clicked()
+                                        {
+                                            self.adopt_hotkey(alt.display());
+                                        }
+                                    }
+                                } else {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "{} · 全局快捷键已注册",
+                                            hotkey.display()
+                                        ))
+                                        .small()
+                                        .color(theme::muted()),
+                                    );
+                                }
                             } else if !self.running {
-                                "开始监听后生效"
-                            } else if let Some(err) = &self.hotkey_error {
-                                err.as_str()
-                            } else {
-                                "正在注册…"
-                            };
-                            let color = if registered {
-                                theme::muted()
-                            } else {
-                                theme::gold()
-                            };
-                            ui.label(
-                                egui::RichText::new(format!("{} · {status}", hotkey.display()))
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{} · 开始监听后生效",
+                                        hotkey.display()
+                                    ))
                                     .small()
-                                    .color(color),
-                            );
+                                    .color(theme::gold()),
+                                );
+                            } else if let Some(err) = self.hotkey_error.clone() {
+                                ui.colored_label(theme::gold(), format!("⚠ {err}"));
+                                if let Some(alt) = hotkey::suggest_available(hotkey) {
+                                    if ui
+                                        .button(format!("改用 {}（空闲）", alt.display()))
+                                        .clicked()
+                                    {
+                                        self.adopt_hotkey(alt.display());
+                                    }
+                                }
+                            } else {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{} · 正在注册…",
+                                        hotkey.display()
+                                    ))
+                                    .small()
+                                    .color(theme::gold()),
+                                );
+                            }
                         }
                         Err(err) => {
                             ui.colored_label(theme::gold(), format!("快捷键无效：{err}"));

@@ -393,6 +393,9 @@ pub struct GlobalHotkey {
     thread_id: u32,
     #[allow(dead_code)]
     handle: std::thread::JoinHandle<()>,
+    /// 注册时发现该组合已被其它程序占用（会提示用户换键）。
+    /// 有键盘钩子兜底，所以即便这里非空，快捷键仍然能触发。
+    pub warning: Option<String>,
 }
 
 impl GlobalHotkey {
@@ -422,48 +425,263 @@ pub fn spawn(hotkey: Hotkey, id: i32, sender: Sender<()>) -> Result<GlobalHotkey
     }
 }
 
+/// 探测某个快捷键当前是否可用（未被其它程序占用）。非 Windows 恒为 true。
+pub fn is_available(hotkey: Hotkey) -> bool {
+    #[cfg(windows)]
+    {
+        windows_impl::is_available(hotkey)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = hotkey;
+        true
+    }
+}
+
+/// `desired` 被占用时，实测并返回一个空闲的替代组合。
+/// 优先给常用、基本不会和游戏/输入法冲突的 F 键，其次才是加修饰键的变体。
+pub fn suggest_available(desired: Hotkey) -> Option<Hotkey> {
+    let mut candidates: Vec<Hotkey> = Vec::new();
+    // 1) 常用 F 键
+    for f in [8u8, 9, 6, 7, 10, 12, 5, 4] {
+        candidates.push(Hotkey {
+            ctrl: false,
+            shift: false,
+            alt: false,
+            win: false,
+            key: Key::F(f),
+        });
+    }
+    // 2) Alt + F 变体
+    for f in [8u8, 9, 10, 12] {
+        candidates.push(Hotkey {
+            ctrl: false,
+            shift: false,
+            alt: true,
+            win: false,
+            key: Key::F(f),
+        });
+    }
+    // 3) 在原组合上补修饰键，尽量保留原来的主键手感
+    candidates.push(Hotkey {
+        ctrl: true,
+        alt: true,
+        ..desired
+    });
+    candidates.push(Hotkey {
+        ctrl: true,
+        shift: true,
+        ..desired
+    });
+    candidates.push(Hotkey {
+        alt: true,
+        shift: true,
+        ..desired
+    });
+    candidates
+        .into_iter()
+        .find(|candidate| *candidate != desired && is_available(*candidate))
+}
+
 #[cfg(windows)]
 mod windows_impl {
     use super::{GlobalHotkey, Hotkey};
     use std::sync::mpsc::{channel, Sender};
     use std::thread;
     use std::time::Duration;
-    use windows::Win32::Foundation::{LPARAM, WPARAM};
+    use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
     use windows::Win32::System::Threading::GetCurrentThreadId;
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_SHIFT,
-        MOD_WIN,
+        GetAsyncKeyState, RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL,
+        MOD_NOREPEAT, MOD_SHIFT, MOD_WIN, VIRTUAL_KEY, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN,
+        VK_SHIFT,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetMessageW, PeekMessageW, PostThreadMessageW, MSG, PM_NOREMOVE, WM_HOTKEY, WM_QUIT,
+        CallNextHookEx, GetMessageW, PeekMessageW, PostThreadMessageW, SetWindowsHookExW,
+        UnhookWindowsHookEx, KBDLLHOOKSTRUCT, MSG, PM_NOREMOVE, WH_KEYBOARD_LL, WM_HOTKEY,
+        WM_KEYDOWN, WM_KEYUP, WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP,
     };
 
+    /// 要监听的目标组合（供低级键盘钩子使用）。
+    #[derive(Clone, Copy)]
+    struct Desired {
+        vk: u32,
+        ctrl: bool,
+        shift: bool,
+        alt: bool,
+        win: bool,
+    }
+
+    /// 监听线程启动时上报给调用方的信息。
+    struct Ready {
+        thread_id: u32,
+        warning: Option<String>,
+    }
+
+    // 低级键盘钩子的回调是一个无状态函数指针，只能通过线程局部变量把配置和发送端传进去。
+    // 钩子回调就在装载它的监听线程里执行，所以 thread_local 能正确解析到该线程的状态。
+    thread_local! {
+        static DESIRED: std::cell::Cell<Option<Desired>> = std::cell::Cell::new(None);
+        static SENDER: std::cell::RefCell<Option<Sender<()>>> = std::cell::RefCell::new(None);
+        static HOLDING_VK: std::cell::Cell<u32> = std::cell::Cell::new(0);
+        static LAST_FIRE: std::cell::Cell<Option<std::time::Instant>> = std::cell::Cell::new(None);
+    }
+
+    fn desired_of(hotkey: Hotkey) -> Desired {
+        Desired {
+            vk: hotkey.key.vk(),
+            ctrl: hotkey.ctrl,
+            shift: hotkey.shift,
+            alt: hotkey.alt,
+            win: hotkey.win,
+        }
+    }
+
+    fn modifier_bits(hotkey: Hotkey) -> u32 {
+        // MOD_NOREPEAT：按住不放时不重复触发。
+        let mut bits = MOD_NOREPEAT.0;
+        if hotkey.ctrl {
+            bits |= MOD_CONTROL.0;
+        }
+        if hotkey.shift {
+            bits |= MOD_SHIFT.0;
+        }
+        if hotkey.alt {
+            bits |= MOD_ALT.0;
+        }
+        if hotkey.win {
+            bits |= MOD_WIN.0;
+        }
+        bits
+    }
+
+    fn key_down(vk: VIRTUAL_KEY) -> bool {
+        unsafe { (GetAsyncKeyState(vk.0 as i32) as u16 & 0x8000) != 0 }
+    }
+
+    fn modifiers_match(desired: Desired) -> bool {
+        let ctrl = key_down(VK_CONTROL);
+        let shift = key_down(VK_SHIFT);
+        let alt = key_down(VK_MENU);
+        let win = key_down(VK_LWIN) || key_down(VK_RWIN);
+        ctrl == desired.ctrl && shift == desired.shift && alt == desired.alt && win == desired.win
+    }
+
+    /// 发送一次触发；WM_HOTKEY 与键盘钩子会对同一次按键都上报，这里做去重。
+    fn fire() {
+        let now = std::time::Instant::now();
+        let skip = LAST_FIRE.with(|slot| {
+            let skip = slot
+                .get()
+                .is_some_and(|last| now.duration_since(last) < Duration::from_millis(150));
+            if !skip {
+                slot.set(Some(now));
+            }
+            skip
+        });
+        if skip {
+            return;
+        }
+        let _ = SENDER.try_with(|slot| {
+            if let Some(tx) = slot.borrow().as_ref() {
+                let _ = tx.send(());
+            }
+        });
+    }
+
+    /// 低级键盘钩子回调：在按键送到前台（含全屏游戏）之前就能看到，
+    /// 即便游戏独占键盘、或系统热键被别的程序占用，也能触发。
+    unsafe extern "system" fn ll_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        if code == 0 {
+            // HC_ACTION == 0：wParam/lParam 含有效按键信息。
+            let desired = match DESIRED.try_with(|slot| slot.get()) {
+                Ok(Some(desired)) => desired,
+                _ => return CallNextHookEx(None, code, wparam, lparam),
+            };
+            let kb = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
+            if desired.vk != 0 && kb.vkCode == desired.vk {
+                let msg = wparam.0 as u32;
+                let down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
+                let up = msg == WM_KEYUP || msg == WM_SYSKEYUP;
+                if down {
+                    let holding = HOLDING_VK.try_with(|cell| cell.get()).unwrap_or(0);
+                    if holding != desired.vk && modifiers_match(desired) {
+                        let _ = HOLDING_VK.try_with(|cell| cell.set(desired.vk));
+                        fire();
+                    }
+                } else if up {
+                    let _ = HOLDING_VK.try_with(|cell| {
+                        if cell.get() == desired.vk {
+                            cell.set(0);
+                        }
+                    });
+                }
+            }
+        }
+        CallNextHookEx(None, code, wparam, lparam)
+    }
+
+    /// 探测组合是否空闲（未被其它程序占用）。
+    pub fn is_available(hotkey: Hotkey) -> bool {
+        unsafe {
+            let mut msg = MSG::default();
+            let _ = PeekMessageW(&mut msg, None, 0, 0, PM_NOREMOVE);
+            const PROBE_ID: i32 = 0x5151;
+            let ok = RegisterHotKey(
+                None,
+                PROBE_ID,
+                HOT_KEY_MODIFIERS(modifier_bits(hotkey)),
+                hotkey.key.vk(),
+            )
+            .is_ok();
+            if ok {
+                let _ = UnregisterHotKey(None, PROBE_ID);
+            }
+            ok
+        }
+    }
+
     pub fn spawn(hotkey: Hotkey, id: i32, sender: Sender<()>) -> Result<GlobalHotkey, String> {
-        let (ready_tx, ready_rx) = channel::<Result<u32, String>>();
+        let (ready_tx, ready_rx) = channel::<Result<Ready, String>>();
         let handle = thread::spawn(move || unsafe {
             // 先创建线程消息队列，RegisterHotKey(NULL) 的 WM_HOTKEY 会投递到这里。
             let mut msg = MSG::default();
             let _ = PeekMessageW(&mut msg, None, 0, 0, PM_NOREMOVE);
 
-            let mut bits = 0u32;
-            if hotkey.ctrl {
-                bits |= MOD_CONTROL.0;
-            }
-            if hotkey.shift {
-                bits |= MOD_SHIFT.0;
-            }
-            if hotkey.alt {
-                bits |= MOD_ALT.0;
-            }
-            if hotkey.win {
-                bits |= MOD_WIN.0;
-            }
-            if let Err(err) = RegisterHotKey(None, id, HOT_KEY_MODIFIERS(bits), hotkey.key.vk()) {
-                let _ = ready_tx.send(Err(format!("注册全局快捷键失败：{err}")));
+            DESIRED.with(|slot| slot.set(Some(desired_of(hotkey))));
+            SENDER.with(|slot| *slot.borrow_mut() = Some(sender));
+
+            // 低级键盘钩子先装：即便后面 RegisterHotKey 被占用失败，钩子也能兜底触发。
+            let hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(ll_proc), None, 0).ok();
+
+            // 尽量再注册系统全局热键：成功后系统会替我们“吃掉”这个组合，
+            // 避免同一按键再传给其它程序重复触发；失败也不致命（钩子兜底）。
+            let registered = RegisterHotKey(
+                None,
+                id,
+                HOT_KEY_MODIFIERS(modifier_bits(hotkey)),
+                hotkey.key.vk(),
+            )
+            .is_ok();
+            let warning = if registered {
+                None
+            } else {
+                Some(format!(
+                    "{} 已被其他程序占用，可能同时触发对方；建议换一个组合",
+                    hotkey.display()
+                ))
+            };
+
+            if hook.is_none() && !registered {
+                let _ = ready_tx.send(Err(format!(
+                    "注册全局快捷键失败：{}（键盘钩子也不可用）",
+                    hotkey.display()
+                )));
                 return;
             }
+
             let thread_id = GetCurrentThreadId();
-            let _ = ready_tx.send(Ok(thread_id));
+            let _ = ready_tx.send(Ok(Ready { thread_id, warning }));
 
             loop {
                 let mut msg = MSG::default();
@@ -472,14 +690,21 @@ mod windows_impl {
                     break;
                 }
                 if msg.message == WM_HOTKEY {
-                    let _ = sender.send(());
+                    fire();
                 }
+            }
+            if let Some(hook) = hook {
+                let _ = UnhookWindowsHookEx(hook);
             }
             let _ = UnregisterHotKey(None, id);
         });
 
         match ready_rx.recv_timeout(Duration::from_secs(3)) {
-            Ok(Ok(thread_id)) => Ok(GlobalHotkey { thread_id, handle }),
+            Ok(Ok(ready)) => Ok(GlobalHotkey {
+                thread_id: ready.thread_id,
+                handle,
+                warning: ready.warning,
+            }),
             Ok(Err(err)) => Err(err),
             Err(_) => Err("注册全局快捷键超时".to_string()),
         }
@@ -556,4 +781,5 @@ mod tests {
         assert!(Hotkey::parse("").is_err());
         assert!(Hotkey::parse("Ctrl+Unknown").is_err());
     }
+
 }
