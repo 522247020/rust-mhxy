@@ -213,8 +213,8 @@ jobs:
           #   glutin    -> egl / gl（OpenGL）
           #   winit     -> wayland / xkbcommon / x11（窗口）
           # Windows 打包走 x86_64-pc-windows-msvc target，不需要这些库。
-          packages="pkg-config libpipewire-0.3-dev libegl1-mesa-dev libgl1-mesa-dev libxkbcommon-dev libwayland-dev libx11-dev libxcb1-dev"
-          if ! pkg-config --exists libpipewire-0.3 egl 2>/dev/null; then
+          packages="pkg-config libpipewire-0.3-dev libegl1-mesa-dev libgl1-mesa-dev libgbm-dev libdrm-dev libxkbcommon-dev libwayland-dev libx11-dev libxcb1-dev"
+          if ! pkg-config --exists libpipewire-0.3 egl gbm 2>/dev/null; then
             echo "安装 Linux 构建依赖"
             if command -v sudo >/dev/null 2>&1; then
               sudo apt-get update && sudo apt-get install -y $packages
@@ -222,7 +222,7 @@ jobs:
               apt-get update && apt-get install -y $packages
             fi
           fi
-          pkg-config --modversion libpipewire-0.3 egl
+          pkg-config --modversion libpipewire-0.3 egl gbm
 
       - name: Run tests
         run: |
