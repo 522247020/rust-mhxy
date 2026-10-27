@@ -61,6 +61,65 @@ const MEDITATION_WINDOW_SIZE: Vec2 = Vec2::new(480.0, 560.0);
 struct TaskState {
     location: Option<TaskLocation>,
     map_index: Option<usize>,
+    /// 多帧投票缓冲，抑制单帧错认。
+    votes: VoteBuffer,
+}
+
+/// 多帧投票：地图取最近几帧的众数（连续 2 帧相同则立即切换），
+/// 坐标取该地图最近 3 帧的中位数。
+#[derive(Default)]
+struct VoteBuffer {
+    recent: std::collections::VecDeque<(String, i32, i32)>,
+}
+
+impl VoteBuffer {
+    fn vote(&mut self, map: &str, x: i32, y: i32) -> (String, i32, i32) {
+        self.recent.push_back((map.to_string(), x, y));
+        while self.recent.len() > 5 {
+            self.recent.pop_front();
+        }
+        // 连续两帧同一地图：视为切换或稳定跟踪，不再等众数。
+        let consecutive = self
+            .recent
+            .iter()
+            .rev()
+            .take(2)
+            .all(|(name, _, _)| name == map);
+        let best_map = if consecutive {
+            map.to_string()
+        } else {
+            let mut counts: Vec<(String, usize)> = Vec::new();
+            for (name, _, _) in &self.recent {
+                match counts.iter_mut().find(|(known, _)| known == name) {
+                    Some((_, count)) => *count += 1,
+                    None => counts.push((name.clone(), 1)),
+                }
+            }
+            let (best, best_count) = counts
+                .into_iter()
+                .max_by_key(|(_, count)| *count)
+                .unwrap_or_else(|| (map.to_string(), 1));
+            if best_count < 2 {
+                return (map.to_string(), x, y);
+            }
+            best
+        };
+        // 同一地图最近 3 帧的坐标中位数。
+        let mut xs = Vec::new();
+        let mut ys = Vec::new();
+        for (name, px, py) in self.recent.iter().rev().take(3) {
+            if name == &best_map {
+                xs.push(*px);
+                ys.push(*py);
+            }
+        }
+        if xs.is_empty() {
+            return (best_map, x, y);
+        }
+        xs.sort_unstable();
+        ys.sort_unstable();
+        (best_map, xs[xs.len() / 2], ys[ys.len() / 2])
+    }
 }
 
 pub struct MhxyApp {
@@ -908,7 +967,8 @@ impl MhxyApp {
                 self.config.extra_preprocess_tolerance,
             ));
         }
-        let panel = capture::stack_images(&panels);
+        // 放大后再送 OCR：任务栏文字小的时候，检测模型更容易漏掉。
+        let panel = preprocess::upscale(&capture::stack_images(&panels), self.config.ocr_upscale);
         self.update_preview(full);
         self.notice = None;
         let signature = hash_image(&panel);
@@ -947,7 +1007,10 @@ impl MhxyApp {
             });
         } else {
             self.log_detail(format!("{window_title}：本地 PP-OCR 识别中"));
-            if let Err(err) = self.worker.submit(generation, panel) {
+            if let Err(err) = self
+                .worker
+                .submit(generation, panel, self.config.ocr_high_recall)
+            {
                 self.busy = false;
                 self.notice = Some(err);
             }
@@ -1060,7 +1123,7 @@ impl MhxyApp {
                 self.config.extra_preprocess_tolerance,
             ));
         }
-        let panel = capture::stack_images(&panels);
+        let panel = preprocess::upscale(&capture::stack_images(&panels), self.config.ocr_upscale);
         self.ocr_test_running = true;
         self.ocr_test_result = None;
         if self.config.ocr_mode == "remote" {
@@ -1106,10 +1169,21 @@ impl MhxyApp {
             if !self.task_active(task_type) {
                 continue;
             }
-            let location = locations
+            let mut location = locations
                 .iter()
                 .find(|location| location.task_type == task_type)
                 .cloned();
+            // 多帧投票：地图取众数、坐标取中位数，减少单帧错认造成的跳动。
+            if self.config.ocr_vote_frames {
+                if let (Some(location), Some(state)) =
+                    (location.as_mut(), self.tasks.get_mut(task_type))
+                {
+                    let (map, x, y) = state.votes.vote(&location.map_name, location.x, location.y);
+                    location.map_name = map;
+                    location.x = x;
+                    location.y = y;
+                }
+            }
             let mut clamp_note = None;
             let (map_index, task_status) = match &location {
                 None => (None, Some("本轮未识别到任务".to_string())),

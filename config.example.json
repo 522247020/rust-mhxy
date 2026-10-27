@@ -8,6 +8,12 @@
   "ocr/mode": "local",
   // 识别间隔（秒），范围 1~60（仅自动模式使用）
   "ocr/interval_seconds": 5,
+  // 送 OCR 前把截图放大几倍（1~3）。任务栏文字较小时提高检测召回。
+  "ocr/upscale": 2,
+  // 高召回检测：降低 PP-OCR 检测阈值，减少漏字；代价是可能多出噪声框。
+  "ocr/high_recall": true,
+  // 多帧投票：地图取最近几帧众数、坐标取中位数，抑制单帧错认导致的跳动。
+  "ocr/vote_frames": true,
   // 识别触发方式："auto" 按间隔自动识别；"manual" 按快捷键手动触发一次
   "ocr/trigger": "auto",
   // 手动模式的快捷键，例如 F8、Ctrl+F8；Windows 下全局生效

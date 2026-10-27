@@ -648,6 +648,31 @@ fn entering_compact_mode_shows_exit_hint() {
 }
 
 #[test]
+fn vote_uses_median_for_same_map() {
+    let mut votes = VoteBuffer::default();
+    assert_eq!(
+        votes.vote("长寿村", 100, 50),
+        ("长寿村".to_string(), 100, 50)
+    );
+    votes.vote("长寿村", 102, 52);
+    let (map, x, y) = votes.vote("长寿村", 101, 50);
+    assert_eq!(map, "长寿村");
+    assert_eq!((x, y), (101, 50), "同地图应取坐标中位数");
+}
+
+#[test]
+fn vote_switches_map_after_two_frames() {
+    let mut votes = VoteBuffer::default();
+    for _ in 0..3 {
+        votes.vote("长寿村", 100, 50);
+    }
+    let (map, _, _) = votes.vote("天宫", 200, 60);
+    assert_eq!(map, "长寿村", "单帧新地图不应立刻切换");
+    let (map, _, _) = votes.vote("天宫", 201, 61);
+    assert_eq!(map, "天宫", "连续两帧新地图才切换");
+}
+
+#[test]
 fn compact_mode_hides_chrome_and_esc_restores_it() {
     let mut app = app();
     let ctx = app.ctx.clone();

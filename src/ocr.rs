@@ -43,6 +43,8 @@ struct LocalJob {
     image: RgbImage,
     /// 测试任务不参与正式识别的合并与结果回写。
     test: bool,
+    /// 高召回检测：降低检测阈值，宁可多出噪声框也别漏字。
+    high_recall: bool,
 }
 
 /// 常驻线程：收到第一张截图时才加载模型，远端模式不占用模型内存。
@@ -54,7 +56,8 @@ impl LocalWorker {
     pub fn spawn(reply: Sender<OcrEvent>, ctx: egui::Context) -> LocalWorker {
         let (sender, receiver) = channel::<LocalJob>();
         thread::spawn(move || {
-            let mut engine = None;
+            let mut engine_normal = None;
+            let mut engine_recall = None;
             let mut pending: std::collections::VecDeque<LocalJob> =
                 std::collections::VecDeque::new();
             loop {
@@ -76,11 +79,15 @@ impl LocalWorker {
                     }
                 }
                 let result = (|| {
-                    if engine.is_none() {
-                        engine = Some(LocalEngine::new()?);
+                    let slot = if job.high_recall {
+                        &mut engine_recall
+                    } else {
+                        &mut engine_normal
+                    };
+                    if slot.is_none() {
+                        *slot = Some(LocalEngine::new(job.high_recall)?);
                     }
-                    engine
-                        .as_ref()
+                    slot.as_ref()
                         .expect("initialized engine")
                         .recognize(&job.image)
                 })();
@@ -101,12 +108,18 @@ impl LocalWorker {
         LocalWorker { sender }
     }
 
-    pub fn submit(&self, generation: u64, image: RgbImage) -> Result<(), String> {
+    pub fn submit(
+        &self,
+        generation: u64,
+        image: RgbImage,
+        high_recall: bool,
+    ) -> Result<(), String> {
         self.sender
             .send(LocalJob {
                 generation,
                 image,
                 test: false,
+                high_recall,
             })
             .map_err(|_| "本地识别线程已退出，请重启程序".to_string())
     }
@@ -118,6 +131,7 @@ impl LocalWorker {
                 generation: 0,
                 image,
                 test: true,
+                high_recall: false,
             })
             .map_err(|_| "本地识别线程已退出，请重启程序".to_string())
     }
@@ -128,16 +142,27 @@ struct LocalEngine {
 }
 
 impl LocalEngine {
-    fn new() -> Result<Self, String> {
+    fn new(high_recall: bool) -> Result<Self, String> {
         let session = OrtSessionConfig::default().with_intra_threads(LOCAL_INTRA_THREADS);
-        let ocr = OAROCRBuilder::new(
+        let mut builder = OAROCRBuilder::new(
             bundled_model(LOCAL_DET_MODEL),
             bundled_model(LOCAL_REC_MODEL),
             bundled_model(LOCAL_DICT),
         )
-        .ort_session(session)
-        .build()
-        .map_err(|err| format!("加载本地 PP-OCR 模型失败：{err}"))?;
+        .ort_session(session);
+        if high_recall {
+            // 默认 0.3 / 0.6 / 1.5 偏保守；任务栏文字小、对比度低时容易漏检。
+            let detection = oar_ocr::domain::tasks::text_detection::TextDetectionConfig {
+                score_threshold: 0.2,
+                box_threshold: 0.4,
+                unclip_ratio: 1.8,
+                ..Default::default()
+            };
+            builder = builder.text_detection_config(detection);
+        }
+        let ocr = builder
+            .build()
+            .map_err(|err| format!("加载本地 PP-OCR 模型失败：{err}"))?;
         Ok(Self { ocr })
     }
 
@@ -461,7 +486,7 @@ mod tests {
     #[test]
     #[ignore = "首次运行会下载约 25MB 模型"]
     fn local_engine_smoke() {
-        let engine = LocalEngine::new().expect("加载本地 PP-OCR 模型");
+        let engine = LocalEngine::new(false).expect("加载本地 PP-OCR 模型");
         let image = RgbImage::from_pixel(64, 64, image::Rgb([255, 255, 255]));
         engine.recognize(&image).expect("本地 PP-OCR 推理");
     }
@@ -476,7 +501,7 @@ mod tests {
             eprintln!("跳过：找不到测试图片 {path}");
             return;
         };
-        let engine = LocalEngine::new().expect("加载本地 PP-OCR 模型");
+        let engine = LocalEngine::new(false).expect("加载本地 PP-OCR 模型");
         let result = engine
             .recognize(&image.to_rgb8())
             .expect("本地 PP-OCR 推理");

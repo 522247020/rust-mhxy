@@ -696,6 +696,36 @@ impl MhxyApp {
                         .weak(),
                 );
             }
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label("放大倍数");
+                for (value, label) in [(1, "1x"), (2, "2x"), (3, "3x")] {
+                    if ui
+                        .selectable_value(&mut self.config.ocr_upscale, value, label)
+                        .on_hover_text("送 OCR 前放大截图；任务栏文字小时提高检测召回")
+                        .changed()
+                    {
+                        self.invalidate_scan();
+                        self.persist();
+                    }
+                }
+            });
+            if self.config.ocr_mode == "local"
+                && ui
+                    .checkbox(&mut self.config.ocr_high_recall, "高召回检测")
+                    .on_hover_text("降低 PP-OCR 检测阈值，减少漏字；代价是可能多出噪声框")
+                    .changed()
+            {
+                self.invalidate_scan();
+                self.persist();
+            }
+            if ui
+                .checkbox(&mut self.config.ocr_vote_frames, "多帧投票")
+                .on_hover_text("地图取最近几帧众数、坐标取中位数，避免单帧错认导致跳动")
+                .changed()
+            {
+                self.persist();
+            }
         });
         if now != fold_ocr {
             self.set_sidebar_section_open("ocr", now);

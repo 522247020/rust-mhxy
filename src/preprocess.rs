@@ -122,6 +122,21 @@ fn color_key(image: &RgbImage, target: [u8; 3], tolerance: u8) -> RgbImage {
     })
 }
 
+/// 放大截图：任务栏文字较小时，PP-OCR 的检测更容易漏掉。
+/// 用 Lanczos3 保持笔画边缘，放大后不影响后续预处理顺序。
+pub fn upscale(image: &RgbImage, factor: u32) -> RgbImage {
+    let factor = factor.clamp(1, 3);
+    if factor <= 1 {
+        return image.clone();
+    }
+    image::imageops::resize(
+        image,
+        image.width() * factor,
+        image.height() * factor,
+        image::imageops::FilterType::Lanczos3,
+    )
+}
+
 /// 灰度 + Otsu 阈值二值化，输出白底黑字。
 /// 背景通常贴着截图边缘，用边框亮度判断哪一侧是背景，比“少数派是文字”更稳；
 /// 边框同时混有文字和背景时，退回少数派判断。
@@ -402,6 +417,16 @@ mod tests {
         );
         assert_eq!(output.get_pixel(1, 1), &Rgb([0, 0, 0]));
         assert_eq!(output.get_pixel(0, 0), &Rgb([255, 255, 255]));
+    }
+
+    #[test]
+    fn upscale_changes_dimensions() {
+        let image = RgbImage::from_pixel(10, 4, Rgb([1, 2, 3]));
+        assert_eq!(upscale(&image, 1).dimensions(), (10, 4));
+        assert_eq!(upscale(&image, 2).dimensions(), (20, 8));
+        assert_eq!(upscale(&image, 3).dimensions(), (30, 12));
+        // 超出范围时钳制到 3 倍。
+        assert_eq!(upscale(&image, 9).dimensions(), (30, 12));
     }
 
     #[test]

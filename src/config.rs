@@ -124,6 +124,15 @@ pub struct Config {
     pub interval_seconds: u32,
     #[serde(rename = "ocr/task_region", with = "task_region_serde")]
     pub task_region: TaskRegion,
+    /// 送 OCR 前把截图放大几倍（1 = 不放大）。
+    #[serde(rename = "ocr/upscale")]
+    pub ocr_upscale: u32,
+    /// 高召回检测：降低 PP-OCR 检测阈值，代价是可能多出噪声框。
+    #[serde(rename = "ocr/high_recall")]
+    pub ocr_high_recall: bool,
+    /// 多帧投票：地图取最近几帧众数、坐标取中位数。
+    #[serde(rename = "ocr/vote_frames")]
+    pub ocr_vote_frames: bool,
     /// 按分辨率保存的识别区域：键是 "1920x1080"，值是 "0.65,0.23,0.98,0.50"。
     #[serde(rename = "ocr/region_presets", deserialize_with = "de_region_presets")]
     pub region_presets: std::collections::BTreeMap<String, String>,
@@ -249,6 +258,9 @@ impl Default for Config {
             ocr_mode: "local".into(),
             interval_seconds: 5,
             task_region: DEFAULT_TASK_REGION,
+            ocr_upscale: 2,
+            ocr_high_recall: true,
+            ocr_vote_frames: true,
             region_presets: std::collections::BTreeMap::new(),
             extra_task_region: DEFAULT_EXTRA_REGION,
             extra_region_enabled: false,
@@ -353,6 +365,7 @@ impl Config {
             "local".to_string()
         };
         self.interval_seconds = self.interval_seconds.clamp(1, 60);
+        self.ocr_upscale = self.ocr_upscale.clamp(1, 3);
         self.region_presets
             .retain(|_, region| parse_region(region).is_some());
         self.api_format = if self.api_format == "raw" {
@@ -1492,6 +1505,7 @@ mod tests {
             "ocr/extra_preprocess_tolerance",
             "ocr/extra_region_enabled",
             "ocr/extra_task_region",
+            "ocr/high_recall",
             "ocr/hotkey",
             "ocr/interval_seconds",
             "ocr/mode",
@@ -1501,6 +1515,8 @@ mod tests {
             "ocr/region_presets",
             "ocr/task_region",
             "ocr/trigger",
+            "ocr/upscale",
+            "ocr/vote_frames",
             "profiles/active",
             "profiles/items",
             "task/high_chance",
