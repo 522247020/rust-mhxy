@@ -686,6 +686,13 @@ LICENSE
 
 完整版本历史和安装包见 [GitHub Releases](https://github.com/522247020/rust-mhxy/releases)。
 
+### v0.2.12
+
+- **代码结构整理**：`src/app.rs` 按功能拆成 `app/{mod,shell,sidebar,region,flight,meditation,task,update,tests}.rs`，最大的业务文件从 6800 行降到约 1200 行，行为未变。
+- **配置解析迁移**：`config.json` 改用 `json5` + serde derive 解析，删掉约 450 行手写读取/保存样板；仍然支持 `//`、`/* */` 注释、尾逗号、旧键（`task/option/降妖伏魔`、`meditation/visible`）和旧主题值，保存格式与旧版字节级一致。
+- **精简模式提示**：进入精简界面时，窗口底部显示 4 秒「按 Esc 退出精简界面」，避免找不到退出方式。
+- README 新增「界面预览」：主界面、精简界面、精简提示、高级设置、打坐计时截图。
+
 ### v0.2.11
 
 - **高级设置、打坐改为顶栏入口**：高级设置和打坐计时各自打开独立窗口，侧栏只保留常用项；识别区域和门控不再在高级设置里重复出现。
