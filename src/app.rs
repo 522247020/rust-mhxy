@@ -895,6 +895,25 @@ impl MhxyApp {
             return;
         };
         self.config.active_profile = profile.name.clone();
+        // 方案里带的识别区域：应用后同步到当前分辨率，避免下次识别又被自动记忆覆盖。
+        if let Some(region) = profile.task_region {
+            self.config.task_region = region;
+            if let Some(size) = self
+                .last_client_size
+                .or_else(|| self.selected_handle.and_then(capture::client_size))
+            {
+                self.config
+                    .region_presets
+                    .insert(format!("{}x{}", size.0, size.1), region_to_string(region));
+                self.last_client_size = Some(size);
+            }
+        }
+        if let Some(region) = profile.extra_task_region {
+            self.config.extra_task_region = region;
+        }
+        if let Some(enabled) = profile.extra_region_enabled {
+            self.config.extra_region_enabled = enabled;
+        }
         self.config.color_gate_enabled = profile.gate_enabled;
         self.config.color_gate_interval_ms = profile.gate_interval_ms;
         self.config.color_gate_mode = profile.gate_mode;
@@ -1090,19 +1109,30 @@ impl MhxyApp {
     }
 
     fn task_active(&self, task_type: &str) -> bool {
+        // 通用任务是独立模式：只要它开启，就不解析抓鬼 / 鬼王。
+        if self.config.generic_enabled {
+            return task_type == "通用";
+        }
         match task_type {
             "抓鬼" => self.config.zhuagui_enabled,
             "鬼王" => self.config.ghost_king_enabled,
-            "通用" => self.config.generic_enabled,
+            "通用" => false,
             _ => true,
         }
     }
 
     fn task_filter(&self) -> TaskFilter {
+        if self.config.generic_enabled {
+            return TaskFilter {
+                zhuagui: false,
+                ghost_king: false,
+                generic: true,
+            };
+        }
         TaskFilter {
             zhuagui: self.config.zhuagui_enabled,
             ghost_king: self.config.ghost_king_enabled,
-            generic: self.config.generic_enabled,
+            generic: false,
         }
     }
 
@@ -2955,6 +2985,10 @@ impl MhxyApp {
                 .on_hover_text("同时识别鬼王任务，并单独显示一块地图面板")
                 .changed()
             {
+                if self.config.ghost_king_enabled {
+                    // 通用任务是独立模式，勾选鬼王时把它让开。
+                    self.config.generic_enabled = false;
+                }
                 self.invalidate_scan();
                 self.persist();
             }
@@ -2983,10 +3017,50 @@ impl MhxyApp {
         if now != fold_task {
             self.set_sidebar_section_open("task", now);
         }
+        let fold_display = self.sidebar_section_open("display");
+        let now = theme::collapsible_section(
+            ui,
+            "sidebar_display",
+            "显示与布局",
+            fold_display,
+            |ui| {
+                let mut high_chance_changed = false;
+                if self.config.zhuagui_enabled {
+                    high_chance_changed |= ui
+                        .checkbox(&mut self.config.high_chance, "抓鬼：显示高概率区域")
+                        .on_hover_text("按 175LG 捉鬼省眼规则，在抓鬼地图上叠加 50×50 的高概率格子")
+                        .changed();
+                }
+                if self.config.ghost_king_enabled {
+                    high_chance_changed |= ui
+                        .checkbox(
+                            &mut self.config.ghost_king_high_chance,
+                            "鬼王：显示高概率区域",
+                        )
+                        .on_hover_text("按 175LG 捉鬼省眼规则，在鬼王地图上叠加 50×50 的高概率格子")
+                        .changed();
+                }
+                if high_chance_changed {
+                    self.persist();
+                }
+                let previous = self.config.horizontal_layout;
+                ui.horizontal(|ui| {
+                    ui.label("布局");
+                    ui.selectable_value(&mut self.config.horizontal_layout, false, "上下");
+                    ui.selectable_value(&mut self.config.horizontal_layout, true, "左右");
+                });
+                if previous != self.config.horizontal_layout {
+                    self.persist();
+                }
+            },
+        );
+        if now != fold_display {
+            self.set_sidebar_section_open("display", now);
+        }
         ui.add_space(4.0);
     }
 
-    /// 高级设置窗口：识别方式、方案管理、显示与布局、合成旗，以及日志级别。
+    /// 高级设置窗口：识别方式、方案管理、合成旗，以及日志级别。
     fn advanced_controls(&mut self, ui: &mut egui::Ui) {
         let mode = if self.config.ocr_mode == "remote" {
             "远端 PP-OCR"
@@ -3000,7 +3074,7 @@ impl MhxyApp {
                     .color(theme::muted()),
             );
             ui.label(
-                egui::RichText::new("· 识别方式、方案、显示与合成旗")
+                egui::RichText::new("· 识别方式、方案与合成旗")
                     .small()
                     .weak(),
             );
@@ -3103,7 +3177,7 @@ impl MhxyApp {
             |ui| {
                 self.profile_ui(ui);
                 ui.label(
-                    egui::RichText::new("方案保存图色门控和预处理设置，不包含识别区域。")
+                    egui::RichText::new("方案保存识别区域、图色门控和预处理设置。")
                         .small()
                         .weak(),
                 );
@@ -3111,46 +3185,6 @@ impl MhxyApp {
         );
         if now != fold_profiles {
             self.set_sidebar_section_open("profiles", now);
-        }
-        let fold_display = self.sidebar_section_open("display");
-        let now = theme::collapsible_section(
-            ui,
-            "sidebar_display",
-            "显示与布局",
-            fold_display,
-            |ui| {
-                let mut high_chance_changed = false;
-                if self.config.zhuagui_enabled {
-                    high_chance_changed |= ui
-                        .checkbox(&mut self.config.high_chance, "抓鬼：显示高概率区域")
-                        .on_hover_text("按 175LG 捉鬼省眼规则，在抓鬼地图上叠加 50×50 的高概率格子")
-                        .changed();
-                }
-                if self.config.ghost_king_enabled {
-                    high_chance_changed |= ui
-                        .checkbox(
-                            &mut self.config.ghost_king_high_chance,
-                            "鬼王：显示高概率区域",
-                        )
-                        .on_hover_text("按 175LG 捉鬼省眼规则，在鬼王地图上叠加 50×50 的高概率格子")
-                        .changed();
-                }
-                if high_chance_changed {
-                    self.persist();
-                }
-                let previous = self.config.horizontal_layout;
-                ui.horizontal(|ui| {
-                    ui.label("布局");
-                    ui.selectable_value(&mut self.config.horizontal_layout, false, "上下");
-                    ui.selectable_value(&mut self.config.horizontal_layout, true, "左右");
-                });
-                if previous != self.config.horizontal_layout {
-                    self.persist();
-                }
-            },
-        );
-        if now != fold_display {
-            self.set_sidebar_section_open("display", now);
         }
         let fold_flight = self.sidebar_section_open("flight_flags");
         let now = theme::collapsible_section(
@@ -3187,7 +3221,7 @@ impl MhxyApp {
             "2. 在侧栏底部点「开始识别」/「开始监听」启动，「暂停」停止；按钮始终固定可见。",
             "3. 在「任务类型」里勾选要显示的任务，侧栏会自动出现对应地图面板。",
             "4. 基础区「设置识别区域」打开独立窗口，可调整任务栏截图区域并点击取点配置图色门控。",
-            "5. 识别方式、方案、显示与布局、合成旗在顶栏「高级设置」里；打坐计时在顶栏「打坐」里。",
+            "5. 识别方式、方案、合成旗在顶栏「高级设置」里；打坐计时在顶栏「打坐」里。",
         ] {
             ui.label(egui::RichText::new(line).small());
         }
@@ -3221,8 +3255,9 @@ impl MhxyApp {
         ui.add_space(4.0);
         ui.label(egui::RichText::new("其它").strong());
         for line in [
-            "任务类型：勾选抓鬼 / 鬼王 / 通用任务；高概率区域开关在「高级设置 → 显示与布局」。",
-            "高级设置（顶栏）：识别方式、方案管理、显示与布局、合成旗标注。",
+            "任务类型：抓鬼 / 鬼王可以同时勾选；通用任务与它们互斥，单独使用。",
+            "显示与布局（基础区）：高概率区域开关和上下 / 左右布局。",
+            "高级设置（顶栏）：识别方式、方案管理、合成旗标注。",
             "打坐计时（顶栏）：独立设置窗口，启用后显示透明悬浮窗并注册快捷键。",
             "日志：直接写入配置目录下的 logs/rust-mhxy.log，不在界面显示；详细级别记录 OCR 过程。",
             "设置会自动保存到程序目录的 config.json。",
@@ -4818,10 +4853,16 @@ impl eframe::App for MhxyApp {
                         egui::Frame::central_panel(ui.style())
                             .inner_margin(16)
                             .show(ui, |ui| {
-                                ui.set_min_size(ui.available_size());
+                                let height = ui.available_height();
                                 egui::ScrollArea::vertical()
                                     .id_salt("advanced_scroll")
-                                    .show(ui, |ui| self.advanced_controls(ui));
+                                    .auto_shrink([false, false])
+                                    .max_height(height)
+                                    .min_scrolled_height(height)
+                                    .show(ui, |ui| {
+                                        ui.set_min_width(ui.available_width());
+                                        self.advanced_controls(ui);
+                                    });
                             });
                     }
                 },
@@ -4864,10 +4905,17 @@ impl eframe::App for MhxyApp {
                         egui::Frame::central_panel(ui.style())
                             .inner_margin(16)
                             .show(ui, |ui| {
-                                ui.set_min_size(ui.available_size());
+                                // 滚动区占满窗口高度：窗口变矮时内容滚动，而不是被裁掉。
+                                let height = ui.available_height();
                                 egui::ScrollArea::vertical()
                                     .id_salt("meditation_scroll")
-                                    .show(ui, |ui| self.meditation_controls(ui));
+                                    .auto_shrink([false, false])
+                                    .max_height(height)
+                                    .min_scrolled_height(height)
+                                    .show(ui, |ui| {
+                                        ui.set_min_width(ui.available_width());
+                                        self.meditation_controls(ui);
+                                    });
                             });
                     }
                 },
@@ -5808,9 +5856,6 @@ mod tests {
             "测试连接",
             "方案管理",
             "识别方案",
-            "显示与布局",
-            "抓鬼：显示高概率区域",
-            "鬼王：显示高概率区域",
             "合成旗标注",
             "打开合成旗编辑器",
         ] {
@@ -5825,6 +5870,8 @@ mod tests {
             "打开识别区域设置",
             "启用打坐计时",
             "暂无日志",
+            "显示与布局",
+            "显示高概率区域",
         ] {
             assert!(
                 !texts.iter().any(|text| text.contains(removed)),
@@ -5848,6 +5895,43 @@ mod tests {
     }
 
     #[test]
+    fn generic_task_is_exclusive_with_zhuagui_and_ghost_king() {
+        let mut app = app();
+        // 即使配置里三个都开着（旧配置或手改），通用任务也必须独占。
+        app.config.generic_enabled = true;
+        app.config.zhuagui_enabled = true;
+        app.config.ghost_king_enabled = true;
+        let filter = app.task_filter();
+        assert!(filter.generic, "通用任务应生效");
+        assert!(
+            !filter.zhuagui && !filter.ghost_king,
+            "通用任务不能与抓鬼/鬼王并存"
+        );
+        assert!(app.task_active("通用"));
+        assert!(!app.task_active("抓鬼"));
+        assert!(!app.task_active("鬼王"));
+    }
+
+    #[test]
+    fn profile_saves_and_restores_task_region() {
+        let mut app = app();
+        app.config.task_region = (0.11, 0.22, 0.33, 0.44);
+        app.config.extra_task_region = (0.55, 0.66, 0.77, 0.88);
+        app.config.extra_region_enabled = true;
+        app.save_active_profile();
+
+        app.config.task_region = crate::core::DEFAULT_TASK_REGION;
+        app.config.extra_task_region = crate::core::DEFAULT_EXTRA_REGION;
+        app.config.extra_region_enabled = false;
+        let name = app.config.active_profile.clone();
+        app.apply_profile(&name);
+
+        assert_eq!(app.config.task_region, (0.11, 0.22, 0.33, 0.44));
+        assert_eq!(app.config.extra_task_region, (0.55, 0.66, 0.77, 0.88));
+        assert!(app.config.extra_region_enabled);
+    }
+
+    #[test]
     fn task_panel_has_no_high_chance_checkbox() {
         let mut app = app();
         app.config.high_chance = true;
@@ -5866,13 +5950,13 @@ mod tests {
         );
         output.textures_delta.clear();
 
-        // 高概率开关在顶栏「高级设置 → 显示与布局」里。
-        let mut output = ctx.run_ui(input, |ui| app.advanced_controls(ui));
+        // 高概率开关在基础区「显示与布局」里。
+        let mut output = ctx.run_ui(input, |ui| app.basic_controls(ui));
         let texts = collect_texts(&output.shapes);
         output.textures_delta.clear();
         assert!(
             texts.iter().any(|text| text.contains("显示高概率区域")),
-            "高级设置里仍应保留高概率开关：{texts:?}"
+            "基础区应保留高概率开关：{texts:?}"
         );
     }
 

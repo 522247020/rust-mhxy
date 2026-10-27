@@ -10,10 +10,14 @@ pub const CONFIG_PATH_ENV: &str = "MHXY_CONFIG_PATH";
 /// 预处理默认文字颜色：RGB u8 (234, 255, 101)，即 #eaff65。
 pub const DEFAULT_PREPROCESS_COLOR: [u8; 3] = [234, 255, 101];
 
-/// 可保存的识别方案：图色门控 + 预处理设置，方便一键切换。
+/// 可保存的识别方案：识别区域 + 图色门控 + 预处理设置，方便一键切换。
 #[derive(Clone, Debug, PartialEq)]
 pub struct Profile {
     pub name: String,
+    /// 主识别区域；旧方案没有这一项时保持当前区域不变。
+    pub task_region: Option<TaskRegion>,
+    pub extra_task_region: Option<TaskRegion>,
+    pub extra_region_enabled: Option<bool>,
     pub gate_enabled: bool,
     pub gate_interval_ms: u32,
     pub gate_mode: String,
@@ -32,6 +36,9 @@ impl Profile {
     pub fn from_config(config: &Config, name: String) -> Self {
         Self {
             name,
+            task_region: Some(config.task_region),
+            extra_task_region: Some(config.extra_task_region),
+            extra_region_enabled: Some(config.extra_region_enabled),
             gate_enabled: config.color_gate_enabled,
             gate_interval_ms: config.color_gate_interval_ms,
             gate_mode: config.color_gate_mode.clone(),
@@ -662,6 +669,15 @@ fn profile_from_value(value: &Value) -> Option<Profile> {
     }
     Some(Profile {
         name,
+        task_region: object
+            .get("task_region")
+            .and_then(Value::as_str)
+            .and_then(crate::core::parse_region),
+        extra_task_region: object
+            .get("extra_task_region")
+            .and_then(Value::as_str)
+            .and_then(crate::core::parse_region),
+        extra_region_enabled: object.get("extra_region_enabled").and_then(Value::as_bool),
         gate_enabled: object
             .get("gate_enabled")
             .and_then(Value::as_bool)
@@ -728,6 +744,21 @@ fn points_from_value(value: Option<&Value>) -> Vec<ColorPoint> {
 fn profile_to_value(profile: &Profile) -> Value {
     let mut object = Map::new();
     object.insert("name".into(), Value::String(profile.name.clone()));
+    if let Some(region) = profile.task_region {
+        object.insert(
+            "task_region".into(),
+            Value::String(region_to_string(region)),
+        );
+    }
+    if let Some(region) = profile.extra_task_region {
+        object.insert(
+            "extra_task_region".into(),
+            Value::String(region_to_string(region)),
+        );
+    }
+    if let Some(enabled) = profile.extra_region_enabled {
+        object.insert("extra_region_enabled".into(), Value::Bool(enabled));
+    }
     object.insert("gate_enabled".into(), Value::Bool(profile.gate_enabled));
     object.insert(
         "gate_interval_ms".into(),
