@@ -180,7 +180,13 @@ jobs:
               ln -sf "$lld_bin" "$CARGO_HOME/bin/lld-link"
             fi
           fi
-          rustup component add llvm-tools >/dev/null 2>&1 || true
+          # clippy / rustfmt 不在默认工具链里，先补齐再跑检查。
+          rustup component add clippy rustfmt llvm-tools >/dev/null 2>&1 || true
+          if ! cargo clippy --version >/dev/null 2>&1; then
+            echo "::error::cargo-clippy 未安装成功，无法执行 clippy 检查"
+            exit 1
+          fi
+          cargo clippy --version
           command -v rsync >/dev/null 2>&1 || {
             echo "安装 rsync"
             (command -v sudo >/dev/null 2>&1 && sudo apt-get update && sudo apt-get install -y rsync) ||
