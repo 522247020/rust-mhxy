@@ -520,8 +520,10 @@ fn locate_loose(
     task_type: &str,
     allow_fuzzy: bool,
 ) -> Option<TaskLocation> {
-    let (_, x, y) = find_coordinate(block)?;
-    let text = compact(block);
+    let (coordinate_start, x, y) = find_coordinate(block)?;
+    // 只在坐标前后一小段里找地图名：整段文字可能同时包含抓鬼和鬼王的描述，
+    // 用整段匹配会把鬼王的坐标配给抓鬼的地图名（或反过来）。
+    let near = compact(&near_around(block, coordinate_start, MAP_LOOKBACK_CHARS));
     let candidates: Vec<&MapDefinition> = maps
         .iter()
         .filter(|map| map.supports_task(task_type))
@@ -532,12 +534,12 @@ fn locate_loose(
         .find(|map| {
             map.aliases.iter().any(|alias| {
                 let alias = compact(alias);
-                !alias.is_empty() && text.contains(&alias)
+                !alias.is_empty() && near.contains(&alias)
             })
         })
         .or_else(|| {
             allow_fuzzy
-                .then(|| fuzzy_map_in_text(&text, &candidates))
+                .then(|| fuzzy_map_in_text(&near, &candidates))
                 .flatten()
         })?;
     Some(TaskLocation {
@@ -545,7 +547,7 @@ fn locate_loose(
         map_name: definition.name.clone(),
         x,
         y,
-        nearby: text.contains("附近"),
+        nearby: near.contains("附近"),
         matched: if allow_fuzzy {
             TaskMatch::Fuzzy
         } else {
@@ -650,6 +652,23 @@ fn locate_at(
         nearby: compact_block.contains("附近"),
         matched,
     })
+}
+
+/// 取坐标前后各 `limit` 个字符，用于在地图名与坐标距离较近时才配对。
+fn near_around(block: &str, coordinate_start: usize, limit: usize) -> String {
+    let chars: Vec<char> = block.chars().collect();
+    let mut byte = 0usize;
+    let mut index = chars.len();
+    for (position, ch) in chars.iter().enumerate() {
+        if byte >= coordinate_start {
+            index = position;
+            break;
+        }
+        byte += ch.len_utf8();
+    }
+    let from = index.saturating_sub(limit);
+    let to = (index + limit).min(chars.len());
+    chars[from..to].iter().collect()
 }
 
 /// 取坐标起点之前最后 `limit` 个字符（按字节偏移定位坐标位置）。
@@ -1119,6 +1138,28 @@ mod tests {
             assert_eq!(tasks.len(), 1, "{name}");
             assert_eq!(tasks[0].map_name, expected, "{name}");
         }
+    }
+
+    #[test]
+    fn does_not_mix_map_and_coordinate_across_tasks() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/maps.json");
+        let maps = load_maps(&path).expect("加载 maps.json");
+        // 真实 OCR 结果：抓鬼的地图名被认成「江南外3」、坐标丢失；
+        // 鬼王有坐标 104,61，但地图名认成了「大行」。
+        let text = "捉鬼\n钟抓 江南外3,处抓已时 鬼 （第7个） 去\n一刻浇虚鬼。\
+                     \n鬼王\n降服千年厉鬼（第7个)\n奇一行病鬼王，剩 ： 大行 104,61降服\n茶（39)分钟";
+        let filter = TaskFilter {
+            zhuagui: true,
+            ghost_king: true,
+            generic: true,
+        };
+        let tasks = parse_tasks(text, &maps, filter);
+        assert!(
+            !tasks
+                .iter()
+                .any(|task| task.map_name == "江南野外" && task.x == 104 && task.y == 61),
+            "不能把鬼王的坐标配给抓鬼那段被认错的地图名：{tasks:?}"
+        );
     }
 
     #[test]
