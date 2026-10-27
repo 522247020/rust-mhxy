@@ -206,19 +206,23 @@ jobs:
           ln -sf pathcch.lib "$sdk_dir/PATHCCH.lib"
           ls -l "$sdk_dir" | grep -iE 'directml|pathcch'
 
-      - name: Install Linux test dependencies
+      - name: Install Linux build dependencies
         run: |
-          # Linux 的截图实现（xcap）依赖 PipeWire，编译测试和 clippy 都需要它的开发头文件。
-          # Windows 打包走 x86_64-pc-windows-msvc target，不会用到这些库。
-          if ! pkg-config --exists libpipewire-0.3 2>/dev/null; then
-            echo "安装 pkg-config / libpipewire-0.3-dev"
+          # 测试和 clippy 在 Linux 本机编译，会用到：
+          #   xcap      -> libpipewire-0.3（截图）
+          #   glutin    -> egl / gl（OpenGL）
+          #   winit     -> wayland / xkbcommon / x11（窗口）
+          # Windows 打包走 x86_64-pc-windows-msvc target，不需要这些库。
+          packages="pkg-config libpipewire-0.3-dev libegl1-mesa-dev libgl1-mesa-dev libxkbcommon-dev libwayland-dev libx11-dev libxcb1-dev"
+          if ! pkg-config --exists libpipewire-0.3 egl 2>/dev/null; then
+            echo "安装 Linux 构建依赖"
             if command -v sudo >/dev/null 2>&1; then
-              sudo apt-get update && sudo apt-get install -y pkg-config libpipewire-0.3-dev
+              sudo apt-get update && sudo apt-get install -y $packages
             else
-              apt-get update && apt-get install -y pkg-config libpipewire-0.3-dev
+              apt-get update && apt-get install -y $packages
             fi
           fi
-          pkg-config --modversion libpipewire-0.3
+          pkg-config --modversion libpipewire-0.3 egl
 
       - name: Run tests
         run: |
