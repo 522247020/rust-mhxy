@@ -4285,7 +4285,7 @@ dependencies = [
 
 [[package]]
 name = "rust-mhxy"
-version = "0.2.12"
+version = "0.2.13"
 dependencies = [
  "chrono",
  "eframe",
