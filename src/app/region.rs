@@ -545,6 +545,22 @@ impl MhxyApp {
                         .add(egui::DragValue::new(&mut tolerance).range(0..=255))
                         .changed();
                 });
+                if tolerance > 80 {
+                    ui.label(
+                        egui::RichText::new(
+                            "容差过大：背景也可能被当成文字，整张图会变成全黑或全白；建议 20~40",
+                        )
+                        .small()
+                        .color(theme::gold()),
+                    );
+                }
+                ui.label(
+                    egui::RichText::new(
+                        "颜色提取只保留接近该颜色的像素并输出黑字白底：预览里若是白字黑底，说明选到的是背景色",
+                    )
+                    .small()
+                    .weak(),
+                );
                 ui.collapsing("更多颜色", |ui| {
                     let mut color32 = Color32::from_rgb(color[0], color[1], color[2]);
                     if egui::color_picker::color_picker_color32(
