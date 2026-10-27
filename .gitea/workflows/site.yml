@@ -159,10 +159,6 @@ jobs:
             echo "安装 cargo-xwin"
             cargo install cargo-xwin --locked
           fi
-          if ! command -v cargo-xwin >/dev/null 2>&1; then
-            echo "安装 cargo-xwin"
-            cargo install cargo-xwin --locked
-          fi
 
           # cargo-xwin 编译 C 依赖需要 clang；lld-link/llvm-lib 由 rust 的 llvm-tools 提供
           if ! command -v clang >/dev/null 2>&1; then
@@ -209,6 +205,20 @@ jobs:
           ln -sf pathcch.lib "$sdk_dir/PathCch.lib"
           ln -sf pathcch.lib "$sdk_dir/PATHCCH.lib"
           ls -l "$sdk_dir" | grep -iE 'directml|pathcch'
+
+      - name: Install Linux test dependencies
+        run: |
+          # Linux 的截图实现（xcap）依赖 PipeWire，编译测试和 clippy 都需要它的开发头文件。
+          # Windows 打包走 x86_64-pc-windows-msvc target，不会用到这些库。
+          if ! pkg-config --exists libpipewire-0.3 2>/dev/null; then
+            echo "安装 pkg-config / libpipewire-0.3-dev"
+            if command -v sudo >/dev/null 2>&1; then
+              sudo apt-get update && sudo apt-get install -y pkg-config libpipewire-0.3-dev
+            else
+              apt-get update && apt-get install -y pkg-config libpipewire-0.3-dev
+            fi
+          fi
+          pkg-config --modversion libpipewire-0.3
 
       - name: Run tests
         run: |
