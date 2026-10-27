@@ -149,7 +149,7 @@ impl LocalEngine {
             .map_err(|err| format!("本地 PP-OCR 推理失败：{err}"))?;
         let text = results
             .iter()
-            .flat_map(|result| result.all_text())
+            .map(regions_to_text)
             .collect::<Vec<_>>()
             .join("\n");
         Ok(OcrText {
@@ -157,6 +157,77 @@ impl LocalEngine {
             elapsed_secs: started.elapsed().as_secs_f64(),
         })
     }
+}
+
+/// 把检测框按位置整理成文本行：同一行的文字按 x 排序，行与行按 y 排序。
+///
+/// `all_text()` 按检测顺序返回，遇到两个任务条目、或者倾斜/换行时顺序可能乱掉。
+/// 用检测框重新排一次，后续解析拿到的就是「从左到右、从上到下」的文本。
+fn regions_to_text(result: &oar_ocr::oarocr::OAROCRResult) -> String {
+    struct Item {
+        top: f32,
+        bottom: f32,
+        left: f32,
+        text: String,
+    }
+
+    let mut items: Vec<Item> = result
+        .text_regions
+        .iter()
+        .filter_map(|region| {
+            let text = region.text.as_deref()?.trim().to_string();
+            if text.is_empty() {
+                return None;
+            }
+            let mut top = f32::INFINITY;
+            let mut bottom = f32::NEG_INFINITY;
+            let mut left = f32::INFINITY;
+            for point in &region.bounding_box.points {
+                top = top.min(point.y);
+                bottom = bottom.max(point.y);
+                left = left.min(point.x);
+            }
+            top.is_finite().then_some(Item {
+                top,
+                bottom,
+                left,
+                text,
+            })
+        })
+        .collect();
+
+    items.sort_by(|a, b| a.top.total_cmp(&b.top).then(a.left.total_cmp(&b.left)));
+
+    let mut lines: Vec<Vec<Item>> = Vec::new();
+    for item in items {
+        let join = lines.last().is_some_and(|line| {
+            let first = &line[0];
+            let overlap = (first.bottom.min(item.bottom) - first.top.max(item.top)).max(0.0);
+            let height = (first.bottom - first.top)
+                .min(item.bottom - item.top)
+                .max(1.0);
+            overlap / height > 0.5
+        });
+        if join {
+            if let Some(line) = lines.last_mut() {
+                line.push(item);
+            }
+        } else {
+            lines.push(vec![item]);
+        }
+    }
+
+    lines
+        .iter_mut()
+        .map(|line| {
+            line.sort_by(|a, b| a.left.total_cmp(&b.left));
+            line.iter()
+                .map(|item| item.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// 优先使用随包携带的模型（`assets/models` 或 exe 旁的 `models`）；

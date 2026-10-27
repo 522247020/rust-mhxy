@@ -21,6 +21,9 @@ pub const APP_VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 pub const APP_REPO_URL: &str = "https://github.com/522247020/rust-mhxy";
 
 fn main() -> eframe::Result {
+    if !acquire_single_instance() {
+        return Ok(());
+    }
     let config = config::Config::load(&config::default_config_path());
     let mut viewport = egui::ViewportBuilder::default()
         .with_title(format!("梦幻西游任务坐标辅助（rust-mhxy {APP_VERSION}）"))
@@ -45,6 +48,63 @@ fn main() -> eframe::Result {
             Ok(Box::new(app::MhxyApp::new(cc)))
         }),
     )
+}
+
+/// 单实例：两个进程会抢同一组全局快捷键、重复跑 OCR、互相覆盖配置。
+/// 已经有一个实例时提示并直接退出。
+#[cfg(windows)]
+fn acquire_single_instance() -> bool {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
+    use windows::Win32::System::Threading::CreateMutexW;
+
+    let name: Vec<u16> = "Local\\rust-mhxy-single-instance"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        match CreateMutexW(None, true, PCWSTR(name.as_ptr())) {
+            Ok(handle) => {
+                if GetLastError() == ERROR_ALREADY_EXISTS {
+                    show_already_running();
+                    false
+                } else {
+                    // HANDLE 没有 Drop，不调用 CloseHandle 就会一直持有到进程结束。
+                    let _ = handle;
+                    true
+                }
+            }
+            // 创建失败就不拦着启动，避免因为权限问题完全打不开。
+            Err(_) => true,
+        }
+    }
+}
+
+#[cfg(windows)]
+fn show_already_running() {
+    use windows::core::PCWSTR;
+    use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONINFORMATION, MB_OK};
+    let text: Vec<u16> = "rust-mhxy 已经在运行。\n请在任务栏或托盘切换到已打开的窗口。"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let title: Vec<u16> = "rust-mhxy"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        MessageBoxW(
+            None,
+            PCWSTR(text.as_ptr()),
+            PCWSTR(title.as_ptr()),
+            MB_OK | MB_ICONINFORMATION,
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn acquire_single_instance() -> bool {
+    true
 }
 
 fn app_icon() -> egui::IconData {

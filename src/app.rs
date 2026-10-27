@@ -1,6 +1,6 @@
 //! egui 界面与识别调度。只保留「抓鬼 / 鬼王」任务。
 use crate::capture::{self, WindowInfo};
-use crate::config::{assets_dir, Config};
+use crate::config::{assets_dir, region_to_string, Config};
 use crate::core::{
     clamp_to_map, coordinate_in_map, find_map_definition, high_chance_areas, map_area,
     map_coordinate, map_point, map_rect, parse_tasks, MapDefinition, TaskFilter, TaskLocation,
@@ -24,6 +24,13 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const TASK_ORDER: [&str; 3] = ["抓鬼", "鬼王", "通用"];
+/// 每次注册全局快捷键都换一个 id：旧监听线程还在退出时，
+/// 复用同一个 id 会撞上「热键已被注册」，导致新快捷键要等重试才生效。
+static NEXT_HOTKEY_ID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(100);
+/// 快捷键文本变化后的注册节流，避免输入过程中每个字符注册一次。
+const HOTKEY_CHANGE_DELAY: Duration = Duration::from_millis(500);
+/// 注册失败后的重试间隔。
+const HOTKEY_RETRY_DELAY: Duration = Duration::from_secs(5);
 /// 打坐悬浮窗胶囊的最小尺寸。
 const MEDITATION_MIN_SIZE: Vec2 = Vec2::new(64.0, 36.0);
 /// 「附近」范围框的半径（游戏坐标），所以框的边长是 2 倍。
@@ -174,6 +181,8 @@ pub struct MhxyApp {
     meditation_applied_size: Option<Vec2>,
     /// 窗口尺寸的防抖：待应用的尺寸与第一次观察到的时间。
     meditation_pending_size: Option<(Vec2, Instant)>,
+    /// 上一次识别时的游戏客户区尺寸，用来在分辨率变化时切换识别区域。
+    last_client_size: Option<(u32, u32)>,
     /// 悬浮窗去阴影的尝试次数；窗口重建后归零重试。
     meditation_shadow_attempts: u8,
     /// 正在录制打坐计时的全局快捷键。
@@ -186,6 +195,10 @@ pub struct MhxyApp {
     flight_flag_index: usize,
     flight_flag_name_edit: String,
     flight_feedback: Option<Result<String, String>>,
+}
+
+fn next_hotkey_id() -> i32 {
+    NEXT_HOTKEY_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 impl MhxyApp {
@@ -317,6 +330,7 @@ impl MhxyApp {
             meditation_applied_passthrough: None,
             meditation_applied_size: None,
             meditation_pending_size: None,
+            last_client_size: None,
             meditation_shadow_attempts: 0,
             meditation_recording_hotkey: false,
             flight_flags,
@@ -684,6 +698,8 @@ impl MhxyApp {
             self.preview_image = None;
             self.preview_texture = None;
             self.client_size = None;
+            // 换窗口后重新按新窗口的分辨率套用识别区域。
+            self.last_client_size = None;
             self.gate_result = None;
             self.gate_active =
                 !self.config.color_gate_enabled || self.config.color_gate_points.is_empty();
@@ -1185,10 +1201,15 @@ impl MhxyApp {
             }
             if self
                 .meditation_hotkey_tried_at
-                .is_some_and(|at| at.elapsed() < Duration::from_secs(5))
+                .is_some_and(|at| at.elapsed() < HOTKEY_RETRY_DELAY)
             {
                 return;
             }
+        } else if self
+            .meditation_hotkey_tried_at
+            .is_some_and(|at| at.elapsed() < HOTKEY_CHANGE_DELAY)
+        {
+            return;
         }
         self.meditation_hotkey_attempted = Some(raw.clone());
         self.meditation_hotkey_tried_at = Some(Instant::now());
@@ -1202,7 +1223,7 @@ impl MhxyApp {
         };
         // 先释放旧的，避免同一个键重复注册。
         self.meditation_hotkey_listener = None;
-        match hotkey::spawn(hotkey, 2, self.meditation_hotkey_tx.clone()) {
+        match hotkey::spawn(hotkey, next_hotkey_id(), self.meditation_hotkey_tx.clone()) {
             Ok(listener) => {
                 self.meditation_hotkey_listener = Some(listener);
                 self.meditation_hotkey_error = None;
@@ -1596,13 +1617,15 @@ impl MhxyApp {
             } else if !self.running {
                 return;
             }
-            // 注册失败后每 5 秒重试一次，避免被其他程序临时占用后一直无效。
-            if self
-                .hotkey_tried_at
-                .is_some_and(|at| at.elapsed() < Duration::from_secs(5))
-            {
-                return;
-            }
+        }
+        // 输入过程中每 500ms 才注册一次；注册失败或线程退出则每 5 秒重试。
+        let delay = if changed {
+            HOTKEY_CHANGE_DELAY
+        } else {
+            HOTKEY_RETRY_DELAY
+        };
+        if self.hotkey_tried_at.is_some_and(|at| at.elapsed() < delay) {
+            return;
         }
         self.hotkey_attempted = desired_label;
         self.hotkey_tried_at = Some(Instant::now());
@@ -1611,7 +1634,7 @@ impl MhxyApp {
             self.hotkey_error = None;
             return;
         };
-        match hotkey::spawn(hotkey, 1, self.hotkey_tx.clone()) {
+        match hotkey::spawn(hotkey, next_hotkey_id(), self.hotkey_tx.clone()) {
             Ok(listener) => {
                 self.hotkey_listener = Some(listener);
                 self.hotkey_error = None;
@@ -1619,10 +1642,41 @@ impl MhxyApp {
             }
             Err(err) => {
                 self.hotkey_listener = None;
-                self.log(err.clone());
+                // 同一个错误只记一次，避免每 5 秒刷屏。
+                if self.hotkey_error.as_deref() != Some(err.as_str()) {
+                    self.log(err.clone());
+                }
                 self.hotkey_error = Some(err);
             }
         }
+    }
+
+    /// 分辨率变化时自动切换识别区域：
+    /// 把调整过的区域记到上一个分辨率，再套用新分辨率保存过的区域。
+    fn sync_region_for_size(&mut self, size: Option<(u32, u32)>) {
+        let Some((width, height)) = size else {
+            return;
+        };
+        if self.last_client_size == Some((width, height)) {
+            return;
+        }
+        if let Some((old_width, old_height)) = self.last_client_size {
+            self.config.region_presets.insert(
+                format!("{old_width}x{old_height}"),
+                region_to_string(self.config.task_region),
+            );
+        }
+        let key = format!("{width}x{height}");
+        if let Some(saved) = self
+            .config
+            .region_presets
+            .get(&key)
+            .and_then(|saved| crate::core::parse_region(saved))
+        {
+            self.config.task_region = saved;
+        }
+        self.last_client_size = Some((width, height));
+        self.persist();
     }
 
     fn trigger_scan(&mut self, force: bool) {
@@ -1654,7 +1708,10 @@ impl MhxyApp {
             .map(|window| window.title.clone())
             .unwrap_or_else(|| format!("#{handle}"));
         self.last_scan = Some(Instant::now());
-        let full = match capture::capture_client(handle, self.config.task_region) {
+        // 分辨率变了就切换识别区域（每个分辨率记住一套）。
+        self.sync_region_for_size(capture::client_size(handle));
+        let region = self.config.task_region;
+        let full = match capture::capture_client(handle, region) {
             Ok(full) => full,
             Err(err) => {
                 self.log_detail(format!("截图失败（{window_title}）：{err}"));
@@ -1667,7 +1724,7 @@ impl MhxyApp {
         };
         // 主区域和备用区域分别预处理，再上下拼接送一次 OCR。
         let mut panels = vec![preprocess::apply(
-            capture::crop_task_region(&full, self.config.task_region),
+            capture::crop_task_region(&full, region),
             self.preprocess_pipeline_for(false),
             self.config.preprocess_color,
             self.config.preprocess_tolerance,
@@ -1962,10 +2019,18 @@ impl MhxyApp {
                 self.log_detail(note);
             }
             let summary = match (&task_status, &location) {
-                (None, Some(location)) => format!(
-                    "{task_type} {} ({}, {})",
-                    location.map_name, location.x, location.y
-                ),
+                (None, Some(location)) => {
+                    // 不是「详细」结构匹配时标出来，方便判断这条结果可信度。
+                    let hint = if location.matched == crate::core::TaskMatch::Detailed {
+                        String::new()
+                    } else {
+                        format!(" [{}匹配]", location.matched.label())
+                    };
+                    format!(
+                        "{task_type} {} ({}, {}){hint}",
+                        location.map_name, location.x, location.y
+                    )
+                }
                 (Some(message), _) => format!("{task_type} {message}"),
                 (None, None) => format!("{task_type} 无结果"),
             };
@@ -2606,6 +2671,38 @@ impl MhxyApp {
                             self.release_preview();
                         }
                     }
+                    // 游戏窗口的分辨率是固定的，识别区域也固定：按分辨率记住一套区域，
+                    // 换分辨率时自动套用，只有需要微调时才进「设置识别区域」。
+                    if let Some(handle) = self.selected_handle {
+                        if let Some((width, height)) = capture::client_size(handle) {
+                            let key = format!("{width}x{height}");
+                            let saved = self.config.region_presets.contains_key(&key);
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(
+                                    egui::RichText::new(format!("当前分辨率 {key}"))
+                                        .small()
+                                        .color(theme::muted()),
+                                );
+                                ui.label(
+                                    egui::RichText::new(if saved {
+                                        "已记住该分辨率的区域"
+                                    } else {
+                                        "首次使用，调整后会自动记住"
+                                    })
+                                    .small()
+                                    .color(if saved { theme::jade() } else { theme::muted() }),
+                                );
+                                if saved && ui.small_button("忘记").clicked() {
+                                    self.config.region_presets.remove(&key);
+                                    self.config.task_region = crate::core::DEFAULT_TASK_REGION;
+                                    // 记成「当前分辨率」，避免下一次识别又把默认区域存回去。
+                                    self.last_client_size = Some((width, height));
+                                    self.persist();
+                                    self.notice = Some(format!("已恢复 {key} 的默认识别区域"));
+                                }
+                            });
+                        }
+                    }
                 });
                 if now != fold_window {
                     self.set_sidebar_section_open("window", now);
@@ -2696,124 +2793,6 @@ impl MhxyApp {
                 if now != fold_trigger {
                     self.set_sidebar_section_open("trigger", now);
                 }
-                let fold_ocr = self.sidebar_section_open("ocr");
-                let now = theme::collapsible_section(ui, "sidebar_ocr", "识别方式", fold_ocr, |ui| {
-                    let previous = self.config.ocr_mode.clone();
-                    ui.horizontal(|ui| {
-                        ui.selectable_value(
-                            &mut self.config.ocr_mode,
-                            "local".into(),
-                            "本地 PP-OCR",
-                        );
-                        ui.selectable_value(
-                            &mut self.config.ocr_mode,
-                            "remote".into(),
-                            "远端 PP-OCR",
-                        );
-                    });
-                    if previous != self.config.ocr_mode {
-                        self.invalidate_scan();
-                        self.notice = None;
-                        self.persist();
-                    }
-                    if self.config.ocr_mode == "remote" {
-                        ui.label(egui::RichText::new("服务地址").small().weak());
-                        let url_changed = ui
-                            .add(
-                                egui::TextEdit::singleline(&mut self.api_url_edit)
-                                    .desired_width(f32::INFINITY)
-                                    .hint_text("http://192.168.1.100:8008"),
-                            )
-                            .changed();
-                        ui.label(egui::RichText::new("访问令牌（可选）").small().weak());
-                        let token_changed = ui
-                            .add(
-                                egui::TextEdit::singleline(&mut self.api_token_edit)
-                                    .desired_width(f32::INFINITY)
-                                    .password(true)
-                                    .hint_text("Bearer Token"),
-                            )
-                            .changed();
-                        if url_changed || token_changed {
-                            self.config.api_url = self.api_url_edit.trim().into();
-                            self.config.api_token = self.api_token_edit.trim().into();
-                            self.remote_feedback = None;
-                            self.invalidate_scan();
-                            self.persist();
-                        }
-                        let previous = self.config.api_format.clone();
-                        ui.horizontal(|ui| {
-                            ui.label("格式");
-                            ui.selectable_value(
-                                &mut self.config.api_format,
-                                "multipart".into(),
-                                "multipart",
-                            );
-                            ui.selectable_value(&mut self.config.api_format, "raw".into(), "raw");
-                        });
-                        if previous != self.config.api_format {
-                            self.invalidate_scan();
-                            self.remote_feedback = None;
-                            self.persist();
-                        }
-                        ui.horizontal(|ui| {
-                            if ui
-                                .add_enabled(
-                                    !self.testing_remote,
-                                    egui::Button::new(if self.testing_remote {
-                                        "测试中…"
-                                    } else {
-                                        "测试连接"
-                                    }),
-                                )
-                                .clicked()
-                            {
-                                self.test_remote_ocr();
-                            }
-                            if self.testing_remote {
-                                ui.spinner();
-                            }
-                        });
-                        if let Some(result) = &self.remote_feedback {
-                            let (message, color) = match result {
-                                Ok(message) => (message, theme::jade()),
-                                Err(message) => (message, theme::red()),
-                            };
-                            ui.label(egui::RichText::new(message).small().color(color));
-                        }
-                    } else {
-                        ui.label(
-                            egui::RichText::new("首次识别时加载模型；缺少模型时自动下载约 25 MB。")
-                                .small()
-                                .weak(),
-                        );
-                    }
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("预处理").small().weak());
-                        let main_pipeline = self.preprocess_pipeline_for(false);
-                        let extra_pipeline = self.preprocess_pipeline_for(true);
-                        let summary = if self.config.extra_region_enabled {
-                            format!(
-                                "主 {} / 备 {}",
-                                main_pipeline.summary(),
-                                extra_pipeline.summary()
-                            )
-                        } else {
-                            main_pipeline.summary()
-                        };
-                        let all_off = main_pipeline.is_off()
-                            && (!self.config.extra_region_enabled || extra_pipeline.is_off());
-                        ui.label(
-                            egui::RichText::new(summary)
-                                .small()
-                                .color(if all_off { theme::muted() } else { theme::jade() }),
-                        );
-                    });
-                });
-                if now != fold_ocr {
-                    self.set_sidebar_section_open("ocr", now);
-                }
                 let fold_task = self.sidebar_section_open("task");
                 let now = theme::collapsible_section(ui, "sidebar_task", "任务显示", fold_task, |ui| {
                     // 抓鬼 / 鬼王 按任务名解析；通用任务不看任务类型，两边互斥。
@@ -2897,17 +2876,6 @@ impl MhxyApp {
                 if now != fold_task {
                     self.set_sidebar_section_open("task", now);
                 }
-                let fold_flight = self.sidebar_section_open("flight_flags");
-                let now = theme::collapsible_section(
-                    ui,
-                    "sidebar_flight_flags",
-                    "合成旗标注",
-                    fold_flight,
-                    |ui| self.flight_flags_ui(ui),
-                );
-                if now != fold_flight {
-                    self.set_sidebar_section_open("flight_flags", now);
-                }
                 let fold_meditation = self.sidebar_section_open("meditation");
                 let now = theme::collapsible_section(
                     ui,
@@ -2919,19 +2887,151 @@ impl MhxyApp {
                 if now != fold_meditation {
                     self.set_sidebar_section_open("meditation", now);
                 }
-                let fold_log = self.sidebar_section_open("log");
+                // 不常用的细调项收进这里，侧栏只留「打开就能用」的几项。
+                let fold_advanced = self.sidebar_section_open("advanced");
                 let now = theme::collapsible_section(
                     ui,
-                    "sidebar_log",
-                    "日志",
-                    fold_log,
-                    |ui| self.log_ui(ui),
+                    "sidebar_advanced",
+                    "高级设置",
+                    fold_advanced,
+                    |ui| self.advanced_controls(ui),
                 );
-                if now != fold_log {
-                    self.set_sidebar_section_open("log", now);
+                if now != fold_advanced {
+                    self.set_sidebar_section_open("advanced", now);
                 }
                 ui.add_space(4.0);
             });
+    }
+
+    /// 高级设置：识别方式与预处理、合成旗、日志。
+    fn advanced_controls(&mut self, ui: &mut egui::Ui) {
+        let fold_ocr = self.sidebar_section_open("ocr");
+        let now = theme::collapsible_section(ui, "sidebar_ocr", "识别方式", fold_ocr, |ui| {
+            let previous = self.config.ocr_mode.clone();
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.config.ocr_mode, "local".into(), "本地 PP-OCR");
+                ui.selectable_value(&mut self.config.ocr_mode, "remote".into(), "远端 PP-OCR");
+            });
+            if previous != self.config.ocr_mode {
+                self.invalidate_scan();
+                self.notice = None;
+                self.persist();
+            }
+            if self.config.ocr_mode == "remote" {
+                ui.label(egui::RichText::new("服务地址").small().weak());
+                let url_changed = ui
+                    .add(
+                        egui::TextEdit::singleline(&mut self.api_url_edit)
+                            .desired_width(f32::INFINITY)
+                            .hint_text("http://192.168.1.100:8008"),
+                    )
+                    .changed();
+                ui.label(egui::RichText::new("访问令牌（可选）").small().weak());
+                let token_changed = ui
+                    .add(
+                        egui::TextEdit::singleline(&mut self.api_token_edit)
+                            .desired_width(f32::INFINITY)
+                            .password(true)
+                            .hint_text("Bearer Token"),
+                    )
+                    .changed();
+                if url_changed || token_changed {
+                    self.config.api_url = self.api_url_edit.trim().into();
+                    self.config.api_token = self.api_token_edit.trim().into();
+                    self.remote_feedback = None;
+                    self.invalidate_scan();
+                    self.persist();
+                }
+                let previous = self.config.api_format.clone();
+                ui.horizontal(|ui| {
+                    ui.label("格式");
+                    ui.selectable_value(
+                        &mut self.config.api_format,
+                        "multipart".into(),
+                        "multipart",
+                    );
+                    ui.selectable_value(&mut self.config.api_format, "raw".into(), "raw");
+                });
+                if previous != self.config.api_format {
+                    self.invalidate_scan();
+                    self.remote_feedback = None;
+                    self.persist();
+                }
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(
+                            !self.testing_remote,
+                            egui::Button::new(if self.testing_remote {
+                                "测试中…"
+                            } else {
+                                "测试连接"
+                            }),
+                        )
+                        .clicked()
+                    {
+                        self.test_remote_ocr();
+                    }
+                    if self.testing_remote {
+                        ui.spinner();
+                    }
+                });
+                if let Some(result) = &self.remote_feedback {
+                    let (message, color) = match result {
+                        Ok(message) => (message, theme::jade()),
+                        Err(message) => (message, theme::red()),
+                    };
+                    ui.label(egui::RichText::new(message).small().color(color));
+                }
+            } else {
+                ui.label(
+                    egui::RichText::new("首次识别时加载模型；缺少模型时自动下载约 25 MB。")
+                        .small()
+                        .weak(),
+                );
+            }
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("预处理").small().weak());
+                let main_pipeline = self.preprocess_pipeline_for(false);
+                let extra_pipeline = self.preprocess_pipeline_for(true);
+                let summary = if self.config.extra_region_enabled {
+                    format!(
+                        "主 {} / 备 {}",
+                        main_pipeline.summary(),
+                        extra_pipeline.summary()
+                    )
+                } else {
+                    main_pipeline.summary()
+                };
+                let all_off = main_pipeline.is_off()
+                    && (!self.config.extra_region_enabled || extra_pipeline.is_off());
+                ui.label(egui::RichText::new(summary).small().color(if all_off {
+                    theme::muted()
+                } else {
+                    theme::jade()
+                }));
+            });
+        });
+        if now != fold_ocr {
+            self.set_sidebar_section_open("ocr", now);
+        }
+        let fold_flight = self.sidebar_section_open("flight_flags");
+        let now = theme::collapsible_section(
+            ui,
+            "sidebar_flight_flags",
+            "合成旗标注",
+            fold_flight,
+            |ui| self.flight_flags_ui(ui),
+        );
+        if now != fold_flight {
+            self.set_sidebar_section_open("flight_flags", now);
+        }
+        let fold_log = self.sidebar_section_open("log");
+        let now =
+            theme::collapsible_section(ui, "sidebar_log", "日志", fold_log, |ui| self.log_ui(ui));
+        if now != fold_log {
+            self.set_sidebar_section_open("log", now);
+        }
     }
 
     fn help_contents(&self, ui: &mut egui::Ui) {

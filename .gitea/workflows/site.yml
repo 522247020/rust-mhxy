@@ -210,6 +210,11 @@ jobs:
           ln -sf pathcch.lib "$sdk_dir/PATHCCH.lib"
           ls -l "$sdk_dir" | grep -iE 'directml|pathcch'
 
+      - name: Run tests
+        run: |
+          cargo test --locked
+          cargo clippy --locked --all-targets -- -D warnings
+
       - name: Build Windows package
         run: |
           echo "HEAD: $(git rev-parse --short HEAD)"

@@ -90,6 +90,30 @@ impl MapDefinition {
     }
 }
 
+/// 这条结果是由哪一层匹配得到的，用来判断可信度。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaskMatch {
+    /// 「去 … 附近 / 去 … 处」结构完整，地图和坐标紧挨着。
+    Detailed,
+    /// 结构不完整，但在坐标前一小段里找到了地图名。
+    Nearby,
+    /// 整块里能找到地图名，顺序不限。
+    Loose,
+    /// 地图名有错字，靠模糊匹配纠正。
+    Fuzzy,
+}
+
+impl TaskMatch {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Detailed => "详细",
+            Self::Nearby => "邻近",
+            Self::Loose => "极简",
+            Self::Fuzzy => "模糊",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct TaskLocation {
     pub task_type: String,
@@ -97,6 +121,7 @@ pub struct TaskLocation {
     pub x: i32,
     pub y: i32,
     pub nearby: bool,
+    pub matched: TaskMatch,
 }
 
 #[derive(Deserialize)]
@@ -212,11 +237,9 @@ fn is_cjk(ch: char) -> bool {
 }
 
 fn is_separator(ch: char) -> bool {
-    // OCR 经常把坐标的逗号认成句号、冒号或分号，都当作分隔符。
-    matches!(
-        ch,
-        ',' | '，' | '、' | '.' | '．' | '。' | ':' | '：' | ';' | '；' | '·'
-    )
+    // OCR 经常把坐标的逗号认成句号，两种句号都算分隔符。
+    // 不要加冒号 / 分号：「剩余12:30」这类文本会被误读成坐标 (12, 30)。
+    matches!(ch, ',' | '，' | '、' | '.' | '．' | '。')
 }
 
 /// 归一化后的编辑距离相似度，近似 Python difflib 的匹配比例。
@@ -446,24 +469,13 @@ pub fn parse_tasks(text: &str, maps: &[MapDefinition], filter: TaskFilter) -> Ve
         }
     }
 
-    for (position, (start, end, task_type)) in matches.iter().enumerate() {
+    for (position, (_start, end, task_type)) in matches.iter().enumerate() {
         if !filter.enabled(task_type) || tasks.iter().any(|task| task.task_type == *task_type) {
             continue;
         }
         let block_end = matches.get(position + 1).map_or(chars.len(), |next| next.0);
         let block = &normalized[byte_of_char[*end]..byte_of_char[block_end]];
         if let Some(location) = locate_in_text(block, maps, task_type) {
-            tasks.push(location);
-            continue;
-        }
-        // OCR 阅读顺序错乱时，地图和坐标可能被排到关键字前面（如「长寿村 123,45 抓鬼」）。
-        // 只在关键字后面的文字里完全没有坐标时，才回看前面一小段。
-        if find_coordinate(block).is_some() {
-            continue;
-        }
-        let from = byte_of_char[start.saturating_sub(40)];
-        let before = &normalized[from..byte_of_char[*start]];
-        if let Some(location) = locate_in_text(before, maps, task_type) {
             tasks.push(location);
         }
     }
@@ -476,15 +488,70 @@ pub fn parse_tasks(text: &str, maps: &[MapDefinition], filter: TaskFilter) -> Ve
 /// 去掉空白后再取坐标，可以避免把 "79,26" 拆成 "79,2" + "6"。
 fn locate_in_text(block: &str, maps: &[MapDefinition], task_type: &str) -> Option<TaskLocation> {
     let nearby = compact(block).contains("附近");
-    let mut location =
-        travel_segment(block).and_then(|segment| locate_at(&segment, maps, task_type));
+    // 分四层，越往后越宽松；前一层成功就不再用后面的。
+    // 1) 「去 … 附近 / 去 … 处」结构完整，地图和坐标都紧挨着 —— 最可信。
+    let mut location = travel_segment(block)
+        .and_then(|segment| locate_at(&segment, maps, task_type, TaskMatch::Detailed));
+    // 2) 结构不完整，但在坐标前面一小段里能找到地图名。
     if location.is_none() {
-        location = locate_at(block, maps, task_type);
+        location = locate_at(block, maps, task_type, TaskMatch::Nearby);
+    }
+    // 3) OCR 把地图名排到了坐标后面之类：整块里精确包含地图名就用。
+    if location.is_none() {
+        location = locate_loose(block, maps, task_type, false);
+    }
+    // 4) 最后才用模糊匹配，兜底认错字的地图名。
+    if location.is_none() {
+        location = locate_loose(block, maps, task_type, true);
     }
     if let Some(location) = &mut location {
         location.nearby = nearby;
     }
     location
+}
+
+/// 极简匹配：只要整块里能找到坐标和地图名就成立，不要求两者相邻。
+///
+/// `allow_fuzzy` 为 true 时允许地图名有一两个字的偏差，只在所有严格匹配
+/// 都失败后才使用。
+fn locate_loose(
+    block: &str,
+    maps: &[MapDefinition],
+    task_type: &str,
+    allow_fuzzy: bool,
+) -> Option<TaskLocation> {
+    let (_, x, y) = find_coordinate(block)?;
+    let text = compact(block);
+    let candidates: Vec<&MapDefinition> = maps
+        .iter()
+        .filter(|map| map.supports_task(task_type))
+        .collect();
+    let definition = candidates
+        .iter()
+        .copied()
+        .find(|map| {
+            map.aliases.iter().any(|alias| {
+                let alias = compact(alias);
+                !alias.is_empty() && text.contains(&alias)
+            })
+        })
+        .or_else(|| {
+            allow_fuzzy
+                .then(|| fuzzy_map_in_text(&text, &candidates))
+                .flatten()
+        })?;
+    Some(TaskLocation {
+        task_type: task_type.to_string(),
+        map_name: definition.name.clone(),
+        x,
+        y,
+        nearby: text.contains("附近"),
+        matched: if allow_fuzzy {
+            TaskMatch::Fuzzy
+        } else {
+            TaskMatch::Loose
+        },
+    })
 }
 
 /// 取「去 / 前往」到「附近 / 处」之间的文字，并去掉所有空白。
@@ -532,28 +599,40 @@ fn prev_char_is_digit(chars: &[char], index: usize) -> bool {
     false
 }
 
+/// 坐标前用于找地图名的字符数。
+///
+/// 任务描述里地图名和坐标是紧挨着的（「去长寿村123,45」），
+/// 只看坐标前这一小段就够；范围放大到整段会把「附近抓僵尸」之类的
+/// 描述也拿去比对，反而容易匹配到错误的地图。
+const MAP_LOOKBACK_CHARS: usize = 24;
+
 /// 在一段（已归一化的）文字里找「地图名 + 坐标」。
-fn locate_at(block: &str, maps: &[MapDefinition], task_type: &str) -> Option<TaskLocation> {
+fn locate_at(
+    block: &str,
+    maps: &[MapDefinition],
+    task_type: &str,
+    matched: TaskMatch,
+) -> Option<TaskLocation> {
     let (coordinate_start, x, y) = find_coordinate(block)?;
     let compact_block = compact(block);
     let candidates: Vec<&MapDefinition> = maps
         .iter()
         .filter(|map| map.supports_task(task_type))
         .collect();
-    // 1) 整段里包含某个别名（地图名与坐标之间可能夹着 OCR 噪声）。
+    // 只看坐标前面一小段：OCR 认错地图名时也不至于去别处找相似字。
+    let near = compact(&near_before(block, coordinate_start, MAP_LOOKBACK_CHARS));
+    // 1) 坐标附近包含某个别名（地图名与坐标之间可能夹着 OCR 噪声）。
     let mut definition = candidates.iter().copied().find(|map| {
         map.aliases.iter().any(|alias| {
             let alias = compact(alias);
-            !alias.is_empty() && compact_block.contains(&alias)
+            !alias.is_empty() && near.contains(&alias)
         })
     });
-    // 2) 别名没命中时，用坐标附近的连续中文段做模糊匹配：
-    //    OCR 把「长寿村」认成「长寿材」时仍能对回地图；
-    //    地图名出现在坐标后面（阅读顺序错乱）也能处理。
+    // 2) 别名没命中时，在坐标前面这一小段里做模糊匹配（长寿材 / 长y村 / 夭宫）。
     if definition.is_none() {
-        definition = fuzzy_map_in_text(block, &candidates);
+        definition = fuzzy_map_in_text(&near, &candidates);
     }
-    let inferred_map = infer_map_name(&compact(&block[..coordinate_start]));
+    let inferred_map = infer_map_name(&near);
     // 3) 最后按「去XXX / 前往XXX」推断。
     if definition.is_none() {
         if let Some(inferred) = &inferred_map {
@@ -569,7 +648,24 @@ fn locate_at(block: &str, maps: &[MapDefinition], task_type: &str) -> Option<Tas
         x,
         y,
         nearby: compact_block.contains("附近"),
+        matched,
     })
+}
+
+/// 取坐标起点之前最后 `limit` 个字符（按字节偏移定位坐标位置）。
+fn near_before(block: &str, coordinate_start: usize, limit: usize) -> String {
+    let chars: Vec<char> = block.chars().collect();
+    let mut byte = 0usize;
+    let mut index = chars.len();
+    for (position, ch) in chars.iter().enumerate() {
+        if byte >= coordinate_start {
+            index = position;
+            break;
+        }
+        byte += ch.len_utf8();
+    }
+    let from = index.saturating_sub(limit);
+    chars[from..index].iter().collect()
 }
 
 /// 在整段文字上按「别名长度 ±1」滑动窗口，用编辑距离找出最像的地图名。
@@ -597,6 +693,10 @@ fn fuzzy_map_in_text<'a>(
                     continue;
                 }
                 for start in 0..=chars.len() - length {
+                    // 2 字地图名容错率太宽（「天空」也有 0.5），只认紧挨坐标的那一段。
+                    if alias.len() <= 2 && start + length != chars.len() {
+                        continue;
+                    }
                     let window = &chars[start..start + length];
                     if window.iter().any(|ch| ch.is_ascii_digit()) {
                         continue;
@@ -772,19 +872,19 @@ pub fn task_region(width: f32, height: f32, region: TaskRegion) -> (f32, f32, f3
     )
 }
 
-/// 解析 ``左,上,右,下`` 百分比字符串，非法时返回默认值。
-pub fn parse_region_setting(saved: &str, default: TaskRegion) -> TaskRegion {
+/// 解析 ``左,上,右,下`` 百分比字符串，非法时返回 None。
+pub fn parse_region(saved: &str) -> Option<TaskRegion> {
     let parts: Vec<&str> = saved.split(',').collect();
     if parts.len() != 4 {
-        return default;
+        return None;
     }
     let mut values = [0f32; 4];
     for (slot, part) in values.iter_mut().zip(parts.iter()) {
-        match part.trim().parse::<f32>() {
-            Ok(value) if value.is_finite() => *slot = value,
-            Ok(_) => return default,
-            Err(_) => return default,
+        let value = part.trim().parse::<f32>().ok()?;
+        if !value.is_finite() {
+            return None;
         }
+        *slot = value;
     }
     let (left, top, right, bottom) = (values[0], values[1], values[2], values[3]);
     if !(0.0..1.0).contains(&left)
@@ -794,9 +894,14 @@ pub fn parse_region_setting(saved: &str, default: TaskRegion) -> TaskRegion {
         || top >= bottom
         || bottom > 1.0
     {
-        return default;
+        return None;
     }
-    (left, top, right, bottom)
+    Some((left, top, right, bottom))
+}
+
+/// 解析 ``左,上,右,下`` 百分比字符串，非法时返回默认值。
+pub fn parse_region_setting(saved: &str, default: TaskRegion) -> TaskRegion {
+    parse_region(saved).unwrap_or(default)
 }
 
 #[cfg(test)]
@@ -1116,12 +1221,9 @@ mod tests {
             // 地图名被 OCR 认错一个字，模糊匹配回正确地图。
             ("抓鬼\n长寿材 123,45", "长寿村", (123, 45)),
             ("捉鬼\n普院山 79,26", "普陀山", (79, 26)),
-            // 坐标分隔符被认成冒号 / 分号 / 句号。
-            ("抓鬼\n长寿村 123;45", "长寿村", (123, 45)),
+            // 坐标分隔符被认成句号。
             ("抓鬼\n长寿村 123。45", "长寿村", (123, 45)),
-            ("抓鬼\n长寿村 123:45", "长寿村", (123, 45)),
-            // 坐标行排在任务名之前（阅读顺序错乱）。
-            ("长寿村 123,45 抓鬼", "长寿村", (123, 45)),
+            ("抓鬼\n长寿村 123.45", "长寿村", (123, 45)),
             // 任务栏里夹着「1/10」「第1个」这类计数，不能当成坐标。
             ("抓鬼 1/10 长寿村 123,45", "长寿村", (123, 45)),
             ("抓鬼\n第1个：长寿村 123,45", "长寿村", (123, 45)),
@@ -1133,6 +1235,89 @@ mod tests {
             assert_eq!(tasks[0].map_name, map_name, "{text}");
             assert_eq!((tasks[0].x, tasks[0].y), (x, y), "{text}");
         }
+    }
+
+    #[test]
+    fn falls_back_to_loose_match_when_structure_missing() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/maps.json");
+        let maps = load_maps(&path).expect("加载 maps.json");
+        let filter = TaskFilter {
+            zhuagui: true,
+            ghost_king: true,
+            generic: false,
+        };
+        // 没有「去…附近」结构，地图名还排在坐标后面：极简匹配兜底。
+        let text = "钟馗抓鬼 123,45 长寿村";
+        let tasks = parse_tasks(text, &maps, filter);
+        assert_eq!(tasks.len(), 1, "{tasks:?}");
+        assert_eq!(tasks[0].map_name, "长寿村");
+        assert_eq!((tasks[0].x, tasks[0].y), (123, 45));
+    }
+
+    #[test]
+    fn falls_back_to_fuzzy_loose_match_last() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/maps.json");
+        let maps = load_maps(&path).expect("加载 maps.json");
+        let filter = TaskFilter {
+            zhuagui: true,
+            ghost_king: true,
+            generic: false,
+        };
+        // 结构缺失 + 地图名认错一个字，最后一层模糊兜底。
+        let text = "钟馗抓鬼 123,45 长寿材";
+        let tasks = parse_tasks(text, &maps, filter);
+        assert_eq!(tasks.len(), 1, "{tasks:?}");
+        assert_eq!(tasks[0].map_name, "长寿村");
+    }
+
+    #[test]
+    fn does_not_read_clock_as_coordinate() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/maps.json");
+        let maps = load_maps(&path).expect("加载 maps.json");
+        let filter = TaskFilter {
+            zhuagui: true,
+            ghost_king: true,
+            generic: false,
+        };
+        // 「剩余12:30」不是坐标，冒号不再当分隔符。
+        let text = "降伏千年厉鬼（第1个）：去天宫降伏僵尸鬼王,剩余12:30";
+        assert!(parse_tasks(text, &maps, filter).is_empty());
+    }
+
+    #[test]
+    fn does_not_borrow_coordinates_from_previous_task() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/maps.json");
+        let maps = load_maps(&path).expect("加载 maps.json");
+        let filter = TaskFilter {
+            zhuagui: true,
+            ghost_king: true,
+            generic: false,
+        };
+        // 抓鬼有坐标，鬼王那条只有任务名、没有坐标：不能拿上一条的 123,45 顶上。
+        let text = "钟馗抓鬼（第1个）：去长寿村123,45附近抓僵尸。\
+                    降伏千年厉鬼（第1个）：去天宫附近降伏僵尸鬼王";
+        let tasks = parse_tasks(text, &maps, filter);
+        assert_eq!(tasks.len(), 1, "{tasks:?}");
+        assert_eq!(tasks[0].task_type, "抓鬼");
+        assert_eq!(tasks[0].map_name, "长寿村");
+    }
+
+    #[test]
+    fn does_not_guess_map_from_distant_text() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/maps.json");
+        let maps = load_maps(&path).expect("加载 maps.json");
+        let filter = TaskFilter {
+            zhuagui: true,
+            ghost_king: true,
+            generic: false,
+        };
+        // 「天空」离坐标很远，且真实地图不在名单里：应该放弃，而不是猜成天宫。
+        let text = "降伏千年厉鬼（第1个）：天空很蓝，去长安城123,45降伏僵尸鬼王,剩余15分钟";
+        let tasks = parse_tasks(text, &maps, filter);
+        assert!(
+            !tasks.iter().any(|task| task.map_name == "天宫"),
+            "不应把远处的「天空」猜成天宫：{tasks:?}"
+        );
     }
 
     #[test]

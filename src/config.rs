@@ -52,6 +52,8 @@ pub struct Config {
     pub ocr_mode: String,
     pub interval_seconds: u32,
     pub task_region: TaskRegion,
+    /// 按分辨率保存的识别区域：键是 "1920x1080"，值是 "0.65,0.23,0.98,0.50"。
+    pub region_presets: std::collections::BTreeMap<String, String>,
     pub extra_task_region: TaskRegion,
     pub extra_region_enabled: bool,
     pub api_format: String,
@@ -127,6 +129,7 @@ impl Default for Config {
             ocr_mode: "local".into(),
             interval_seconds: 5,
             task_region: DEFAULT_TASK_REGION,
+            region_presets: std::collections::BTreeMap::new(),
             extra_task_region: DEFAULT_EXTRA_REGION,
             extra_region_enabled: false,
             api_format: "multipart".into(),
@@ -154,7 +157,8 @@ impl Default for Config {
             extra_preprocess_color: DEFAULT_PREPROCESS_COLOR,
             extra_preprocess_tolerance: 24,
             theme: "system".into(),
-            sidebar_folded: String::new(),
+            // 新用户默认收起「高级设置」，侧栏只留常用项。
+            sidebar_folded: "advanced".to_string(),
             meditation_duration_seconds: crate::meditation::DEFAULT_DURATION_SECONDS,
             meditation_clock_format: false,
             meditation_opacity: 0.85,
@@ -205,6 +209,20 @@ impl Config {
         };
         config.interval_seconds =
             get_u32(map, "ocr/interval_seconds", config.interval_seconds).clamp(1, 60);
+        config.region_presets = map
+            .get("ocr/region_presets")
+            .and_then(Value::as_object)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|(key, value)| {
+                        let region = value.as_str()?;
+                        crate::core::parse_region(region)?;
+                        Some((key.clone(), region.to_string()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         config.task_region =
             parse_region_setting(&get_string(map, "ocr/task_region", ""), DEFAULT_TASK_REGION);
         config.extra_task_region = parse_region_setting(
@@ -364,6 +382,15 @@ impl Config {
             Value::String(region_to_string(self.task_region)),
         );
         insert(
+            "ocr/region_presets",
+            Value::Object(
+                self.region_presets
+                    .iter()
+                    .map(|(key, value)| (key.clone(), Value::String(value.clone())))
+                    .collect(),
+            ),
+        );
+        insert(
             "ocr/extra_task_region",
             Value::String(region_to_string(self.extra_task_region)),
         );
@@ -516,7 +543,7 @@ const CONFIG_HEADER: &str = "// 梦幻西游任务坐标辅助（rust-mhxy）用
 // 界面里改的设置会自动写到这里，下次启动读回；也可以手工编辑后重启程序。\n\
 // 支持 // 和 /* */ 注释。\n";
 
-fn region_to_string(region: TaskRegion) -> String {
+pub(crate) fn region_to_string(region: TaskRegion) -> String {
     format!("{},{},{},{}", region.0, region.1, region.2, region.3)
 }
 

@@ -131,9 +131,8 @@ impl FlightFlags {
         let temporary = path.with_extension(format!("json.{}.tmp", std::process::id()));
         std::fs::write(&temporary, format!("{payload}\n"))
             .map_err(|err| format!("写入飞行旗配置失败：{err}"))?;
-        if path.exists() {
-            std::fs::remove_file(path).map_err(|err| format!("替换飞行旗配置失败：{err}"))?;
-        }
+        // 直接 rename 覆盖：Windows 上底层是 MoveFileEx(REPLACE_EXISTING)。
+        // 先删旧文件再改名的话，中途崩溃/断电会把配置弄丢。
         std::fs::rename(&temporary, path).map_err(|err| {
             let _ = std::fs::remove_file(&temporary);
             format!("保存飞行旗配置失败：{err}")

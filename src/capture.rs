@@ -96,6 +96,11 @@ pub fn list_windows() -> Result<Vec<WindowInfo>, String> {
     Ok(filter_game_windows(windows))
 }
 
+/// 查询窗口客户区尺寸（逻辑像素），用于按分辨率选择识别区域预设。
+pub fn client_size(handle: i64) -> Option<(u32, u32)> {
+    imp::client_size(handle)
+}
+
 /// 只截取客户区里的一小块（图色门控用），开销远小于整张客户区。
 pub fn capture_client_rect(
     handle: i64,
@@ -135,6 +140,14 @@ mod imp {
             items.push(WindowInfo { handle, title });
         }
         Ok(items)
+    }
+
+    pub fn client_size(handle: i64) -> Option<(u32, u32)> {
+        let windows = xcap::Window::all().ok()?;
+        let found = windows
+            .into_iter()
+            .find(|window| window.id().map(|id| id as i64).unwrap_or(-1) == handle)?;
+        Some((found.width().ok()?, found.height().ok()?))
     }
 
     pub fn capture_client(
@@ -325,9 +338,26 @@ mod imp {
             };
             let covering = GetAncestor(WindowFromPoint(center), GA_ROOT);
             if covering.0 != hwnd.0 {
-                return Err("任务区域被其他窗口遮挡".into());
+                // 本程序自己的置顶悬浮窗（打坐计时）不算遮挡，否则会一直截不到图。
+                let mut pid = 0u32;
+                GetWindowThreadProcessId(covering, Some(&mut pid));
+                if pid != std::process::id() {
+                    return Err("任务区域被其他窗口遮挡".into());
+                }
             }
             capture_screen(origin.x, origin.y, width, height)
+        }
+    }
+
+    pub fn client_size(handle: i64) -> Option<(u32, u32)> {
+        unsafe {
+            let hwnd = HWND(handle as *mut core::ffi::c_void);
+            if !IsWindow(Some(hwnd)).as_bool() {
+                return None;
+            }
+            let mut rect = RECT::default();
+            GetClientRect(hwnd, &mut rect).ok()?;
+            Some((rect.right.max(0) as u32, rect.bottom.max(0) as u32))
         }
     }
 
