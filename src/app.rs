@@ -35,10 +35,6 @@ const HOTKEY_RETRY_DELAY: Duration = Duration::from_secs(5);
 const MEDITATION_MIN_SIZE: Vec2 = Vec2::new(64.0, 36.0);
 /// 「附近」范围框的半径（游戏坐标），所以框的边长是 2 倍。
 const NEARBY_RADIUS: f32 = 50.0;
-/// 日志框的最小高度；实际高度随窗口高度变化。
-const LOG_PANEL_MIN_HEIGHT: f32 = 140.0;
-/// 日志框占窗口可用高度的比例。
-const LOG_PANEL_HEIGHT_RATIO: f32 = 0.34;
 /// 侧栏展开 / 收起时的最小窗口尺寸。
 const MIN_WINDOW_SIZE_EXPANDED: Vec2 = Vec2::new(760.0, 540.0);
 const MIN_WINDOW_SIZE_COLLAPSED: Vec2 = Vec2::new(460.0, 460.0);
@@ -48,6 +44,9 @@ const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const HELP_WINDOW_SIZE: Vec2 = Vec2::new(560.0, 640.0);
 const UPDATE_WINDOW_SIZE: Vec2 = Vec2::new(480.0, 540.0);
 const FLIGHT_FLAGS_WINDOW_SIZE: Vec2 = Vec2::new(900.0, 760.0);
+/// 高级设置与打坐设置的独立窗口尺寸。
+const ADVANCED_WINDOW_SIZE: Vec2 = Vec2::new(560.0, 640.0);
+const MEDITATION_WINDOW_SIZE: Vec2 = Vec2::new(480.0, 560.0);
 /// 检查结果在按钮上停留的时间。
 const UPDATE_FLASH_DURATION: Duration = Duration::from_secs(4);
 
@@ -161,7 +160,6 @@ pub struct MhxyApp {
     /// 识别还没结束时又按了快捷键：记下来，等这一轮结束立刻补一次，
     /// 不再像以前那样直接丢掉（看起来就像快捷键没反应）。
     pending_manual_trigger: bool,
-    logs: Vec<String>,
     /// 精简模式：只留地图，隐藏顶部按钮栏、状态栏和侧栏；按 Esc 退出。
     compact: bool,
     /// 当前实际应用的亮色 / 暗色，用于跟随系统主题时即时切换。
@@ -191,10 +189,56 @@ pub struct MhxyApp {
     flight_flags: FlightFlags,
     flight_flags_path: PathBuf,
     show_flight_flags_window: bool,
+    /// 高级设置窗口（识别方式、方案、显示、合成旗）。
+    show_advanced_window: bool,
+    advanced_window_pos: Option<egui::Pos2>,
+    applied_advanced_on_top: Option<bool>,
+    /// 打坐计时设置窗口。
+    show_meditation_window: bool,
+    meditation_window_pos: Option<egui::Pos2>,
+    applied_meditation_window_on_top: Option<bool>,
+    /// 日志落盘路径（不再在界面里展示）。
+    log_path: PathBuf,
     flight_map_edit: String,
     flight_flag_index: usize,
     flight_flag_name_edit: String,
     flight_feedback: Option<Result<String, String>>,
+}
+
+/// 日志落盘位置：配置目录下的 logs/rust-mhxy.log。
+fn default_log_path(config_path: &std::path::Path) -> PathBuf {
+    let dir = config_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(|parent| parent.join("logs"))
+        .unwrap_or_else(|| std::env::temp_dir().join("rust-mhxy-logs"));
+    dir.join("rust-mhxy.log")
+}
+
+/// 追加一行日志；文件超过 2MB 时轮转成 `.1`，避免无限增长。
+fn append_log(path: &std::path::Path, line: &str) {
+    const MAX_BYTES: u64 = 2 * 1024 * 1024;
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if std::fs::metadata(path)
+        .map(|meta| meta.len() > MAX_BYTES)
+        .unwrap_or(false)
+    {
+        let rotated = path.with_extension("log.1");
+        let _ = std::fs::rename(path, rotated);
+    }
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        Ok(mut file) => {
+            use std::io::Write;
+            let _ = file.write_all(line.as_bytes());
+        }
+        Err(err) => eprintln!("写入日志失败（{}）：{err}", path.display()),
+    }
 }
 
 fn next_hotkey_id() -> i32 {
@@ -239,6 +283,11 @@ impl MhxyApp {
             Err(err) => (FlightFlags::default(), Some(Err(err))),
         };
         let meditation_duration = config.meditation_duration_seconds;
+        let log_path = if cfg!(test) {
+            std::env::temp_dir().join(format!("rust-mhxy-test-log-{}.log", std::process::id()))
+        } else {
+            default_log_path(&config_path)
+        };
         let mut app = Self {
             api_url_edit: config.api_url.clone(),
             api_token_edit: config.api_token.clone(),
@@ -316,7 +365,6 @@ impl MhxyApp {
             recording_hotkey: false,
             last_manual_trigger: None,
             pending_manual_trigger: false,
-            logs: Vec::new(),
             compact: false,
             applied_light: None,
             meditation: MeditationTimer::new(meditation_duration),
@@ -336,6 +384,13 @@ impl MhxyApp {
             flight_flags,
             flight_flags_path,
             show_flight_flags_window: false,
+            show_advanced_window: false,
+            advanced_window_pos: None,
+            applied_advanced_on_top: None,
+            show_meditation_window: false,
+            meditation_window_pos: None,
+            applied_meditation_window_on_top: None,
+            log_path,
             flight_map_edit: SUPPORTED_MAPS[0].to_string(),
             flight_flag_index: 0,
             flight_flag_name_edit: String::new(),
@@ -359,16 +414,13 @@ impl MhxyApp {
         self.push_log(false, message.into());
     }
 
+    /// 日志直接写盘，界面不再展示；详细级别才记录 OCR 过程。
     fn push_log(&mut self, simple: bool, message: String) {
         if !simple && self.config.log_level != "detailed" {
             return;
         }
-        let time = chrono::Local::now().format("%H:%M:%S");
-        self.logs.push(format!("[{time}] {message}"));
-        if self.logs.len() > 1000 {
-            let excess = self.logs.len() - 1000;
-            self.logs.drain(0..excess);
-        }
+        let time = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+        append_log(&self.log_path, &format!("[{time}] {message}\n"));
     }
 
     // ---- 自动更新 ----
@@ -2580,61 +2632,229 @@ impl MhxyApp {
         }
     }
 
+    fn toggle_region_window(&mut self, ctx: &egui::Context) {
+        if self.show_region_window {
+            self.show_region_window = false;
+            self.region_window_pos = None;
+            self.applied_region_on_top = None;
+            self.release_preview();
+        } else {
+            self.show_region_window = true;
+            // 取点窗口优先放在主窗口右侧；右侧不够就放左侧，
+            // 两边都放不下才贴屏幕右缘（此时靠置顶层级保证不被主窗口压住）。
+            self.region_window_pos = Some(region_window_position(ctx, REGION_WINDOW_SIZE));
+            self.applied_region_on_top = None;
+            self.capture_preview_once();
+        }
+    }
+
     fn controls(&mut self, ui: &mut egui::Ui) {
+        // 最常用的「开始 / 暂停」固定在侧栏底部，窗口再矮也不用滚动去找。
+        let footer_height = 78.0;
+        let scroll_height = (ui.available_height() - footer_height).max(160.0);
         egui::ScrollArea::vertical()
             .id_salt("sidebar")
+            .max_height(scroll_height)
             .auto_shrink([false, false])
-            .show(ui, |ui| {
-                let fold_window = self.sidebar_section_open("window");
-                let now = theme::collapsible_section(ui, "sidebar_window", "游戏窗口", fold_window, |ui| {
-                    let current = self
-                        .windows
-                        .iter()
-                        .find(|window| Some(window.handle) == self.selected_handle)
-                        .map(|window| window.title.clone())
-                        .unwrap_or_else(|| "未找到游戏窗口".into());
-                    let mut selected = self.selected_handle;
-                    ui.horizontal(|ui| {
-                        // ComboBox::width() 只是「最小宽度」：egui 用父 Ui 的 available_width
-                        // 作为文本换行宽度，默认 Extend 模式下选中项文本多长它就有多宽。
-                        // 游戏窗口标题很长时，它会撑破卡片右缘并把「刷新」按钮挤出可视区，
-                        // 所以这里用一个限宽的子 Ui 把可用宽度钉死，并让选中项文本截断。
-                        let combo_width = (ui.available_width() - 66.0).max(100.0);
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(combo_width, ui.spacing().interact_size.y),
-                            egui::Layout::left_to_right(egui::Align::Center),
-                            |ui| {
-                                egui::ComboBox::from_id_salt("window")
-                                    .selected_text(current)
-                                    .width(combo_width)
-                                    .truncate()
-                                    .show_ui(ui, |ui| {
-                                        for window in &self.windows {
-                                            ui.selectable_value(
-                                                &mut selected,
-                                                Some(window.handle),
-                                                &window.title,
-                                            );
-                                        }
-                                    });
-                            },
-                        );
-                        if ui.button("刷新").clicked() {
-                            self.refresh_windows(true);
-                            selected = self.selected_handle;
-                        }
-                    });
-                    if selected != self.selected_handle {
-                        self.set_window(selected);
-                        self.log_detail("已切换游戏窗口，清除旧任务结果");
+            .show(ui, |ui| self.basic_controls(ui));
+        ui.separator();
+        ui.add_space(4.0);
+        self.sidebar_action(ui);
+    }
+
+    fn sidebar_action(&mut self, ui: &mut egui::Ui) {
+        let label = if self.running {
+            if self.manual_mode() {
+                "暂停监听"
+            } else {
+                "暂停识别"
+            }
+        } else if self.manual_mode() {
+            "开始监听"
+        } else {
+            "开始识别"
+        };
+        if ui
+            .add_sized([ui.available_width(), 34.0], theme::primary_button(label))
+            .clicked()
+        {
+            self.toggle_running();
+        }
+        let window = self
+            .windows
+            .iter()
+            .find(|window| Some(window.handle) == self.selected_handle)
+            .map(|window| window.title.clone())
+            .unwrap_or_else(|| "未选择游戏窗口".to_string());
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(format!("窗口：{window}"))
+                    .small()
+                    .weak(),
+            )
+            .truncate(),
+        )
+        .on_hover_text(&window);
+        let mode = if self.config.ocr_mode == "remote" {
+            if self.config.api_url.trim().is_empty() {
+                "远端 PP-OCR（未配置地址）"
+            } else {
+                "远端 PP-OCR"
+            }
+        } else {
+            "本地 PP-OCRv5"
+        };
+        let trigger = if self.manual_mode() {
+            let hotkey = Hotkey::parse(&self.config.ocr_hotkey)
+                .map(|hotkey| hotkey.display())
+                .unwrap_or_else(|_| self.config.ocr_hotkey.clone());
+            format!("手动 · {hotkey}")
+        } else {
+            format!("每 {} 秒自动识别", self.config.interval_seconds)
+        };
+        let remote_unconfigured =
+            self.config.ocr_mode == "remote" && self.config.api_url.trim().is_empty();
+        let summary = format!("{mode} · {trigger}");
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(&summary)
+                    .small()
+                    .color(if remote_unconfigured {
+                        theme::gold()
+                    } else {
+                        theme::muted()
+                    }),
+            )
+            .truncate(),
+        )
+        .on_hover_text(&summary);
+    }
+
+    fn basic_controls(&mut self, ui: &mut egui::Ui) {
+        let fold_window = self.sidebar_section_open("window");
+        let now =
+            theme::collapsible_section(ui, "sidebar_window", "游戏窗口", fold_window, |ui| {
+                let current = self
+                    .windows
+                    .iter()
+                    .find(|window| Some(window.handle) == self.selected_handle)
+                    .map(|window| window.title.clone())
+                    .unwrap_or_else(|| "未找到游戏窗口".into());
+                let mut selected = self.selected_handle;
+                ui.horizontal(|ui| {
+                    // ComboBox::width() 只是「最小宽度」：egui 用父 Ui 的 available_width
+                    // 作为文本换行宽度，默认 Extend 模式下选中项文本多长它就有多宽。
+                    // 游戏窗口标题很长时，它会撑破卡片右缘并把「刷新」按钮挤出可视区，
+                    // 所以这里用一个限宽的子 Ui 把可用宽度钉死，并让选中项文本截断。
+                    let combo_width = (ui.available_width() - 66.0).max(100.0);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(combo_width, ui.spacing().interact_size.y),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            egui::ComboBox::from_id_salt("window")
+                                .selected_text(current)
+                                .width(combo_width)
+                                .truncate()
+                                .show_ui(ui, |ui| {
+                                    for window in &self.windows {
+                                        ui.selectable_value(
+                                            &mut selected,
+                                            Some(window.handle),
+                                            &window.title,
+                                        );
+                                    }
+                                });
+                        },
+                    );
+                    if ui.button("刷新").clicked() {
+                        self.refresh_windows(true);
+                        selected = self.selected_handle;
                     }
-                    if self.windows.is_empty() {
-                        ui.label(
-                            egui::RichText::new("请先打开游戏，窗口列表会自动刷新")
+                });
+                if selected != self.selected_handle {
+                    self.set_window(selected);
+                    self.log_detail("已切换游戏窗口，清除旧任务结果");
+                }
+                if self.windows.is_empty() {
+                    ui.label(
+                        egui::RichText::new("请先打开游戏，窗口列表会自动刷新")
+                            .small()
+                            .color(theme::gold()),
+                    );
+                }
+                let label = if self.show_region_window {
+                    "关闭识别区域"
+                } else {
+                    "设置识别区域"
+                };
+                if ui
+                    .add_sized([ui.available_width(), 32.0], egui::Button::new(label))
+                    .clicked()
+                {
+                    self.toggle_region_window(ui.ctx());
+                }
+                // 游戏窗口的分辨率是固定的，识别区域也固定：按分辨率记住一套区域，
+                // 换分辨率时自动套用，只有需要微调时才进「设置识别区域」。
+                if let Some(handle) = self.selected_handle {
+                    if let Some((width, height)) = capture::client_size(handle) {
+                        let key = format!("{width}x{height}");
+                        let saved = self.config.region_presets.contains_key(&key);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(
+                                egui::RichText::new(format!("当前分辨率 {key}"))
+                                    .small()
+                                    .color(theme::muted()),
+                            );
+                            ui.label(
+                                egui::RichText::new(if saved {
+                                    "已记住该分辨率的区域"
+                                } else {
+                                    "首次使用，调整后会自动记住"
+                                })
                                 .small()
-                                .color(theme::gold()),
-                        );
+                                .color(if saved {
+                                    theme::jade()
+                                } else {
+                                    theme::muted()
+                                }),
+                            );
+                            if saved && ui.small_button("忘记").clicked() {
+                                self.config.region_presets.remove(&key);
+                                self.config.task_region = crate::core::DEFAULT_TASK_REGION;
+                                // 记成「当前分辨率」，避免下一次识别又把默认区域存回去。
+                                self.last_client_size = Some((width, height));
+                                self.persist();
+                                self.notice = Some(format!("已恢复 {key} 的默认识别区域"));
+                            }
+                        });
                     }
+                }
+            });
+        if now != fold_window {
+            self.set_sidebar_section_open("window", now);
+        }
+        let fold_trigger = self.sidebar_section_open("trigger");
+        let now =
+            theme::collapsible_section(ui, "sidebar_trigger", "识别模式", fold_trigger, |ui| {
+                let previous = self.config.trigger_mode.clone();
+                ui.horizontal(|ui| {
+                    ui.selectable_value(
+                        &mut self.config.trigger_mode,
+                        "auto".into(),
+                        "自动（按间隔）",
+                    );
+                    ui.selectable_value(
+                        &mut self.config.trigger_mode,
+                        "manual".into(),
+                        "手动（快捷键）",
+                    );
+                });
+                if previous != self.config.trigger_mode {
+                    self.invalidate_scan();
+                    self.sync_hotkey();
+                    self.persist();
+                }
+                if !self.manual_mode() {
                     ui.horizontal(|ui| {
                         ui.label("识别间隔");
                         if ui
@@ -2643,206 +2863,102 @@ impl MhxyApp {
                                     .range(1..=60)
                                     .suffix(" 秒"),
                             )
+                            .on_hover_text("自动模式下每隔多少秒识别一次")
                             .changed()
                         {
                             self.persist();
                         }
                     });
-                    let label = if self.show_region_window {
-                        "关闭识别区域"
-                    } else {
-                        "设置识别区域"
-                    };
-                    if ui
-                        .add_sized([ui.available_width(), 32.0], egui::Button::new(label))
-                        .clicked()
-                    {
-                        self.show_region_window = !self.show_region_window;
-                        if self.show_region_window {
-                            // 取点窗口优先放在主窗口右侧；右侧不够就放左侧，
-                            // 两边都放不下才贴屏幕右缘（此时靠置顶层级保证不被主窗口压住）。
-                            self.region_window_pos =
-                                Some(region_window_position(ui.ctx(), REGION_WINDOW_SIZE));
-                            self.applied_region_on_top = None;
-                            self.capture_preview_once();
-                        } else {
-                            self.region_window_pos = None;
-                            self.applied_region_on_top = None;
-                            self.release_preview();
-                        }
-                    }
-                    // 游戏窗口的分辨率是固定的，识别区域也固定：按分辨率记住一套区域，
-                    // 换分辨率时自动套用，只有需要微调时才进「设置识别区域」。
-                    if let Some(handle) = self.selected_handle {
-                        if let Some((width, height)) = capture::client_size(handle) {
-                            let key = format!("{width}x{height}");
-                            let saved = self.config.region_presets.contains_key(&key);
-                            ui.horizontal_wrapped(|ui| {
-                                ui.label(
-                                    egui::RichText::new(format!("当前分辨率 {key}"))
-                                        .small()
-                                        .color(theme::muted()),
-                                );
-                                ui.label(
-                                    egui::RichText::new(if saved {
-                                        "已记住该分辨率的区域"
-                                    } else {
-                                        "首次使用，调整后会自动记住"
-                                    })
-                                    .small()
-                                    .color(if saved { theme::jade() } else { theme::muted() }),
-                                );
-                                if saved && ui.small_button("忘记").clicked() {
-                                    self.config.region_presets.remove(&key);
-                                    self.config.task_region = crate::core::DEFAULT_TASK_REGION;
-                                    // 记成「当前分辨率」，避免下一次识别又把默认区域存回去。
-                                    self.last_client_size = Some((width, height));
-                                    self.persist();
-                                    self.notice = Some(format!("已恢复 {key} 的默认识别区域"));
-                                }
-                            });
-                        }
-                    }
-                });
-                if now != fold_window {
-                    self.set_sidebar_section_open("window", now);
                 }
-                let fold_trigger = self.sidebar_section_open("trigger");
-                let now = theme::collapsible_section(ui, "sidebar_trigger", "识别模式", fold_trigger, |ui| {
-                    let previous = self.config.trigger_mode.clone();
+                if self.manual_mode() {
                     ui.horizontal(|ui| {
-                        ui.selectable_value(
-                            &mut self.config.trigger_mode,
-                            "auto".into(),
-                            "自动（按间隔）",
+                        ui.label("快捷键");
+                        let response = ui.add(
+                            egui::TextEdit::singleline(&mut self.config.ocr_hotkey)
+                                .desired_width(96.0)
+                                .hint_text("F8"),
                         );
-                        ui.selectable_value(
-                            &mut self.config.trigger_mode,
-                            "manual".into(),
-                            "手动（快捷键）",
-                        );
+                        if response.lost_focus() {
+                            self.sync_hotkey();
+                            self.persist();
+                        }
+                        let record_label = if self.recording_hotkey {
+                            "按键…"
+                        } else {
+                            "录制"
+                        };
+                        if ui.button(record_label).clicked() {
+                            self.recording_hotkey = !self.recording_hotkey;
+                        }
                     });
-                    if previous != self.config.trigger_mode {
-                        self.invalidate_scan();
-                        self.sync_hotkey();
-                        self.persist();
-                    }
-                    if self.manual_mode() {
-                        ui.horizontal(|ui| {
-                            ui.label("快捷键");
-                            let response = ui.add(
-                                egui::TextEdit::singleline(&mut self.config.ocr_hotkey)
-                                    .desired_width(96.0)
-                                    .hint_text("F8"),
-                            );
-                            if response.lost_focus() {
-                                self.sync_hotkey();
-                                self.persist();
-                            }
-                            let record_label =
-                                if self.recording_hotkey { "按键…" } else { "录制" };
-                            if ui.button(record_label).clicked() {
-                                self.recording_hotkey = !self.recording_hotkey;
-                            }
-                        });
-                        match Hotkey::parse(&self.config.ocr_hotkey) {
-                            Ok(hotkey) => {
-                                let registered = self
-                                    .hotkey_listener
-                                    .as_ref()
-                                    .is_some_and(|listener| listener.is_alive());
-                                let status = if registered {
-                                    "全局快捷键已注册"
-                                } else if !self.running {
-                                    "开始监听后生效"
-                                } else if let Some(err) = &self.hotkey_error {
-                                    err.as_str()
-                                } else {
-                                    "正在注册…"
-                                };
-                                let color = if registered {
-                                    theme::muted()
-                                } else {
-                                    theme::gold()
-                                };
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "{} · {status}",
-                                        hotkey.display()
-                                    ))
+                    match Hotkey::parse(&self.config.ocr_hotkey) {
+                        Ok(hotkey) => {
+                            let registered = self
+                                .hotkey_listener
+                                .as_ref()
+                                .is_some_and(|listener| listener.is_alive());
+                            let status = if registered {
+                                "全局快捷键已注册"
+                            } else if !self.running {
+                                "开始监听后生效"
+                            } else if let Some(err) = &self.hotkey_error {
+                                err.as_str()
+                            } else {
+                                "正在注册…"
+                            };
+                            let color = if registered {
+                                theme::muted()
+                            } else {
+                                theme::gold()
+                            };
+                            ui.label(
+                                egui::RichText::new(format!("{} · {status}", hotkey.display()))
                                     .small()
                                     .color(color),
-                                );
-                            }
-                            Err(err) => {
-                                ui.colored_label(theme::gold(), format!("快捷键无效：{err}"));
-                            }
-                        }
-                        ui.horizontal(|ui| {
-                            if ui.button("立即识别一次").clicked() {
-                                self.manual_trigger();
-                            }
-                            ui.label(
-                                egui::RichText::new("手动模式下按键触发一次 OCR")
-                                    .small()
-                                    .weak(),
                             );
-                        });
-                    }
-                });
-                if now != fold_trigger {
-                    self.set_sidebar_section_open("trigger", now);
-                }
-                let fold_task = self.sidebar_section_open("task");
-                let now = theme::collapsible_section(ui, "sidebar_task", "任务显示", fold_task, |ui| {
-                    // 抓鬼 / 鬼王 按任务名解析；通用任务不看任务类型，两边互斥。
-                    if ui
-                        .checkbox(&mut self.config.zhuagui_enabled, "识别抓鬼任务")
-                        .changed()
-                    {
-                        if self.config.zhuagui_enabled {
-                            self.config.generic_enabled = false;
                         }
-                        self.invalidate_scan();
-                        self.persist();
+                        Err(err) => {
+                            ui.colored_label(theme::gold(), format!("快捷键无效：{err}"));
+                        }
                     }
-                    if self.config.zhuagui_enabled {
-                        ui.indent("high_chance", |ui| {
-                            if ui
-                                .checkbox(&mut self.config.high_chance, "显示高概率区域")
-                                .on_hover_text(
-                                    "按 175LG 捉鬼省眼规则，在抓鬼地图上叠加 50×50 的高概率格子",
-                                )
-                                .changed()
-                            {
-                                self.persist();
-                            }
-                        });
-                    }
-                    if ui
-                        .checkbox(&mut self.config.ghost_king_enabled, "同时识别鬼王任务")
-                        .changed()
-                    {
-                        self.invalidate_scan();
-                        self.persist();
-                    }
-                    if self.config.ghost_king_enabled {
-                        ui.indent("high_chance_king", |ui| {
-                            if ui
-                                .checkbox(
-                                    &mut self.config.ghost_king_high_chance,
-                                    "显示高概率区域",
-                                )
-                                .on_hover_text(
-                                    "按 175LG 捉鬼省眼规则，在鬼王地图上叠加 50×50 的高概率格子",
-                                )
-                                .changed()
-                            {
-                                self.persist();
-                            }
-                        });
-                    }
-                    if ui
+                    ui.horizontal(|ui| {
+                        if ui.button("立即识别一次").clicked() {
+                            self.manual_trigger();
+                        }
+                        ui.label(
+                            egui::RichText::new("手动模式下按键触发一次 OCR")
+                                .small()
+                                .weak(),
+                        );
+                    });
+                }
+            });
+        if now != fold_trigger {
+            self.set_sidebar_section_open("trigger", now);
+        }
+        let fold_task = self.sidebar_section_open("task");
+        let now = theme::collapsible_section(ui, "sidebar_task", "任务类型", fold_task, |ui| {
+            // 抓鬼 / 鬼王 按任务名解析；通用任务不看任务类型，两边互斥。
+            if ui
+                .checkbox(&mut self.config.zhuagui_enabled, "抓鬼任务")
+                .on_hover_text("识别任务栏里的抓鬼任务，并在地图上标出 NPC 坐标")
+                .changed()
+            {
+                if self.config.zhuagui_enabled {
+                    self.config.generic_enabled = false;
+                }
+                self.invalidate_scan();
+                self.persist();
+            }
+            if ui
+                .checkbox(&mut self.config.ghost_king_enabled, "鬼王任务")
+                .on_hover_text("同时识别鬼王任务，并单独显示一块地图面板")
+                .changed()
+            {
+                self.invalidate_scan();
+                self.persist();
+            }
+            if ui
                         .checkbox(&mut self.config.generic_enabled, "通用任务（只看地图名和坐标）")
                         .on_hover_text(
                             "不识别任务类型，只按地图名和坐标标注；坐标不一定在第一个截图区域里，勾选后会自动启用备用区域",
@@ -2863,48 +2979,33 @@ impl MhxyApp {
                         self.invalidate_scan();
                         self.persist();
                     }
-                    let previous = self.config.horizontal_layout;
-                    ui.horizontal(|ui| {
-                        ui.label("布局");
-                        ui.selectable_value(&mut self.config.horizontal_layout, false, "上下");
-                        ui.selectable_value(&mut self.config.horizontal_layout, true, "左右");
-                    });
-                    if previous != self.config.horizontal_layout {
-                        self.persist();
-                    }
-                });
-                if now != fold_task {
-                    self.set_sidebar_section_open("task", now);
-                }
-                let fold_meditation = self.sidebar_section_open("meditation");
-                let now = theme::collapsible_section(
-                    ui,
-                    "sidebar_meditation",
-                    "打坐计时",
-                    fold_meditation,
-                    |ui| self.meditation_controls(ui),
-                );
-                if now != fold_meditation {
-                    self.set_sidebar_section_open("meditation", now);
-                }
-                // 不常用的细调项收进这里，侧栏只留「打开就能用」的几项。
-                let fold_advanced = self.sidebar_section_open("advanced");
-                let now = theme::collapsible_section(
-                    ui,
-                    "sidebar_advanced",
-                    "高级设置",
-                    fold_advanced,
-                    |ui| self.advanced_controls(ui),
-                );
-                if now != fold_advanced {
-                    self.set_sidebar_section_open("advanced", now);
-                }
-                ui.add_space(4.0);
-            });
+        });
+        if now != fold_task {
+            self.set_sidebar_section_open("task", now);
+        }
+        ui.add_space(4.0);
     }
 
-    /// 高级设置：识别方式与预处理、合成旗、日志。
+    /// 高级设置窗口：识别方式、方案管理、显示与布局、合成旗，以及日志级别。
     fn advanced_controls(&mut self, ui: &mut egui::Ui) {
+        let mode = if self.config.ocr_mode == "remote" {
+            "远端 PP-OCR"
+        } else {
+            "本地 PP-OCRv5"
+        };
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                egui::RichText::new(format!("当前识别：{mode}"))
+                    .small()
+                    .color(theme::muted()),
+            );
+            ui.label(
+                egui::RichText::new("· 识别方式、方案、显示与合成旗")
+                    .small()
+                    .weak(),
+            );
+        });
+        ui.add_space(2.0);
         let fold_ocr = self.sidebar_section_open("ocr");
         let now = theme::collapsible_section(ui, "sidebar_ocr", "识别方式", fold_ocr, |ui| {
             let previous = self.config.ocr_mode.clone();
@@ -2989,31 +3090,67 @@ impl MhxyApp {
                         .weak(),
                 );
             }
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("预处理").small().weak());
-                let main_pipeline = self.preprocess_pipeline_for(false);
-                let extra_pipeline = self.preprocess_pipeline_for(true);
-                let summary = if self.config.extra_region_enabled {
-                    format!(
-                        "主 {} / 备 {}",
-                        main_pipeline.summary(),
-                        extra_pipeline.summary()
-                    )
-                } else {
-                    main_pipeline.summary()
-                };
-                let all_off = main_pipeline.is_off()
-                    && (!self.config.extra_region_enabled || extra_pipeline.is_off());
-                ui.label(egui::RichText::new(summary).small().color(if all_off {
-                    theme::muted()
-                } else {
-                    theme::jade()
-                }));
-            });
         });
         if now != fold_ocr {
             self.set_sidebar_section_open("ocr", now);
+        }
+        let fold_profiles = self.sidebar_section_open("profiles");
+        let now = theme::collapsible_section(
+            ui,
+            "sidebar_profiles",
+            "方案管理",
+            fold_profiles,
+            |ui| {
+                self.profile_ui(ui);
+                ui.label(
+                    egui::RichText::new("方案保存图色门控和预处理设置，不包含识别区域。")
+                        .small()
+                        .weak(),
+                );
+            },
+        );
+        if now != fold_profiles {
+            self.set_sidebar_section_open("profiles", now);
+        }
+        let fold_display = self.sidebar_section_open("display");
+        let now = theme::collapsible_section(
+            ui,
+            "sidebar_display",
+            "显示与布局",
+            fold_display,
+            |ui| {
+                let mut high_chance_changed = false;
+                if self.config.zhuagui_enabled {
+                    high_chance_changed |= ui
+                        .checkbox(&mut self.config.high_chance, "抓鬼：显示高概率区域")
+                        .on_hover_text("按 175LG 捉鬼省眼规则，在抓鬼地图上叠加 50×50 的高概率格子")
+                        .changed();
+                }
+                if self.config.ghost_king_enabled {
+                    high_chance_changed |= ui
+                        .checkbox(
+                            &mut self.config.ghost_king_high_chance,
+                            "鬼王：显示高概率区域",
+                        )
+                        .on_hover_text("按 175LG 捉鬼省眼规则，在鬼王地图上叠加 50×50 的高概率格子")
+                        .changed();
+                }
+                if high_chance_changed {
+                    self.persist();
+                }
+                let previous = self.config.horizontal_layout;
+                ui.horizontal(|ui| {
+                    ui.label("布局");
+                    ui.selectable_value(&mut self.config.horizontal_layout, false, "上下");
+                    ui.selectable_value(&mut self.config.horizontal_layout, true, "左右");
+                });
+                if previous != self.config.horizontal_layout {
+                    self.persist();
+                }
+            },
+        );
+        if now != fold_display {
+            self.set_sidebar_section_open("display", now);
         }
         let fold_flight = self.sidebar_section_open("flight_flags");
         let now = theme::collapsible_section(
@@ -3026,21 +3163,31 @@ impl MhxyApp {
         if now != fold_flight {
             self.set_sidebar_section_open("flight_flags", now);
         }
-        let fold_log = self.sidebar_section_open("log");
-        let now =
-            theme::collapsible_section(ui, "sidebar_log", "日志", fold_log, |ui| self.log_ui(ui));
-        if now != fold_log {
-            self.set_sidebar_section_open("log", now);
-        }
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label("日志级别");
+            let previous = self.config.log_level.clone();
+            ui.selectable_value(&mut self.config.log_level, "simple".into(), "简单");
+            ui.selectable_value(&mut self.config.log_level, "detailed".into(), "详细");
+            if previous != self.config.log_level {
+                self.persist();
+            }
+        });
+        ui.label(
+            egui::RichText::new(format!("日志写入：{}", self.log_path.display()))
+                .small()
+                .weak(),
+        );
     }
 
     fn help_contents(&self, ui: &mut egui::Ui) {
         ui.label(egui::RichText::new("基本流程").strong());
         for line in [
             "1. 打开游戏，程序会自动扫描并选中游戏窗口（也可用下拉框选择、点「刷新」）。",
-            "2. 顶部「开始识别」/「开始监听」启动，「暂停」停止。",
-            "3. 「识别方式」选择本地 PP-OCRv5 或远端 PP-OCR；远端可点「测试连接」。",
-            "4. 「设置识别区域」打开独立窗口，可调整任务栏截图区域并点击取点配置图色门控。",
+            "2. 在侧栏底部点「开始识别」/「开始监听」启动，「暂停」停止；按钮始终固定可见。",
+            "3. 在「任务类型」里勾选要显示的任务，侧栏会自动出现对应地图面板。",
+            "4. 基础区「设置识别区域」打开独立窗口，可调整任务栏截图区域并点击取点配置图色门控。",
+            "5. 识别方式、方案、显示与布局、合成旗在顶栏「高级设置」里；打坐计时在顶栏「打坐」里。",
         ] {
             ui.label(egui::RichText::new(line).small());
         }
@@ -3074,8 +3221,10 @@ impl MhxyApp {
         ui.add_space(4.0);
         ui.label(egui::RichText::new("其它").strong());
         for line in [
-            "任务显示：勾选抓鬼 / 鬼王 / 通用任务；高概率区域可分别开关。",
-            "日志：简单只记启动 / 任务开始 / 停止，详细额外记录 OCR 过程与错误。",
+            "任务类型：勾选抓鬼 / 鬼王 / 通用任务；高概率区域开关在「高级设置 → 显示与布局」。",
+            "高级设置（顶栏）：识别方式、方案管理、显示与布局、合成旗标注。",
+            "打坐计时（顶栏）：独立设置窗口，启用后显示透明悬浮窗并注册快捷键。",
+            "日志：直接写入配置目录下的 logs/rust-mhxy.log，不在界面显示；详细级别记录 OCR 过程。",
             "设置会自动保存到程序目录的 config.json。",
         ] {
             ui.label(egui::RichText::new(line).small());
@@ -3087,59 +3236,6 @@ impl MhxyApp {
             ui.hyperlink_to("GitHub", crate::APP_REPO_URL)
                 .on_hover_text(crate::APP_REPO_URL);
         });
-    }
-
-    fn log_ui(&mut self, ui: &mut egui::Ui) {
-        // 日志高度跟随窗口高度，窗口变高时能显示更多记录。
-        let log_height = log_panel_height(ui.ctx().content_rect().height());
-        ui.horizontal(|ui| {
-            let mut level = self.config.log_level.clone();
-            let mut changed = false;
-            changed |= ui
-                .radio_value(&mut level, "simple".to_string(), "简单")
-                .changed();
-            changed |= ui
-                .radio_value(&mut level, "detailed".to_string(), "详细")
-                .changed();
-            if changed {
-                self.config.log_level = level;
-                self.persist();
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("清空").clicked() {
-                    self.logs.clear();
-                }
-            });
-        });
-        egui::Frame::new()
-            .fill(theme::inset())
-            .corner_radius(8)
-            .inner_margin(10)
-            .show(ui, |ui| {
-                if self.logs.is_empty() {
-                    ui.label(egui::RichText::new("暂无日志").small().weak());
-                } else {
-                    egui::ScrollArea::vertical()
-                        .id_salt("log_scroll")
-                        .stick_to_bottom(true)
-                        .max_height(log_height)
-                        .auto_shrink([false, true])
-                        .show_rows(ui, 15.0, self.logs.len(), |ui, rows| {
-                            for index in rows {
-                                ui.add(
-                                    egui::Label::new(
-                                        egui::RichText::new(&self.logs[index])
-                                            .monospace()
-                                            .size(11.0)
-                                            .color(theme::muted()),
-                                    )
-                                    .truncate(),
-                                )
-                                .on_hover_text(&self.logs[index]);
-                            }
-                        });
-                }
-            });
     }
 
     /// 画客户区预览：红框主区域、蓝框备用区域、图色点位；点击时返回 (x, y, 颜色)。
@@ -3970,6 +4066,42 @@ impl MhxyApp {
             }
             ui.close();
         }
+        if ui
+            .button(if self.show_advanced_window {
+                "关闭高级设置"
+            } else {
+                "高级设置"
+            })
+            .clicked()
+        {
+            self.show_advanced_window = !self.show_advanced_window;
+            if self.show_advanced_window {
+                self.advanced_window_pos =
+                    Some(centered_window_position(ctx, ADVANCED_WINDOW_SIZE));
+                self.applied_advanced_on_top = None;
+            } else {
+                self.advanced_window_pos = None;
+            }
+            ui.close();
+        }
+        if ui
+            .button(if self.show_meditation_window {
+                "关闭打坐计时"
+            } else {
+                "打坐计时"
+            })
+            .clicked()
+        {
+            self.show_meditation_window = !self.show_meditation_window;
+            if self.show_meditation_window {
+                self.meditation_window_pos =
+                    Some(centered_window_position(ctx, MEDITATION_WINDOW_SIZE));
+                self.applied_meditation_window_on_top = None;
+            } else {
+                self.meditation_window_pos = None;
+            }
+            ui.close();
+        }
         if ui.button("说明").clicked() {
             let opening = !self.show_help;
             self.show_help = opening;
@@ -4219,6 +4351,38 @@ impl eframe::App for MhxyApp {
                                         self.header_overflow_menu(ui, &ctx)
                                     });
                                 });
+                            }
+                            if !narrow
+                                && ui
+                                    .add(header_button("打坐", self.show_meditation_window))
+                                    .on_hover_text("打坐倒计时设置")
+                                    .clicked()
+                            {
+                                self.show_meditation_window = !self.show_meditation_window;
+                                if self.show_meditation_window {
+                                    self.meditation_window_pos = Some(centered_window_position(
+                                        &ctx,
+                                        MEDITATION_WINDOW_SIZE,
+                                    ));
+                                    self.applied_meditation_window_on_top = None;
+                                } else {
+                                    self.meditation_window_pos = None;
+                                }
+                            }
+                            if !narrow
+                                && ui
+                                    .add(header_button("高级设置", self.show_advanced_window))
+                                    .on_hover_text("识别方式、方案、显示与合成旗")
+                                    .clicked()
+                            {
+                                self.show_advanced_window = !self.show_advanced_window;
+                                if self.show_advanced_window {
+                                    self.advanced_window_pos =
+                                        Some(centered_window_position(&ctx, ADVANCED_WINDOW_SIZE));
+                                    self.applied_advanced_on_top = None;
+                                } else {
+                                    self.advanced_window_pos = None;
+                                }
                             }
                             if !narrow
                                 && ui
@@ -4612,6 +4776,98 @@ impl eframe::App for MhxyApp {
                             .show(ui, |ui| {
                                 ui.set_min_size(ui.available_size());
                                 egui::ScrollArea::vertical().show(ui, |ui| self.help_contents(ui));
+                            });
+                    }
+                },
+            );
+        }
+        if self.show_advanced_window {
+            let on_top = self.config.on_top;
+            let mut builder = egui::ViewportBuilder::default()
+                .with_title("高级设置")
+                .with_inner_size(ADVANCED_WINDOW_SIZE)
+                .with_min_inner_size([420.0, 400.0]);
+            if on_top {
+                builder = builder.with_always_on_top();
+            }
+            if let Some(position) = self.advanced_window_pos {
+                builder = builder.with_position(position);
+            }
+            ctx.show_viewport_immediate(
+                egui::ViewportId::from_hash_of("advanced_window"),
+                builder,
+                |ui, _class| {
+                    if ui.ctx().viewport_id() == egui::ViewportId::ROOT {
+                        egui::Window::new("高级设置")
+                            .default_size(ADVANCED_WINDOW_SIZE)
+                            .show(ui.ctx(), |ui| self.advanced_controls(ui));
+                    } else {
+                        if ui.ctx().input(|input| input.viewport().close_requested()) {
+                            self.show_advanced_window = false;
+                        }
+                        if self.applied_advanced_on_top != Some(on_top) {
+                            let level = if on_top {
+                                egui::WindowLevel::AlwaysOnTop
+                            } else {
+                                egui::WindowLevel::Normal
+                            };
+                            ui.ctx()
+                                .send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
+                            self.applied_advanced_on_top = Some(on_top);
+                        }
+                        egui::Frame::central_panel(ui.style())
+                            .inner_margin(16)
+                            .show(ui, |ui| {
+                                ui.set_min_size(ui.available_size());
+                                egui::ScrollArea::vertical()
+                                    .id_salt("advanced_scroll")
+                                    .show(ui, |ui| self.advanced_controls(ui));
+                            });
+                    }
+                },
+            );
+        }
+        if self.show_meditation_window {
+            let on_top = self.config.on_top;
+            let mut builder = egui::ViewportBuilder::default()
+                .with_title("打坐计时")
+                .with_inner_size(MEDITATION_WINDOW_SIZE)
+                .with_min_inner_size([360.0, 360.0]);
+            if on_top {
+                builder = builder.with_always_on_top();
+            }
+            if let Some(position) = self.meditation_window_pos {
+                builder = builder.with_position(position);
+            }
+            ctx.show_viewport_immediate(
+                egui::ViewportId::from_hash_of("meditation_window"),
+                builder,
+                |ui, _class| {
+                    if ui.ctx().viewport_id() == egui::ViewportId::ROOT {
+                        egui::Window::new("打坐计时")
+                            .default_size(MEDITATION_WINDOW_SIZE)
+                            .show(ui.ctx(), |ui| self.meditation_controls(ui));
+                    } else {
+                        if ui.ctx().input(|input| input.viewport().close_requested()) {
+                            self.show_meditation_window = false;
+                        }
+                        if self.applied_meditation_window_on_top != Some(on_top) {
+                            let level = if on_top {
+                                egui::WindowLevel::AlwaysOnTop
+                            } else {
+                                egui::WindowLevel::Normal
+                            };
+                            ui.ctx()
+                                .send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
+                            self.applied_meditation_window_on_top = Some(on_top);
+                        }
+                        egui::Frame::central_panel(ui.style())
+                            .inner_margin(16)
+                            .show(ui, |ui| {
+                                ui.set_min_size(ui.available_size());
+                                egui::ScrollArea::vertical()
+                                    .id_salt("meditation_scroll")
+                                    .show(ui, |ui| self.meditation_controls(ui));
                             });
                     }
                 },
@@ -5064,11 +5320,6 @@ fn apply_window_level(ctx: &egui::Context, on: bool) {
     }));
 }
 
-/// 日志框高度随窗口高度线性变化，并限制在最小值和最大值之间。
-fn log_panel_height(content_height: f32) -> f32 {
-    (content_height * LOG_PANEL_HEIGHT_RATIO).clamp(LOG_PANEL_MIN_HEIGHT, 620.0)
-}
-
 fn to_color_image(image: &image::RgbImage) -> egui::ColorImage {
     egui::ColorImage::from_rgb(
         [image.width() as usize, image.height() as usize],
@@ -5359,21 +5610,29 @@ mod tests {
     #[test]
     fn meditation_panel_shows_countdown_and_controls() {
         let mut app = app();
-        // 只展开「打坐计时」，避免侧栏滚动区域把后面的分组裁掉。
-        app.config.sidebar_folded = "window,trigger,ocr,task,log".to_string();
         let ctx = app.ctx.clone();
         let mut frame = eframe::Frame::_new_kittest();
-        let input = egui::RawInput {
+        let input = || egui::RawInput {
             screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1120.0, 900.0))),
             ..Default::default()
         };
-        let mut output = ctx.run_ui(input, |ui| app.ui(ui, &mut frame));
+        // 侧栏不再有打坐分组，顶栏提供「打坐」按钮。
+        let mut output = ctx.run_ui(input(), |ui| app.ui(ui, &mut frame));
         let texts = collect_texts(&output.shapes);
         output.textures_delta.clear();
         assert!(
-            texts.iter().any(|text| text == "打坐计时"),
-            "侧栏应有打坐计时分组：{texts:?}"
+            texts.iter().any(|text| text == "打坐"),
+            "顶栏应有打坐按钮：{texts:?}"
         );
+        assert!(
+            !texts.iter().any(|text| text == "启用打坐计时"),
+            "打坐设置不应再出现在侧栏：{texts:?}"
+        );
+
+        // 独立窗口里的设置项。
+        let mut output = ctx.run_ui(input(), |ui| app.meditation_controls(ui));
+        let texts = collect_texts(&output.shapes);
+        output.textures_delta.clear();
         assert!(
             texts.iter().any(|text| text == "启用打坐计时"),
             "应有功能的启用开关：{texts:?}"
@@ -5389,6 +5648,206 @@ mod tests {
     }
 
     #[test]
+    fn basic_sidebar_keeps_primary_path_and_hides_advanced_details() {
+        let mut app = app();
+        let ctx = app.ctx.clone();
+        let mut frame = eframe::Frame::_new_kittest();
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1120.0, 900.0))),
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| app.ui(ui, &mut frame));
+        let texts = collect_texts(&output.shapes);
+        let positions = text_positions(&output.shapes);
+        output.textures_delta.clear();
+        for expected in [
+            "游戏窗口",
+            "识别模式",
+            "任务类型",
+            "设置识别区域",
+            "开始识别",
+            "高级设置",
+        ] {
+            assert!(
+                texts.iter().any(|text| text == expected),
+                "基础侧栏缺少「{expected}」：{texts:?}"
+            );
+        }
+        // 高级设置默认收起，低频项不应出现在首屏。
+        for hidden in [
+            "远端 PP-OCR",
+            "服务地址",
+            "访问令牌（可选）",
+            "识别方案",
+            "打坐计时",
+            "合成旗标注",
+            "日志",
+        ] {
+            assert!(
+                !texts.iter().any(|text| text == hidden),
+                "高级设置收起时不应显示「{hidden}」：{texts:?}"
+            );
+        }
+        // 底部固定区始终给出当前窗口、识别方式和主操作。
+        assert!(texts.iter().any(|text| text == "本地 PP-OCRv5"));
+        assert!(texts.iter().any(|text| text.contains("每 5 秒自动识别")));
+
+        let find = |needle: &str| {
+            positions
+                .iter()
+                .find(|(text, _)| text == needle)
+                .map(|(_, pos)| *pos)
+                .unwrap_or_else(|| panic!("侧栏缺少「{needle}」：{positions:?}"))
+        };
+        let window = find("游戏窗口");
+        let task = find("任务类型");
+        let start = positions
+            .iter()
+            .filter(|(text, _)| text == "开始识别")
+            .map(|(_, pos)| *pos)
+            .find(|pos| pos.x < 420.0)
+            .expect("侧栏底部应有开始识别按钮");
+        assert!(
+            window.y < task.y && task.y < start.y,
+            "基础路径应为 游戏窗口 → 任务类型 → 开始识别：window={window:?} task={task:?} start={start:?}"
+        );
+    }
+
+    #[test]
+    fn interval_is_only_shown_in_auto_mode() {
+        let mut app = app();
+        let ctx = app.ctx.clone();
+        let input = || egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(420.0, 900.0))),
+            ..Default::default()
+        };
+
+        app.config.trigger_mode = "auto".into();
+        let mut output = ctx.run_ui(input(), |ui| app.basic_controls(ui));
+        let texts = collect_texts(&output.shapes);
+        output.textures_delta.clear();
+        assert!(
+            texts.iter().any(|text| text == "识别间隔"),
+            "自动模式应显示识别间隔：{texts:?}"
+        );
+        assert!(!texts.iter().any(|text| text == "快捷键"));
+
+        app.config.trigger_mode = "manual".into();
+        let mut output = ctx.run_ui(input(), |ui| app.basic_controls(ui));
+        let texts = collect_texts(&output.shapes);
+        output.textures_delta.clear();
+        assert!(
+            !texts.iter().any(|text| text == "识别间隔"),
+            "手动模式不应占位显示识别间隔：{texts:?}"
+        );
+        assert!(
+            texts.iter().any(|text| text == "快捷键"),
+            "手动模式应显示快捷键设置：{texts:?}"
+        );
+        assert!(texts.iter().any(|text| text == "立即识别一次"));
+    }
+
+    #[test]
+    fn sidebar_action_follows_trigger_mode_and_running() {
+        let mut app = app();
+        let ctx = app.ctx.clone();
+        let input = || egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(320.0, 240.0))),
+            ..Default::default()
+        };
+
+        app.config.trigger_mode = "manual".into();
+        app.running = false;
+        let mut output = ctx.run_ui(input(), |ui| app.sidebar_action(ui));
+        let texts = collect_texts(&output.shapes);
+        output.textures_delta.clear();
+        assert!(texts.iter().any(|text| text == "开始监听"));
+        assert!(texts.iter().any(|text| text.contains("手动 · F8")));
+
+        app.running = true;
+        let mut output = ctx.run_ui(input(), |ui| app.sidebar_action(ui));
+        let texts = collect_texts(&output.shapes);
+        output.textures_delta.clear();
+        assert!(texts.iter().any(|text| text == "暂停监听"));
+
+        app.config.trigger_mode = "auto".into();
+        app.config.interval_seconds = 5;
+        app.running = false;
+        let mut output = ctx.run_ui(input(), |ui| app.sidebar_action(ui));
+        let texts = collect_texts(&output.shapes);
+        output.textures_delta.clear();
+        assert!(texts.iter().any(|text| text == "开始识别"));
+        assert!(texts
+            .iter()
+            .any(|text| text == "本地 PP-OCRv5 · 每 5 秒自动识别"));
+    }
+
+    #[test]
+    fn advanced_settings_hold_low_frequency_controls() {
+        let mut app = app();
+        app.config.ocr_mode = "remote".into();
+        app.config.api_url = "http://127.0.0.1:8008".into();
+        app.config.color_gate_enabled = true;
+        app.config.preprocess_mode = "binary".into();
+        let ctx = app.ctx.clone();
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 2600.0))),
+                ..Default::default()
+            },
+            |ui| app.advanced_controls(ui),
+        );
+        let texts = collect_texts(&output.shapes);
+        output.textures_delta.clear();
+        for expected in [
+            "识别方式",
+            "本地 PP-OCR",
+            "远端 PP-OCR",
+            "服务地址",
+            "访问令牌（可选）",
+            "测试连接",
+            "方案管理",
+            "识别方案",
+            "显示与布局",
+            "抓鬼：显示高概率区域",
+            "鬼王：显示高概率区域",
+            "合成旗标注",
+            "打开合成旗编辑器",
+        ] {
+            assert!(
+                texts.iter().any(|text| text.contains(expected)),
+                "高级设置缺少「{expected}」：{texts:?}"
+            );
+        }
+        // 识别区域/门控在基础区「设置识别区域」里；打坐有独立窗口，日志不再展示内容。
+        for removed in [
+            "识别区域、门控与预处理",
+            "打开识别区域设置",
+            "启用打坐计时",
+            "暂无日志",
+        ] {
+            assert!(
+                !texts.iter().any(|text| text.contains(removed)),
+                "高级设置不应再包含「{removed}」：{texts:?}"
+            );
+        }
+
+        // 切回本地后不再显示远端地址输入。
+        app.config.ocr_mode = "local".into();
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 900.0))),
+                ..Default::default()
+            },
+            |ui| app.advanced_controls(ui),
+        );
+        let texts = collect_texts(&output.shapes);
+        output.textures_delta.clear();
+        assert!(!texts.iter().any(|text| text == "服务地址"));
+        assert!(texts.iter().any(|text| text.contains("首次识别时加载模型")));
+    }
+
+    #[test]
     fn task_panel_has_no_high_chance_checkbox() {
         let mut app = app();
         app.config.high_chance = true;
@@ -5396,21 +5855,25 @@ mod tests {
         let ctx = app.ctx.clone();
         let mut frame = eframe::Frame::_new_kittest();
         let input = egui::RawInput {
-            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1120.0, 800.0))),
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1120.0, 900.0))),
             ..Default::default()
         };
-        let mut output = ctx.run_ui(input, |ui| app.ui(ui, &mut frame));
+        let mut output = ctx.run_ui(input.clone(), |ui| app.ui(ui, &mut frame));
         let texts = collect_texts(&output.shapes);
         assert!(
             !texts.iter().any(|text| text == "高概率区域"),
             "地图上方不应再有高概率勾选框：{texts:?}"
         );
-        // 侧栏「任务显示」里的开关还在，只是换成了完整文案。
+        output.textures_delta.clear();
+
+        // 高概率开关在顶栏「高级设置 → 显示与布局」里。
+        let mut output = ctx.run_ui(input, |ui| app.advanced_controls(ui));
+        let texts = collect_texts(&output.shapes);
+        output.textures_delta.clear();
         assert!(
             texts.iter().any(|text| text.contains("显示高概率区域")),
-            "侧栏仍应保留高概率开关：{texts:?}"
+            "高级设置里仍应保留高概率开关：{texts:?}"
         );
-        output.textures_delta.clear();
     }
 
     #[test]
@@ -5570,6 +6033,10 @@ mod tests {
     #[test]
     fn remote_test_feedback_is_available_with_simple_logging() {
         let mut app = app();
+        app.config.log_level = "detailed".into();
+        app.log_path =
+            std::env::temp_dir().join(format!("rust-mhxy-log-test-{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&app.log_path);
         app.testing_remote = true;
         app.sender
             .send(OcrEvent::Test {
@@ -5579,7 +6046,9 @@ mod tests {
         app.poll_events();
         assert!(!app.testing_remote);
         assert_eq!(app.remote_feedback, Some(Err("连接超时".into())));
-        assert_eq!(app.logs.len(), 1);
+        let text = std::fs::read_to_string(&app.log_path).unwrap_or_default();
+        assert!(text.contains("连接超时"), "日志应直接写入磁盘：{text:?}");
+        let _ = std::fs::remove_file(&app.log_path);
     }
 
     #[test]
@@ -6039,9 +6508,17 @@ mod tests {
     #[test]
     fn sidebar_sections_can_collapse() {
         let mut app = app();
-        app.config.sidebar_folded = "window,trigger,ocr,task,log".into();
+        app.config.sidebar_folded =
+            "window,trigger,ocr,task,log,advanced,region,profiles,display,meditation,flight_flags"
+                .into();
         assert!(!app.sidebar_section_open("window"));
         assert!(!app.sidebar_section_open("log"));
+        assert!(!app.sidebar_section_open("advanced"));
+        assert!(!app.sidebar_section_open("region"));
+        assert!(!app.sidebar_section_open("profiles"));
+        assert!(!app.sidebar_section_open("display"));
+        assert!(!app.sidebar_section_open("meditation"));
+        assert!(!app.sidebar_section_open("flight_flags"));
         assert!(app.sidebar_section_open("unknown"));
         app.set_sidebar_section_open("window", true);
         assert!(app.sidebar_section_open("window"));
@@ -6061,13 +6538,6 @@ mod tests {
         );
         assert!(!output.shapes.is_empty());
         output.textures_delta.clear();
-    }
-
-    #[test]
-    fn log_panel_height_grows_with_window() {
-        assert_eq!(log_panel_height(200.0), LOG_PANEL_MIN_HEIGHT);
-        assert!(log_panel_height(900.0) > log_panel_height(700.0));
-        assert_eq!(log_panel_height(5000.0), 620.0);
     }
 
     #[test]
