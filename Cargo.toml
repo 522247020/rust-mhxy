@@ -1,6 +1,6 @@
 [package]
 name = "rust-mhxy"
-version = "0.2.10"
+version = "0.2.11"
 edition = "2021"
 description = "梦幻西游抓鬼/鬼王任务坐标辅助（Rust + egui）"
 license = "MIT"

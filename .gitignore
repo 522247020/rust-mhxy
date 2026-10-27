@@ -7,3 +7,4 @@
 /.ocr-models
 __pycache__/
 /.ci-cache
+/logs
