@@ -213,7 +213,7 @@ jobs:
           #   glutin    -> egl / gl（OpenGL）
           #   winit     -> wayland / xkbcommon / x11（窗口）
           # Windows 打包走 x86_64-pc-windows-msvc target，不需要这些库。
-          packages="pkg-config libpipewire-0.3-dev libegl1-mesa-dev libgl1-mesa-dev libgbm-dev libdrm-dev libxkbcommon-dev libwayland-dev libx11-dev libxcb1-dev"
+          packages="pkg-config libpipewire-0.3-dev libegl1-mesa-dev libgl1-mesa-dev libgbm-dev libdrm-dev libxkbcommon-dev libwayland-dev libx11-dev libxcb1-dev fonts-wqy-microhei"
           if ! pkg-config --exists libpipewire-0.3 egl gbm 2>/dev/null; then
             echo "安装 Linux 构建依赖"
             if command -v sudo >/dev/null 2>&1; then
@@ -223,6 +223,7 @@ jobs:
             fi
           fi
           pkg-config --modversion libpipewire-0.3 egl gbm
+          echo "中文字体：$(fc-match -f '%{file}' 'WenQuanYi Micro Hei' 2>/dev/null || echo 未找到)"
 
       - name: Run tests
         run: |

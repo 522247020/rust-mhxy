@@ -126,9 +126,18 @@ fn load_font(path: &std::path::Path) -> Option<&'static [u8]> {
     Some(Box::leak(bytes.into_boxed_slice()))
 }
 
+/// 系统里是否找到了可用的中文字体。
+static CJK_FONT_AVAILABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// 系统里是否找到了可用的粗体中文字体。
 static BOLD_FONT_AVAILABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// 界面字体是否加载到了中文；没有时界面中文会显示成方块。
+pub fn has_cjk_font() -> bool {
+    CJK_FONT_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// 悬浮窗等地方用真实粗体；没有粗体字体时退回叠加绘制。
 pub fn has_bold_font() -> bool {
@@ -158,6 +167,8 @@ fn install_fonts(ctx: &egui::Context) {
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/wenquanyi/wqy-microhei/wqy-microhei.ttc",
         "/usr/share/fonts/wenquanyi/wqy-zenhei/wqy-zenhei.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
         // macOS
         "/System/Library/Fonts/PingFang.ttc",
         "/System/Library/Fonts/STHeiti Medium.ttc",
@@ -169,6 +180,7 @@ fn install_fonts(ctx: &egui::Context) {
         eprintln!("未找到可用的中文字体，界面中文可能显示为方块");
         return;
     };
+    CJK_FONT_AVAILABLE.store(true, std::sync::atomic::Ordering::Relaxed);
     let mut fonts = egui::FontDefinitions::default();
     // epaint 会为 FontData 的字体数据再准备一份 Blob；用 'static 切片可以避免复制。
     fonts.font_data.insert(
@@ -261,6 +273,10 @@ mod tests {
     fn bundled_font_covers_ui_and_map_characters() {
         let ctx = egui::Context::default();
         install_fonts(&ctx);
+        if !has_cjk_font() {
+            eprintln!("系统没有中文字体，跳过字形检查");
+            return;
+        }
         let sample = "梦幻西游任务坐标辅助抓鬼鬼王长寿村天宫普陀山五庄观附近等待识别";
         let font_id = egui::FontId::proportional(14.0);
         // 字体在第一次渲染帧后可用。
