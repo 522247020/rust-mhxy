@@ -179,6 +179,15 @@ impl MhxyApp {
                         self.meditation_shadow_attempts = 30;
                     }
                 }
+                // Win+D（显示桌面）会把无边框悬浮窗一起最小化。如果不主动还原，
+                // 悬浮窗就会消失，必须先点回主窗口它才会跟着回来。
+                // eframe 在窗口不可见时仍会按固定间隔驱动 UI，所以这里能收到状态并自行恢复。
+                // 只在「可见 → 最小化」边沿发一次，避免最小化期间每帧重复下发命令。
+                let minimized = ctx.input(|input| input.viewport().minimized == Some(true));
+                if minimized && !self.meditation_overlay_minimized {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                }
+                self.meditation_overlay_minimized = minimized;
                 if ctx.input(|input| input.viewport().close_requested()) {
                     self.config.meditation_enabled = false;
                     self.persist();

@@ -235,6 +235,8 @@ pub struct MhxyApp {
     last_client_size: Option<(u32, u32)>,
     /// 悬浮窗去阴影的尝试次数；窗口重建后归零重试。
     meditation_shadow_attempts: u8,
+    /// 悬浮窗上一帧是否处于最小化；用于只在「可见→最小化」边沿发一次还原命令。
+    meditation_overlay_minimized: bool,
     /// 正在录制打坐计时的全局快捷键。
     meditation_recording_hotkey: bool,
     /// 合成旗点位单独保存在用户本地目录，不进入主配置和更新包。
@@ -433,6 +435,7 @@ impl MhxyApp {
             meditation_pending_size: None,
             last_client_size: None,
             meditation_shadow_attempts: 0,
+            meditation_overlay_minimized: false,
             meditation_recording_hotkey: false,
             flight_flags,
             flight_flags_path,
