@@ -626,7 +626,14 @@ fn narrow_header_moves_secondary_actions_into_more_menu() {
         texts.iter().any(|text| text == "开始识别"),
         "窄窗口仍应保留主操作：{texts:?}"
     );
-    for hidden in ["检查更新", "说明", "界面主题", "置顶", "精简界面"] {
+    for hidden in [
+        "检查更新",
+        "说明",
+        "界面主题",
+        "置顶",
+        "地图浮窗",
+        "精简界面",
+    ] {
         assert!(
             !texts.iter().any(|text| text == hidden),
             "窄窗口不应在顶栏直接显示 {hidden}：{texts:?}"
@@ -644,6 +651,111 @@ fn entering_compact_mode_shows_exit_hint() {
     assert!(
         app.compact_hint_until.is_some(),
         "进入精简模式应显示按 Esc 退出的提示"
+    );
+}
+
+#[test]
+fn map_window_mode_replaces_the_main_map_with_a_placeholder() {
+    let mut app = app();
+    let ctx = app.ctx.clone();
+    let mut frame = eframe::Frame::_new_kittest();
+    assert!(!app.config.map_window_enabled, "地图浮窗默认关闭");
+
+    app.set_map_window(true, &ctx);
+    assert!(app.config.map_window_enabled);
+    let position = app
+        .config
+        .map_window_position
+        .expect("第一次打开时应给出默认位置");
+    assert!(position.0 >= 0.0 && position.1 >= 0.0);
+
+    let mut output = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1120.0, 800.0))),
+            ..Default::default()
+        },
+        |ui| app.ui(ui, &mut frame),
+    );
+    let texts = collect_texts(&output.shapes);
+    assert!(
+        texts.iter().any(|text| text == "地图已在独立浮窗中显示"),
+        "开启浮窗后主窗口应显示占位说明：{texts:?}"
+    );
+    assert!(
+        texts.iter().any(|text| text == "关闭地图浮窗"),
+        "占位区应提供关闭入口：{texts:?}"
+    );
+    output.textures_delta.clear();
+
+    app.set_map_window(false, &ctx);
+    assert!(!app.config.map_window_enabled);
+    assert_eq!(
+        app.config.map_window_position,
+        Some(position),
+        "关闭后应保留用户上次的位置"
+    );
+}
+
+#[test]
+fn map_window_resize_hit_test_prefers_corners_then_edges() {
+    use egui::ResizeDirection;
+    let rect = Rect::from_min_size(pos2(10.0, 20.0), vec2(400.0, 300.0));
+    let border = 6.0;
+    assert_eq!(
+        map_window::resize_direction(rect, rect.center(), border),
+        None,
+        "窗口中间拖动是移动，不是缩放"
+    );
+    assert_eq!(
+        map_window::resize_direction(rect, pos2(rect.left() + 2.0, rect.center().y), border),
+        Some(ResizeDirection::West)
+    );
+    assert_eq!(
+        map_window::resize_direction(rect, pos2(rect.right() - 2.0, rect.center().y), border),
+        Some(ResizeDirection::East)
+    );
+    assert_eq!(
+        map_window::resize_direction(rect, pos2(rect.center().x, rect.top() + 2.0), border),
+        Some(ResizeDirection::North)
+    );
+    assert_eq!(
+        map_window::resize_direction(rect, pos2(rect.center().x, rect.bottom() - 2.0), border),
+        Some(ResizeDirection::South)
+    );
+    assert_eq!(
+        map_window::resize_direction(rect, pos2(rect.left() + 2.0, rect.top() + 2.0), border),
+        Some(ResizeDirection::NorthWest)
+    );
+    assert_eq!(
+        map_window::resize_direction(rect, pos2(rect.right() - 2.0, rect.top() + 2.0), border),
+        Some(ResizeDirection::NorthEast)
+    );
+    assert_eq!(
+        map_window::resize_direction(rect, pos2(rect.left() + 2.0, rect.bottom() - 2.0), border),
+        Some(ResizeDirection::SouthWest)
+    );
+    assert_eq!(
+        map_window::resize_direction(rect, pos2(rect.right() - 2.0, rect.bottom() - 2.0), border),
+        Some(ResizeDirection::SouthEast)
+    );
+}
+
+#[test]
+fn map_window_opacity_and_size_stay_in_usable_range() {
+    let mut app = app();
+    app.config.map_window_opacity = 0.0;
+    assert_eq!(
+        app.map_window_alpha(),
+        (map_window::MAP_WINDOW_MIN_OPACITY * 255.0).round() as u8,
+        "透明度不能低到完全看不见"
+    );
+    app.config.map_window_opacity = 1.0;
+    assert_eq!(app.map_window_alpha(), 255);
+    app.config.map_window_size = Some((50.0, 50.0));
+    assert_eq!(
+        app.map_window_size(),
+        map_window::MAP_WINDOW_MIN_SIZE,
+        "过小的浮窗尺寸应被抬到下限"
     );
 }
 

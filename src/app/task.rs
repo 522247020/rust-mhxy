@@ -73,9 +73,14 @@ impl MhxyApp {
         definition: &MapDefinition,
         location: &TaskLocation,
         show_high_chance: bool,
+        alpha: u8,
     ) {
+        let opacity = alpha as f32 / 255.0;
         let Some(texture) = self.map_texture(ui.ctx(), definition) else {
-            ui.colored_label(Color32::from_rgb(240, 180, 80), "地图图片未配置");
+            ui.colored_label(
+                Color32::from_rgb(240, 180, 80).gamma_multiply(opacity),
+                "地图图片未配置",
+            );
             ui.add_space(6.0);
             return;
         };
@@ -86,7 +91,11 @@ impl MhxyApp {
         }
         let (rect, response) = ui.allocate_exact_size(available, Sense::hover());
         let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, CornerRadius::same(8), theme::inset());
+        painter.rect_filled(
+            rect,
+            CornerRadius::same(8),
+            theme::inset().gamma_multiply(opacity),
+        );
         let outer = rect.shrink(8.0);
         let image_rect = fit_rect(outer, texture_size);
         if image_rect.width() <= 1.0 {
@@ -96,7 +105,8 @@ impl MhxyApp {
             texture.id(),
             image_rect,
             Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
-            Color32::WHITE,
+            // 半透明取值：浮窗调低不透明度时地图本身也一起变淡。
+            Color32::WHITE.gamma_multiply(opacity),
         );
         let scale = image_rect.width() / texture_size.x;
         let to_screen = |point: (f32, f32)| {
@@ -155,7 +165,7 @@ impl MhxyApp {
         };
 
         if let Some(area) = nearby_area {
-            let shade = Color32::from_rgba_unmultiplied(0, 0, 0, 150);
+            let shade = Color32::from_rgba_unmultiplied(0, 0, 0, 150).gamma_multiply(opacity);
             painter.rect_filled(
                 Rect::from_min_max(image_rect.min, pos2(image_rect.max.x, area.min.y)),
                 CornerRadius::ZERO,
@@ -185,7 +195,10 @@ impl MhxyApp {
             painter.rect_stroke(
                 area,
                 CornerRadius::ZERO,
-                egui::Stroke::new(2.0, Color32::from_rgb(255, 209, 102)),
+                egui::Stroke::new(
+                    2.0,
+                    Color32::from_rgb(255, 209, 102).gamma_multiply(opacity),
+                ),
                 egui::StrokeKind::Inside,
             );
         }
@@ -202,12 +215,15 @@ impl MhxyApp {
             painter.rect_filled(
                 chance,
                 CornerRadius::ZERO,
-                Color32::from_rgba_unmultiplied(255, 40, 40, 48),
+                Color32::from_rgba_unmultiplied(255, 40, 40, 48).gamma_multiply(opacity),
             );
             painter.rect_stroke(
                 chance,
                 CornerRadius::ZERO,
-                egui::Stroke::new(2.0, Color32::from_rgba_unmultiplied(255, 40, 40, 170)),
+                egui::Stroke::new(
+                    2.0,
+                    Color32::from_rgba_unmultiplied(255, 40, 40, 170).gamma_multiply(opacity),
+                ),
                 egui::StrokeKind::Inside,
             );
         }
@@ -232,6 +248,7 @@ impl MhxyApp {
                         flag_index + 1,
                         false,
                         self.flight_flags.flag_style(&definition.name, flag_index),
+                        opacity,
                     );
                 }
             }
@@ -240,8 +257,16 @@ impl MhxyApp {
         if let Some(point) = map_point(definition, point_x, point_y, texture_size.x, texture_size.y)
         {
             let center = to_screen(point);
-            painter.circle_filled(center, 8.0, Color32::from_rgb(255, 51, 78));
-            painter.circle_stroke(center, 8.0, egui::Stroke::new(2.0, Color32::WHITE));
+            painter.circle_filled(
+                center,
+                8.0,
+                Color32::from_rgb(255, 51, 78).gamma_multiply(opacity),
+            );
+            painter.circle_stroke(
+                center,
+                8.0,
+                egui::Stroke::new(2.0, Color32::WHITE.gamma_multiply(opacity)),
+            );
             let label = format!("({}, {})", location.x, location.y);
             let galley = painter.layout_no_wrap(label, FontId::proportional(14.0), Color32::WHITE);
             let label_size = galley.size() + vec2(12.0, 8.0);
@@ -253,9 +278,13 @@ impl MhxyApp {
             painter.rect_filled(
                 Rect::from_min_size(label_min, label_size),
                 CornerRadius::same(4),
-                Color32::from_black_alpha(220),
+                Color32::from_black_alpha(220).gamma_multiply(opacity),
             );
-            painter.galley(label_min + vec2(6.0, 4.0), galley, Color32::WHITE);
+            painter.galley(
+                label_min + vec2(6.0, 4.0),
+                galley,
+                Color32::WHITE.gamma_multiply(opacity),
+            );
         }
 
         if let Some(pointer) = response.hover_pos() {
@@ -270,15 +299,60 @@ impl MhxyApp {
                         Align2::RIGHT_TOP,
                         format!("鼠标坐标：{game_x}, {game_y}"),
                         FontId::proportional(13.0),
-                        Color32::from_rgb(248, 250, 252),
+                        Color32::from_rgb(248, 250, 252).gamma_multiply(opacity),
                     );
                 }
             }
         }
     }
 
+    /// 按当前布局绘制所有任务地图：主窗口和地图浮窗共用。
+    /// `alpha` 为整体不透明度（255 = 完全不透明），`card` 控制是否画任务卡片底板。
+    pub(super) fn task_area(&mut self, ui: &mut egui::Ui, alpha: u8, card: bool) {
+        let tasks: Vec<&'static str> = TASK_ORDER
+            .iter()
+            .copied()
+            .filter(|task| self.task_active(task))
+            .collect();
+        if tasks.is_empty() {
+            return;
+        }
+        let rect = ui.available_rect_before_wrap();
+        let count = tasks.len() as f32;
+        for (index, task_type) in tasks.iter().enumerate() {
+            // 横向布局左右等分，纵向布局上下等分；只有一个任务时占满剩余区域。
+            let child_rect = if self.config.horizontal_layout {
+                let width = rect.width() / count;
+                Rect::from_min_size(
+                    pos2(rect.min.x + width * index as f32, rect.min.y),
+                    vec2(width, rect.height()),
+                )
+            } else {
+                let height = rect.height() / count;
+                Rect::from_min_size(
+                    pos2(rect.min.x, rect.min.y + height * index as f32),
+                    vec2(rect.width(), height),
+                )
+            };
+            let gap = if self.compact || !card { 0.0 } else { 5.0 };
+            let mut child = ui.new_child(egui::UiBuilder::new().max_rect(child_rect.shrink(gap)));
+            self.task_panel_with(&mut child, task_type, alpha, card);
+        }
+    }
+
     /// 任务区域只显示地图；地图名称、坐标和识别状态不再单独占一行。
+    #[cfg(test)]
     pub(super) fn task_panel(&mut self, ui: &mut egui::Ui, task_type: &str) {
+        self.task_panel_with(ui, task_type, 255, true);
+    }
+
+    pub(super) fn task_panel_with(
+        &mut self,
+        ui: &mut egui::Ui,
+        task_type: &str,
+        alpha: u8,
+        card: bool,
+    ) {
         let (location, map_index) = {
             let state = self.tasks.get(task_type).expect("task state");
             (state.location.clone(), state.map_index)
@@ -294,38 +368,48 @@ impl MhxyApp {
             _ => false,
         };
         let compact = self.compact;
+        // 地图浮窗按整体不透明度绘制，占位图也跟着一起变淡。
+        let opacity = alpha as f32 / 255.0;
         let draw = |app: &mut Self, ui: &mut egui::Ui| {
             ui.set_min_size(ui.available_size());
             match (&location, map_index) {
                 (Some(location), Some(index)) => {
                     let definition = app.maps[index].clone();
-                    app.render_map(ui, &definition, location, show_high_chance);
+                    app.render_map(ui, &definition, location, show_high_chance, alpha);
                 }
                 _ => {
                     let size = ui.available_size().max(vec2(1.0, 1.0));
                     let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
                     let painter = ui.painter_at(rect);
-                    painter.rect_filled(rect, CornerRadius::same(8), theme::inset());
+                    painter.rect_filled(
+                        rect,
+                        CornerRadius::same(8),
+                        theme::inset().gamma_multiply(opacity),
+                    );
                     let center = rect.center();
-                    painter.circle_stroke(center, 18.0, egui::Stroke::new(1.0, theme::border()));
+                    painter.circle_stroke(
+                        center,
+                        18.0,
+                        egui::Stroke::new(1.0, theme::border().gamma_multiply(opacity)),
+                    );
                     painter.circle_stroke(
                         center,
                         9.0,
-                        egui::Stroke::new(1.0, accent.gamma_multiply(0.6)),
+                        egui::Stroke::new(1.0, accent.gamma_multiply(0.6).gamma_multiply(opacity)),
                     );
                     painter.line_segment(
                         [center - vec2(25.0, 0.0), center + vec2(25.0, 0.0)],
-                        egui::Stroke::new(1.0, theme::border()),
+                        egui::Stroke::new(1.0, theme::border().gamma_multiply(opacity)),
                     );
                     painter.line_segment(
                         [center - vec2(0.0, 25.0), center + vec2(0.0, 25.0)],
-                        egui::Stroke::new(1.0, theme::border()),
+                        egui::Stroke::new(1.0, theme::border().gamma_multiply(opacity)),
                     );
                 }
             }
         };
-        if compact {
-            // 精简模式不套任务卡片的边框和背景，地图直接铺满窗口。
+        if compact || !card {
+            // 精简模式 / 地图浮窗不套任务卡片的边框和背景，地图直接铺满窗口。
             draw(self, ui);
         } else {
             theme::card().show(ui, |ui| draw(self, ui));

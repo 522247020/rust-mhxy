@@ -227,8 +227,25 @@ pub struct Config {
     #[serde(rename = "meditation/bold")]
     pub meditation_bold: bool,
     /// 悬浮窗外框位置（逻辑像素），None = 交给系统摆放。
-    #[serde(rename = "meditation/position", with = "meditation_position_serde")]
+    #[serde(rename = "meditation/position", with = "position_serde")]
     pub meditation_position: Option<(f32, f32)>,
+
+    /// 独立地图浮窗：把地图从主窗口里弹出来，无边框、可拖动缩放。
+    #[serde(rename = "map_window/enabled")]
+    pub map_window_enabled: bool,
+    /// 地图浮窗整体不透明度 0~1（1 = 完全不透明）。
+    #[serde(rename = "map_window/opacity")]
+    pub map_window_opacity: f32,
+    #[serde(rename = "map_window/on_top")]
+    pub map_window_on_top: bool,
+    /// 锁定后浮窗鼠标穿透，只能在主窗口取消。
+    #[serde(rename = "map_window/locked")]
+    pub map_window_locked: bool,
+    /// 浮窗位置 / 大小（逻辑像素），None = 使用默认值。
+    #[serde(rename = "map_window/position", with = "position_serde")]
+    pub map_window_position: Option<(f32, f32)>,
+    #[serde(rename = "map_window/size", with = "position_serde")]
+    pub map_window_size: Option<(f32, f32)>,
 
     /// 启动时检查更新。
     #[serde(rename = "update/enabled")]
@@ -302,6 +319,12 @@ impl Default for Config {
             meditation_enabled: false,
             meditation_bold: false,
             meditation_position: None,
+            map_window_enabled: false,
+            map_window_opacity: 1.0,
+            map_window_on_top: true,
+            map_window_locked: false,
+            map_window_position: None,
+            map_window_size: None,
             update_enabled: true,
             update_manifest_url: crate::update::DEFAULT_MANIFEST_URL.to_string(),
             region_scope_open: true,
@@ -400,6 +423,11 @@ impl Config {
             crate::meditation::clamp_duration(self.meditation_duration_seconds);
         self.meditation_opacity = self.meditation_opacity.clamp(0.0, 1.0);
         self.meditation_font_px = self.meditation_font_px.min(200);
+        self.map_window_opacity = self.map_window_opacity.clamp(0.0, 1.0);
+        if let Some((width, height)) = self.map_window_size {
+            // 尺寸过小会让浮窗缩成一条线，既看不清也拖不回来。
+            self.map_window_size = Some((width.max(160.0), height.max(120.0)));
+        }
         // 通用任务与抓鬼/鬼王互斥；手改配置或旧配置里同时为真时，以通用任务为准。
         if self.generic_enabled {
             self.zhuagui_enabled = false;
@@ -837,7 +865,7 @@ fn color_from_value(value: &Value) -> Option<[u8; 3]> {
     }
 }
 
-mod meditation_position_serde {
+mod position_serde {
     use super::*;
 
     pub fn serialize<S>(position: &Option<(f32, f32)>, serializer: S) -> Result<S::Ok, S::Error>
@@ -1454,6 +1482,39 @@ mod tests {
     }
 
     #[test]
+    fn map_window_settings_fall_back_to_defaults_and_are_sanitized() {
+        let dir = std::env::temp_dir().join("rust-mhxy-config-map-window-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("config.json");
+        // 旧配置没有 map_window/*：使用默认值（关闭、不透明、置顶）。
+        std::fs::write(&path, r#"{ "window/theme": "dark" }"#).unwrap();
+        let loaded = Config::load(&path);
+        assert!(!loaded.map_window_enabled);
+        assert_eq!(loaded.map_window_opacity, 1.0);
+        assert!(loaded.map_window_on_top);
+        assert!(!loaded.map_window_locked);
+        assert_eq!(loaded.map_window_position, None);
+        assert_eq!(loaded.map_window_size, None);
+
+        // 手改配置写出越界值时要收敛到可用范围。
+        std::fs::write(
+            &path,
+            r##"{
+                "map_window/enabled": true,
+                "map_window/opacity": 2.5,
+                "map_window/position": "120,240",
+                "map_window/size": "10,20",
+            }"##,
+        )
+        .unwrap();
+        let loaded = Config::load(&path);
+        assert!(loaded.map_window_enabled);
+        assert_eq!(loaded.map_window_opacity, 1.0);
+        assert_eq!(loaded.map_window_position, Some((120.0, 240.0)));
+        assert_eq!(loaded.map_window_size, Some((160.0, 120.0)));
+    }
+
+    #[test]
     fn save_output_keeps_flat_key_format() {
         let dir = std::env::temp_dir().join("rust-mhxy-config-output-format-test");
         let _ = std::fs::create_dir_all(&dir);
@@ -1461,6 +1522,9 @@ mod tests {
         let mut config = Config {
             theme: "dark".into(),
             meditation_position: Some((12.4, 56.6)),
+            map_window_position: Some((40.4, 50.6)),
+            map_window_size: Some((520.2, 480.7)),
+            map_window_opacity: 0.75,
             color_gate_points: vec![ColorPoint::new(100, 200, [0xd4, 0xa0, 0x17], 15, 1)],
             ..Default::default()
         };
@@ -1489,6 +1553,12 @@ mod tests {
             "color_gate/points",
             "color_gate/tolerance",
             "log/level",
+            "map_window/enabled",
+            "map_window/locked",
+            "map_window/on_top",
+            "map_window/opacity",
+            "map_window/position",
+            "map_window/size",
             "meditation/bold",
             "meditation/clock_format",
             "meditation/duration_seconds",
@@ -1543,6 +1613,9 @@ mod tests {
         assert_eq!(value["ocr/preprocess_color"], "#eaff65");
         assert_eq!(value["meditation/text_color"], "#ffffff");
         assert_eq!(value["meditation/position"], "12,57");
+        assert_eq!(value["map_window/position"], "40,51");
+        assert_eq!(value["map_window/size"], "520,481");
+        assert_eq!(value["map_window/opacity"], 0.75);
         assert_eq!(value["window/theme"], "dark");
         assert_eq!(
             value["ocr/region_presets"]["1920x1080"],

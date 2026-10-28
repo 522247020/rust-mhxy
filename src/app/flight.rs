@@ -268,6 +268,7 @@ impl MhxyApp {
                         flag_index + 1,
                         flag_index == self.flight_flag_index,
                         self.flight_flags.flag_style(&definition.name, flag_index),
+                        1.0,
                     );
                 }
             }
@@ -344,19 +345,21 @@ pub(super) fn draw_flight_flag_marker(
     number: usize,
     selected: bool,
     style: FlightFlagStyle,
+    opacity: f32,
 ) {
     // 只画背景圆和文字，不再描边；选中时稍微放大一点做区分。
+    // `opacity` 用于地图浮窗的整体不透明度，编辑器里始终传 1.0。
     let radius = f32::from(style.size) * 0.5 + if selected { 2.0 } else { 0.0 };
     painter.circle_filled(
         center,
         radius,
-        marker_color(style.background, style.background_normal_alpha),
+        marker_color(style.background, style.background_normal_alpha).gamma_multiply(opacity),
     );
     painter.text(
         center,
         Align2::CENTER_CENTER,
         number.to_string(),
         FontId::proportional((f32::from(style.size) * 0.65).max(9.0)),
-        marker_color(style.text, style.text_normal_alpha),
+        marker_color(style.text, style.text_normal_alpha).gamma_multiply(opacity),
     );
 }

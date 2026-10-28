@@ -91,6 +91,17 @@ impl MhxyApp {
             self.set_on_top(on_top, ctx);
         }
         ui.separator();
+        if ui
+            .button(if self.config.map_window_enabled {
+                "关闭地图浮窗"
+            } else {
+                "地图浮窗"
+            })
+            .clicked()
+        {
+            self.set_map_window(!self.config.map_window_enabled, ctx);
+            ui.close();
+        }
         if ui.button("精简界面").clicked() {
             self.enter_compact_mode();
             ui.close();
@@ -360,6 +371,20 @@ impl eframe::App for MhxyApp {
                             {
                                 self.enter_compact_mode();
                             }
+                            if !narrow
+                                && ui
+                                    .add(header_button(
+                                        "地图浮窗",
+                                        self.config.map_window_enabled,
+                                    ))
+                                    .on_hover_text(
+                                        "把地图弹到无边框浮窗里：可拖动、可缩放，透明度在侧栏「显示与布局」调",
+                                    )
+                                    .clicked()
+                            {
+                                let enabled = !self.config.map_window_enabled;
+                                self.set_map_window(enabled, &ctx);
+                            }
                             let on_top = self.config.on_top;
                             if !narrow
                                 && ui
@@ -621,36 +646,12 @@ impl eframe::App for MhxyApp {
                     .inner_margin(central_margin),
             )
             .show(ui, |ui| {
-                let tasks: Vec<&'static str> = TASK_ORDER
-                    .iter()
-                    .copied()
-                    .filter(|task| self.task_active(task))
-                    .collect();
-                if tasks.is_empty() {
+                if self.config.map_window_enabled {
+                    // 地图已经弹到独立浮窗里，主窗口只留说明和关闭入口。
+                    self.map_window_placeholder(ui);
                     return;
                 }
-                let rect = ui.available_rect_before_wrap();
-                let count = tasks.len() as f32;
-                for (index, task_type) in tasks.iter().enumerate() {
-                    // 横向布局左右等分，纵向布局上下等分；只有一个任务时占满剩余区域。
-                    let child_rect = if self.config.horizontal_layout {
-                        let width = rect.width() / count;
-                        Rect::from_min_size(
-                            pos2(rect.min.x + width * index as f32, rect.min.y),
-                            vec2(width, rect.height()),
-                        )
-                    } else {
-                        let height = rect.height() / count;
-                        Rect::from_min_size(
-                            pos2(rect.min.x, rect.min.y + height * index as f32),
-                            vec2(rect.width(), height),
-                        )
-                    };
-                    let gap = if self.compact { 0.0 } else { 5.0 };
-                    let mut child =
-                        ui.new_child(egui::UiBuilder::new().max_rect(child_rect.shrink(gap)));
-                    self.task_panel(&mut child, task_type);
-                }
+                self.task_area(ui, 255, true);
             });
         if self.show_update_dialog {
             let on_top = self.config.on_top;
@@ -888,6 +889,8 @@ impl eframe::App for MhxyApp {
         if self.config.meditation_enabled {
             self.meditation_overlay(&ctx);
         }
+        // 地图浮窗：和主窗口同帧调度，关闭模式后下一帧就不再创建。
+        self.map_window(&ctx);
         // 精简模式没有顶栏和状态栏，进入后给一个短暂的退出提示。
         if self.compact {
             if let Some(until) = self.compact_hint_until {
@@ -967,7 +970,7 @@ fn header_button(text: &str, selected: bool) -> egui::Button<'static> {
 }
 
 /// 说明 / 更新窗口在主窗口中间打开，并限制在屏幕内。
-fn centered_window_position(ctx: &egui::Context, size: Vec2) -> egui::Pos2 {
+pub(super) fn centered_window_position(ctx: &egui::Context, size: Vec2) -> egui::Pos2 {
     ctx.input(|input| {
         let viewport = input.viewport();
         let monitor = viewport
