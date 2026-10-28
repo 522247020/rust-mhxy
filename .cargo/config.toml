@@ -1,3 +1,5 @@
 [env]
-TMP = { value = "target/tmp", relative = true, force = true }
-TEMP = { value = "target/tmp", relative = true, force = true }
+# Keep compiler/linker scratch files in a tracked, writable directory. This must
+# exist before Cargo starts dependency build scripts; build.rs runs too late.
+TMP = { value = ".cargo/tmp", relative = true, force = true }
+TEMP = { value = ".cargo/tmp", relative = true, force = true }
