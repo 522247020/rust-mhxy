@@ -44,6 +44,9 @@ pub(super) struct MapWindowRuntime {
     /// 上一次下发缩放命令的时间：限制到约 60Hz，避免鼠标高回报率时
     /// 每来一个事件就重建一次窗口表面，反而更卡。
     last_resize_at: Option<Instant>,
+    /// 窗口是否已经显示过。第一帧先隐藏着画好，再显示，
+    /// 避免创建 / 重新打开浮窗的瞬间闪出 Windows 默认的白底和边框。
+    visible: bool,
     shadow_attempts: u8,
     /// 上一帧是否最小化：无边框工具窗口没有任务栏按钮，Win+D 之后必须自己还原。
     minimized: bool,
@@ -109,6 +112,15 @@ impl MhxyApp {
             return;
         }
         self.config.map_window_enabled = enabled;
+        if !enabled {
+            // 先把窗口隐藏掉再让 eframe 销毁，避免关闭瞬间闪出系统白底。
+            for task in self.active_tasks() {
+                self.ctx.send_viewport_cmd_to(
+                    map_window_id(task),
+                    egui::ViewportCommand::Visible(false),
+                );
+            }
+        }
         // 新窗口没有继承上一次的置顶 / 穿透状态，缓存和手动关闭记录都清空。
         self.map_windows.clear();
         self.closed_map_windows.clear();
@@ -126,6 +138,9 @@ impl MhxyApp {
             self.closed_map_windows.remove(task);
         } else {
             self.closed_map_windows.insert(task);
+            // 先隐藏再销毁，避免关闭瞬间闪出系统白底。
+            self.ctx
+                .send_viewport_cmd_to(map_window_id(task), egui::ViewportCommand::Visible(false));
         }
         // 重新打开时按配置里的位置 / 大小重建，需要重置缓存。
         self.map_windows.remove(task);
@@ -135,15 +150,22 @@ impl MhxyApp {
     /// 把所有任务浮窗恢复到默认大小，并逐个错开摆回主窗口中间。
     pub(super) fn reset_map_window_geometry(&mut self, ctx: &egui::Context) {
         self.config.map_window_layouts.clear();
-        self.map_windows.clear();
         self.closed_map_windows.clear();
         if self.config.map_window_enabled {
             let tasks = self.active_tasks();
             let image_sizes = self.task_map_image_sizes(&tasks, ctx);
             for (index, task) in tasks.iter().copied().enumerate() {
                 let image_size = image_sizes.get(&task).copied();
-                // 清空过运行时状态，下一帧会按新的默认布局重建 builder。
-                self.ensure_map_window_layout(task, index, ctx, image_size);
+                let layout = self.ensure_map_window_layout(task, index, ctx, image_size);
+                // 保留现有窗口的 visible 状态，只更新 builder 几何，避免重置时
+                // 窗口先隐藏再显示造成闪烁。
+                if let Some(runtime) = self.map_windows.get_mut(&task) {
+                    runtime.spawn_layout = Some(layout);
+                    runtime.last_size = None;
+                    runtime.last_outer = None;
+                    runtime.sized_to_map = image_size.is_some();
+                    runtime.resize_drag = None;
+                }
             }
         }
         self.persist();
@@ -296,12 +318,17 @@ impl MhxyApp {
                 .get(&task)
                 .and_then(|runtime| runtime.spawn_layout)
                 .unwrap_or(layout);
+            let visible = self
+                .map_windows
+                .get(&task)
+                .is_some_and(|runtime| runtime.visible);
             let title = map_window_title(task);
             let mut builder = egui::ViewportBuilder::default()
                 .with_title(title.as_str())
                 .with_decorations(false)
                 .with_transparent(true)
                 .with_resizable(true)
+                .with_visible(visible)
                 .with_inner_size(vec2(spawn.width, spawn.height))
                 .with_min_inner_size(MAP_WINDOW_MIN_SIZE)
                 .with_position(pos2(spawn.x, spawn.y));
@@ -326,10 +353,13 @@ impl MhxyApp {
         }
         let title = map_window_title(task);
         let attempts = self.map_windows.entry(task).or_default().shadow_attempts;
+        let mut prepared = true;
         if attempts < 30 {
             // Windows 会给无边框窗口加 DWM 投影和圆角，透明背景下看得到；
             // 窗口刚创建时可能还找不到，下一帧再试（其他平台是空操作）。
             let found = borderless::prepare(&title, true);
+            // 正常第一帧就能找到窗口；万一找不到，也别一直藏着不显示。
+            prepared = found || attempts >= 2;
             self.map_windows.entry(task).or_default().shadow_attempts =
                 if found { 30 } else { attempts + 1 };
         }
@@ -352,14 +382,22 @@ impl MhxyApp {
             .clamp(MAP_WINDOW_MIN_OPACITY, 1.0);
         let alpha = self.map_window_alpha();
         let rect = ui.max_rect();
-        // 不要背景：窗口里画什么就是地图图片本身。
-        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect));
-        self.task_panel_with(&mut child, task, alpha, false, true);
-        if !self
+        // 还没识别到地图时先给一个深色底，避免窗口完全透明像一块空洞；
+        // 识别到地图后不再画背景，整窗就是地图图片本身。
+        let has_location = self
             .tasks
             .get(task)
-            .is_some_and(|state| state.location.is_some())
-        {
+            .is_some_and(|state| state.location.is_some());
+        if !has_location {
+            ui.painter().rect_filled(
+                rect,
+                CornerRadius::ZERO,
+                theme::inset().gamma_multiply(opacity),
+            );
+        }
+        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect));
+        self.task_panel_with(&mut child, task, alpha, false, true);
+        if !has_location {
             // 透明背景下文字直接叠在桌面 / 游戏上，加一层阴影保证可读。
             let text_pos = rect.center_bottom() - vec2(0.0, 16.0);
             let text = "等待识别到任务…";
@@ -378,6 +416,20 @@ impl MhxyApp {
                 font,
                 theme::muted().gamma_multiply(opacity),
             );
+        }
+
+        // 第一帧先隐藏着画好，再显示；避免窗口创建 / 重新打开时
+        // 闪出 Windows 默认的白色底和边框。
+        if prepared
+            && !self
+                .map_windows
+                .get(&task)
+                .is_some_and(|runtime| runtime.visible)
+        {
+            if let Some(runtime) = self.map_windows.get_mut(&task) {
+                runtime.visible = true;
+            }
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         }
 
         // 锁定（鼠标穿透）时窗口不接收任何输入，只能回主界面取消。
@@ -414,12 +466,25 @@ impl MhxyApp {
                 CornerRadius::same(4),
                 Color32::from_black_alpha(alpha).gamma_multiply(opacity),
             );
-            painter.text(
-                close_rect.center(),
-                Align2::CENTER_CENTER,
-                "✕",
-                FontId::proportional(13.0),
+            // 用两条线画 X，不依赖字体字形，避免显示成方块。
+            let stroke = egui::Stroke::new(
+                (close_rect.width() * 0.11).max(1.2),
                 Color32::WHITE.gamma_multiply(opacity),
+            );
+            let inset = close_rect.width() * 0.28;
+            painter.line_segment(
+                [
+                    close_rect.left_top() + vec2(inset, inset),
+                    close_rect.right_bottom() - vec2(inset, inset),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    close_rect.right_top() + vec2(-inset, inset),
+                    close_rect.left_bottom() + vec2(inset, -inset),
+                ],
+                stroke,
             );
         }
         if response.clicked() {

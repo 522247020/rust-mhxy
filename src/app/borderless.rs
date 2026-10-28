@@ -33,8 +33,13 @@ unsafe extern "system" fn borderless_wndproc(
 ) -> windows::Win32::Foundation::LRESULT {
     use windows::Win32::Foundation::{LRESULT, RECT};
     use windows::Win32::UI::WindowsAndMessaging::{
-        CallWindowProcW, DefWindowProcW, GetWindowRect, NCCALCSIZE_PARAMS, WM_NCCALCSIZE, WNDPROC,
+        CallWindowProcW, DefWindowProcW, GetWindowRect, NCCALCSIZE_PARAMS, WM_ERASEBKGND,
+        WM_NCCALCSIZE, WNDPROC,
     };
+    if msg == WM_ERASEBKGND {
+        // 透明无边框窗口不要系统画白底，否则窗口刚创建 / 首次显示时会闪一下白色。
+        return LRESULT(1);
+    }
     if msg == WM_NCCALCSIZE && wparam.0 != 0 {
         let params = lparam.0 as *mut NCCALCSIZE_PARAMS;
         if !params.is_null() {
