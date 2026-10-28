@@ -74,6 +74,7 @@ impl MhxyApp {
         location: &TaskLocation,
         show_high_chance: bool,
         alpha: u8,
+        full_window: bool,
     ) {
         let opacity = alpha as f32 / 255.0;
         let Some(texture) = self.map_texture(ui.ctx(), definition) else {
@@ -91,13 +92,20 @@ impl MhxyApp {
         }
         let (rect, response) = ui.allocate_exact_size(available, Sense::hover());
         let painter = ui.painter_at(rect);
-        painter.rect_filled(
-            rect,
-            CornerRadius::same(8),
-            theme::inset().gamma_multiply(opacity),
-        );
-        let outer = rect.shrink(8.0);
-        let image_rect = fit_rect(outer, texture_size);
+        // 地图浮窗：窗口就是图片本身，既不留边距也不要底板；
+        // 主窗口仍然保留圆角底板，和任务卡片里的效果一致。
+        if !full_window {
+            painter.rect_filled(
+                rect,
+                CornerRadius::same(8),
+                theme::inset().gamma_multiply(opacity),
+            );
+        }
+        let image_rect = if full_window {
+            rect
+        } else {
+            fit_rect(rect.shrink(8.0), texture_size)
+        };
         if image_rect.width() <= 1.0 {
             return;
         }
@@ -108,11 +116,13 @@ impl MhxyApp {
             // 半透明取值：浮窗调低不透明度时地图本身也一起变淡。
             Color32::WHITE.gamma_multiply(opacity),
         );
-        let scale = image_rect.width() / texture_size.x;
+        // 地图浮窗会拉伸到整个窗口，横纵缩放比例可能不同，不能只用一个 scale。
+        let scale_x = image_rect.width() / texture_size.x;
+        let scale_y = image_rect.height() / texture_size.y;
         let to_screen = |point: (f32, f32)| {
             pos2(
-                image_rect.min.x + point.0 * scale,
-                image_rect.min.y + point.1 * scale,
+                image_rect.min.x + point.0 * scale_x,
+                image_rect.min.y + point.1 * scale_y,
             )
         };
         let (point_x, point_y) = clamp_to_map(definition, location.x as f32, location.y as f32);
@@ -289,8 +299,8 @@ impl MhxyApp {
 
         if let Some(pointer) = response.hover_pos() {
             if image_rect.contains(pointer) {
-                let pixel_x = (pointer.x - image_rect.min.x) / scale;
-                let pixel_y = (pointer.y - image_rect.min.y) / scale;
+                let pixel_x = (pointer.x - image_rect.min.x) / scale_x;
+                let pixel_y = (pointer.y - image_rect.min.y) / scale_y;
                 if let Some((game_x, game_y)) =
                     map_coordinate(definition, pixel_x, pixel_y, texture_size.x, texture_size.y)
                 {
@@ -336,14 +346,14 @@ impl MhxyApp {
             };
             let gap = if self.compact || !card { 0.0 } else { 5.0 };
             let mut child = ui.new_child(egui::UiBuilder::new().max_rect(child_rect.shrink(gap)));
-            self.task_panel_with(&mut child, task_type, alpha, card);
+            self.task_panel_with(&mut child, task_type, alpha, card, false);
         }
     }
 
     /// 任务区域只显示地图；地图名称、坐标和识别状态不再单独占一行。
     #[cfg(test)]
     pub(super) fn task_panel(&mut self, ui: &mut egui::Ui, task_type: &str) {
-        self.task_panel_with(ui, task_type, 255, true);
+        self.task_panel_with(ui, task_type, 255, true, false);
     }
 
     pub(super) fn task_panel_with(
@@ -352,6 +362,7 @@ impl MhxyApp {
         task_type: &str,
         alpha: u8,
         card: bool,
+        full_window: bool,
     ) {
         let (location, map_index) = {
             let state = self.tasks.get(task_type).expect("task state");
@@ -375,17 +386,26 @@ impl MhxyApp {
             match (&location, map_index) {
                 (Some(location), Some(index)) => {
                     let definition = app.maps[index].clone();
-                    app.render_map(ui, &definition, location, show_high_chance, alpha);
+                    app.render_map(
+                        ui,
+                        &definition,
+                        location,
+                        show_high_chance,
+                        alpha,
+                        full_window,
+                    );
                 }
                 _ => {
                     let size = ui.available_size().max(vec2(1.0, 1.0));
                     let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
                     let painter = ui.painter_at(rect);
-                    painter.rect_filled(
-                        rect,
-                        CornerRadius::same(8),
-                        theme::inset().gamma_multiply(opacity),
-                    );
+                    if !full_window {
+                        painter.rect_filled(
+                            rect,
+                            CornerRadius::same(8),
+                            theme::inset().gamma_multiply(opacity),
+                        );
+                    }
                     let center = rect.center();
                     painter.circle_stroke(
                         center,

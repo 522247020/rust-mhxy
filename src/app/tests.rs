@@ -780,6 +780,92 @@ fn map_window_opacity_stays_in_usable_range() {
 }
 
 #[test]
+fn map_window_sizes_itself_to_the_map_image() {
+    let mut app = app();
+    let ctx = app.ctx.clone();
+    let mut frame = eframe::Frame::_new_kittest();
+    let input = || egui::RawInput {
+        screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1120.0, 800.0))),
+        ..Default::default()
+    };
+    app.apply_ocr(&OcrText {
+        text: "抓鬼 长寿村 12,34".into(),
+        elapsed_secs: 0.1,
+    });
+    // 模拟旧版本存下来的固定 560×460 布局：升级后应自动贴合图片大小，
+    // 但仍保留原来的位置。
+    app.config.map_window_layouts.insert(
+        "抓鬼".into(),
+        crate::config::MapWindowLayout {
+            x: 100.0,
+            y: 120.0,
+            width: map_window::MAP_WINDOW_SIZE.x,
+            height: map_window::MAP_WINDOW_SIZE.y,
+        },
+    );
+    app.set_map_window(true);
+    let mut output = ctx.run_ui(input(), |ui| app.ui(ui, &mut frame));
+    let texture_size = app
+        .map_textures
+        .values()
+        .next()
+        .expect("应加载抓鬼地图")
+        .size_vec2();
+    let layout = app
+        .config
+        .map_window_layouts
+        .get("抓鬼")
+        .copied()
+        .expect("抓鬼浮窗应有布局");
+    assert!(
+        (layout.width - texture_size.x).abs() < 0.5 && (layout.height - texture_size.y).abs() < 0.5,
+        "浮窗应贴合地图图片：layout={layout:?} texture={texture_size:?}"
+    );
+    assert_eq!((layout.x, layout.y), (100.0, 120.0), "贴合图片时保留原位置");
+    output.textures_delta.clear();
+}
+
+#[test]
+fn map_window_builder_geometry_stays_frozen_after_manual_resize() {
+    let mut app = app();
+    let ctx = app.ctx.clone();
+    let mut frame = eframe::Frame::_new_kittest();
+    let input = || egui::RawInput {
+        screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1120.0, 800.0))),
+        ..Default::default()
+    };
+    app.apply_ocr(&OcrText {
+        text: "抓鬼 长寿村 12,34".into(),
+        elapsed_secs: 0.1,
+    });
+    app.set_map_window(true);
+    let mut output = ctx.run_ui(input(), |ui| app.ui(ui, &mut frame));
+    let spawn = app
+        .map_window_spawn_layout("抓鬼")
+        .expect("应建立抓鬼浮窗运行时状态");
+
+    // 模拟用户拖动缩放后把新尺寸写回配置。builder 的几何值必须保持不动，
+    // 否则下一帧会重新下发 InnerSize，和系统缩放互相拉扯，表现为窗口抖动。
+    let layout = app.config.map_window_layouts.get_mut("抓鬼").unwrap();
+    layout.width = spawn.width + 120.0;
+    layout.height = spawn.height + 80.0;
+    let layout = *layout;
+    let mut output2 = ctx.run_ui(input(), |ui| app.ui(ui, &mut frame));
+    assert_eq!(
+        app.map_window_spawn_layout("抓鬼"),
+        Some(spawn),
+        "用户调整后的尺寸不应反馈给 ViewportBuilder"
+    );
+    assert_eq!(
+        app.config.map_window_layouts.get("抓鬼"),
+        Some(&layout),
+        "配置里的用户尺寸应保留"
+    );
+    output.textures_delta.clear();
+    output2.textures_delta.clear();
+}
+
+#[test]
 fn vote_uses_median_for_same_map() {
     let mut votes = VoteBuffer::default();
     assert_eq!(

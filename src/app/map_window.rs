@@ -27,6 +27,12 @@ pub(super) struct MapWindowRuntime {
     last_size: Option<Vec2>,
     applied_on_top: Option<bool>,
     applied_passthrough: Option<bool>,
+    /// 传给 `ViewportBuilder` 的几何值，创建窗口时固定下来。
+    /// 如果每帧把实际窗口大小 / 位置写回 builder，DPI 换算的取整会让
+    /// 窗口反复收到 InnerSize / OuterPosition 命令，表现为拖动缩放时不停抖动。
+    spawn_layout: Option<MapWindowLayout>,
+    /// 是否已经按地图图片大小收紧过窗口；只在第一次拿到地图时做一次。
+    sized_to_map: bool,
     shadow_attempts: u8,
     /// 上一帧是否最小化：无边框工具窗口没有任务栏按钮，Win+D 之后必须自己还原。
     minimized: bool,
@@ -66,6 +72,14 @@ impl MhxyApp {
             && !self.closed_map_windows.contains(task)
     }
 
+    /// 测试用：查看传给 ViewportBuilder 的几何值是否保持稳定。
+    #[cfg(test)]
+    pub(super) fn map_window_spawn_layout(&self, task: &str) -> Option<MapWindowLayout> {
+        self.map_windows
+            .get(task)
+            .and_then(|runtime| runtime.spawn_layout)
+    }
+
     /// 打开 / 关闭整个浮窗模式。重新打开时所有任务浮窗都会恢复。
     pub(super) fn set_map_window(&mut self, enabled: bool) {
         if self.config.map_window_enabled == enabled {
@@ -101,40 +115,61 @@ impl MhxyApp {
         self.map_windows.clear();
         self.closed_map_windows.clear();
         if self.config.map_window_enabled {
-            for (index, task) in self.active_tasks().into_iter().enumerate() {
-                let layout = self.ensure_map_window_layout(task, index, ctx);
-                let id = map_window_id(task);
-                ctx.send_viewport_cmd_to(
-                    id,
-                    egui::ViewportCommand::InnerSize(vec2(layout.width, layout.height)),
-                );
-                ctx.send_viewport_cmd_to(
-                    id,
-                    egui::ViewportCommand::OuterPosition(pos2(layout.x, layout.y)),
-                );
+            let tasks = self.active_tasks();
+            let image_sizes = self.task_map_image_sizes(&tasks, ctx);
+            for (index, task) in tasks.iter().copied().enumerate() {
+                let image_size = image_sizes.get(&task).copied();
+                // 清空过运行时状态，下一帧会按新的默认布局重建 builder。
+                self.ensure_map_window_layout(task, index, ctx, image_size);
             }
         }
         self.persist();
     }
 
-    /// 读取任务浮窗的保存位置；第一次出现时给出错开的默认位置。
+    /// 当前任务地图图片的尺寸（逻辑像素）；还没识别到任务时为 None。
+    fn task_map_image_size(&mut self, task: &str, ctx: &egui::Context) -> Option<Vec2> {
+        let index = self.tasks.get(task)?.map_index?;
+        let definition = self.maps.get(index)?.clone();
+        let texture = self.map_texture(ctx, &definition)?;
+        Some(texture.size_vec2())
+    }
+
+    /// 批量取各任务的地图尺寸；同一张地图只会加载一次纹理。
+    fn task_map_image_sizes(
+        &mut self,
+        tasks: &[&'static str],
+        ctx: &egui::Context,
+    ) -> HashMap<&'static str, Vec2> {
+        tasks
+            .iter()
+            .filter_map(|task| {
+                self.task_map_image_size(task, ctx)
+                    .map(|size| (*task, size))
+            })
+            .collect()
+    }
+
+    /// 读取任务浮窗的保存位置；第一次出现时按地图图片大小和错开的默认位置摆放。
     fn ensure_map_window_layout(
         &mut self,
         task: &'static str,
         index: usize,
         ctx: &egui::Context,
+        image_size: Option<Vec2>,
     ) -> MapWindowLayout {
         if let Some(layout) = self.config.map_window_layouts.get(task) {
             return *layout;
         }
-        let size = MAP_WINDOW_SIZE;
-        let base = centered_window_position(ctx, size);
         let monitor = ctx.input(|input| {
             input
                 .viewport()
                 .monitor_size
                 .unwrap_or_else(|| vec2(1920.0, 1080.0))
         });
+        let size = image_size
+            .map(|size| fit_window_size(size, monitor))
+            .unwrap_or(MAP_WINDOW_SIZE);
+        let base = centered_window_position(ctx, size);
         // 默认把各任务浮窗横向排开，围绕主窗口居中；屏幕放不下时再错开。
         const GAP: f32 = 12.0;
         let count = self.active_tasks().len().max(1) as f32;
@@ -169,21 +204,67 @@ impl MhxyApp {
         }
         let tasks = self.active_tasks();
         self.map_windows.retain(|task, _| tasks.contains(task));
+        let image_sizes = self.task_map_image_sizes(&tasks, ctx);
         for (index, task) in tasks.iter().copied().enumerate() {
             if self.closed_map_windows.contains(task) {
                 continue;
             }
-            let layout = self.ensure_map_window_layout(task, index, ctx);
+            let image_size = image_sizes.get(&task).copied();
+            let mut layout = self.ensure_map_window_layout(task, index, ctx, image_size);
+            // 第一次识别到地图时把窗口收紧到图片大小；之后尊重用户手动调整的尺寸。
+            // 旧版本存下来的固定 560×460 视为未调整过，迁移时也贴合图片。
+            let mut fitted_now = false;
+            {
+                let legacy_default = (layout.width - MAP_WINDOW_SIZE.x).abs() < 1.0
+                    && (layout.height - MAP_WINDOW_SIZE.y).abs() < 1.0;
+                let runtime = self
+                    .map_windows
+                    .entry(task)
+                    .or_insert_with(|| MapWindowRuntime {
+                        spawn_layout: Some(layout),
+                        sized_to_map: image_size.is_some() && !legacy_default,
+                        ..Default::default()
+                    });
+                if let Some(size) = image_size {
+                    if !runtime.sized_to_map {
+                        let monitor = ctx.input(|input| {
+                            input
+                                .viewport()
+                                .monitor_size
+                                .unwrap_or_else(|| vec2(1920.0, 1080.0))
+                        });
+                        let size = fit_window_size(size, monitor);
+                        layout.width = size.x;
+                        layout.height = size.y;
+                        runtime.sized_to_map = true;
+                        runtime.spawn_layout = Some(layout);
+                        fitted_now = true;
+                    }
+                }
+            }
+            if fitted_now {
+                self.config
+                    .map_window_layouts
+                    .insert(task.to_string(), layout);
+                self.persist();
+            }
+            // builder 的几何值只在创建 / 重置 / 首次贴合图片时更新。
+            // 不能每帧把窗口实际大小写回去：DPI 取整会让窗口反复收到
+            // InnerSize / OuterPosition，拖动缩放时就会不停抖动。
+            let spawn = self
+                .map_windows
+                .get(&task)
+                .and_then(|runtime| runtime.spawn_layout)
+                .unwrap_or(layout);
             let title = map_window_title(task);
             let mut builder = egui::ViewportBuilder::default()
                 .with_title(title.as_str())
                 .with_decorations(false)
                 .with_transparent(true)
                 .with_resizable(true)
-                .with_inner_size(vec2(layout.width, layout.height))
+                .with_inner_size(vec2(spawn.width, spawn.height))
                 .with_min_inner_size(MAP_WINDOW_MIN_SIZE)
-                // 只在建立窗口时定位，之后每个窗口各自记住用户拖动的位置。
-                .with_position(pos2(layout.x, layout.y));
+                .with_position(pos2(spawn.x, spawn.y));
             if self.config.map_window_on_top {
                 builder = builder.with_always_on_top();
             }
@@ -231,32 +312,30 @@ impl MhxyApp {
             .clamp(MAP_WINDOW_MIN_OPACITY, 1.0);
         let alpha = self.map_window_alpha();
         let rect = ui.max_rect();
-        let painter = ui.painter();
-        painter.rect_filled(
-            rect,
-            CornerRadius::same(8),
-            Color32::from_rgb(15, 20, 28).gamma_multiply(opacity),
-        );
-        painter.rect_stroke(
-            rect.shrink(0.5),
-            CornerRadius::same(8),
-            egui::Stroke::new(1.0, theme::border().gamma_multiply(opacity)),
-            egui::StrokeKind::Inside,
-        );
-
-        let content = rect.shrink(2.0);
-        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(content));
-        self.task_panel_with(&mut child, task, alpha, false);
+        // 不要背景：窗口里画什么就是地图图片本身。
+        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect));
+        self.task_panel_with(&mut child, task, alpha, false, true);
         if !self
             .tasks
             .get(task)
             .is_some_and(|state| state.location.is_some())
         {
+            // 透明背景下文字直接叠在桌面 / 游戏上，加一层阴影保证可读。
+            let text_pos = rect.center_bottom() - vec2(0.0, 16.0);
+            let text = "等待识别到任务…";
+            let font = FontId::proportional(14.0);
             child.painter().text(
-                content.center_bottom() - vec2(0.0, 12.0),
+                text_pos + vec2(1.0, 1.0),
                 Align2::CENTER_CENTER,
-                "等待识别到任务…",
-                FontId::proportional(13.0),
+                text,
+                font.clone(),
+                Color32::from_black_alpha(190).gamma_multiply(opacity),
+            );
+            child.painter().text(
+                text_pos,
+                Align2::CENTER_CENTER,
+                text,
+                font,
                 theme::muted().gamma_multiply(opacity),
             );
         }
@@ -462,6 +541,16 @@ impl MhxyApp {
             self.set_map_window(false);
         }
     }
+}
+
+/// 按图片大小开窗，但不超过当前显示器、也不小于浮窗下限。
+fn fit_window_size(size: Vec2, monitor: Vec2) -> Vec2 {
+    vec2(
+        size.x
+            .clamp(MAP_WINDOW_MIN_SIZE.x, monitor.x.max(MAP_WINDOW_MIN_SIZE.x)),
+        size.y
+            .clamp(MAP_WINDOW_MIN_SIZE.y, monitor.y.max(MAP_WINDOW_MIN_SIZE.y)),
+    )
 }
 
 /// 指针落在窗口哪条边 / 哪个角：角落优先于单边。
