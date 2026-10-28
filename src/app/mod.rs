@@ -967,60 +967,66 @@ impl MhxyApp {
         self.last_scan = Some(Instant::now());
         // 分辨率变了就切换识别区域（每个分辨率记住一套）。
         self.sync_region_for_size(capture::client_size(handle));
+        // 截图 / 裁剪 / 预处理 / 放大都很耗 CPU（调试构建尤其明显），
+        // 放到后台线程做，避免每次识别都把 UI 卡住一下，拖窗口时特别明显。
         let region = self.config.task_region;
-        let full = match capture::capture_client(handle, region) {
-            Ok(full) => full,
-            Err(err) => {
-                self.log_detail(format!("截图失败（{window_title}）：{err}"));
-                self.notice = Some(err.clone());
-                if err.contains("关闭") || err.contains("最小化") {
-                    self.set_window(None);
-                }
-                return;
-            }
-        };
-        // 主区域和备用区域分别预处理，再上下拼接送一次 OCR。
-        let mut panels = vec![preprocess::apply(
-            capture::crop_task_region(&full, region),
-            self.preprocess_pipeline_for(false),
-            self.config.preprocess_color,
-            self.config.preprocess_tolerance,
-        )];
-        if self.config.extra_region_enabled {
-            panels.push(preprocess::apply(
-                capture::crop_task_region(&full, self.config.extra_task_region),
-                self.preprocess_pipeline_for(true),
-                self.config.extra_preprocess_color,
-                self.config.extra_preprocess_tolerance,
-            ));
-        }
-        // 放大后再送 OCR：任务栏文字小的时候，检测模型更容易漏掉。
-        let panel = preprocess::upscale(&capture::stack_images(&panels), self.config.ocr_upscale);
-        self.update_preview(full);
-        self.notice = None;
-        let signature = hash_image(&panel);
-        // 快捷键 / 「立即识别一次」是明确的用户意图，不能因为画面没变就跳过，
-        // 否则按下去毫无反应（自动识别才需要去重）。
-        if !force && self.last_signature == Some(signature) {
-            self.log_detail(format!("{window_title}：识别区域未变化，跳过"));
-            return;
-        }
+        let extra_region = self.config.extra_task_region;
+        let extra_enabled = self.config.extra_region_enabled;
+        let main_pipeline = self.preprocess_pipeline_for(false);
+        let extra_pipeline = self.preprocess_pipeline_for(true);
+        let main_color = self.config.preprocess_color;
+        let main_tolerance = self.config.preprocess_tolerance;
+        let extra_color = self.config.extra_preprocess_color;
+        let extra_tolerance = self.config.extra_preprocess_tolerance;
+        let upscale = self.config.ocr_upscale;
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
-        self.pending_signature = Some(signature);
+        self.pending_signature = None;
         self.busy = true;
-
-        if self.config.ocr_mode == "remote" {
-            let png = match ocr::encode_png(&panel) {
-                Ok(png) => png,
-                Err(err) => {
-                    self.log_detail(format!("编码截图失败：{err}"));
-                    self.notice = Some(err);
-                    self.pending_signature = None;
-                    self.busy = false;
-                    return;
+        let sender = self.sender.clone();
+        let ctx = self.ctx.clone();
+        let title = window_title.clone();
+        thread::spawn(move || {
+            let result = (|| -> Result<ocr::Captured, String> {
+                let full = capture::capture_client(handle, region)?;
+                // 主区域和备用区域分别预处理，再上下拼接送一次 OCR。
+                let mut panels = vec![preprocess::apply(
+                    capture::crop_task_region(&full, region),
+                    main_pipeline,
+                    main_color,
+                    main_tolerance,
+                )];
+                if extra_enabled {
+                    panels.push(preprocess::apply(
+                        capture::crop_task_region(&full, extra_region),
+                        extra_pipeline,
+                        extra_color,
+                        extra_tolerance,
+                    ));
                 }
-            };
+                // 放大后再送 OCR：任务栏文字小的时候，检测模型更容易漏掉。
+                let panel = preprocess::upscale(&capture::stack_images(&panels), upscale);
+                let signature = hash_image(&panel);
+                Ok(ocr::Captured {
+                    full,
+                    panel,
+                    signature,
+                })
+            })();
+            let _ = sender.send(OcrEvent::Captured {
+                generation,
+                window_title: title,
+                force,
+                result,
+            });
+            ctx.request_repaint();
+        });
+    }
+
+    /// 拿到后台线程的截图后，按当前识别方式提交 OCR。
+    /// PNG 编码和远端请求都在后台线程里做，UI 线程只负责发结果。
+    fn start_ocr(&mut self, generation: u64, panel: image::RgbImage, window_title: &str) {
+        if self.config.ocr_mode == "remote" {
             let url = self.config.api_url.clone();
             let token = self.config.api_token.clone();
             let format = self.config.api_format.clone();
@@ -1028,7 +1034,9 @@ impl MhxyApp {
             let ctx = self.ctx.clone();
             self.log_detail(format!("{window_title}：请求远端 PP-OCR {url}"));
             thread::spawn(move || {
-                let result = ocr::remote_recognize(&url, &token, &format, &png);
+                let result = ocr::encode_png(&panel)
+                    .map_err(|err| format!("编码截图失败：{err}"))
+                    .and_then(|png| ocr::remote_recognize(&url, &token, &format, &png));
                 let _ = sender.send(OcrEvent::Remote { generation, result });
                 ctx.request_repaint();
             });
@@ -1047,6 +1055,40 @@ impl MhxyApp {
     fn poll_events(&mut self) {
         while let Ok(event) = self.receiver.try_recv() {
             let (generation, result) = match event {
+                OcrEvent::Captured {
+                    generation,
+                    window_title,
+                    force,
+                    result,
+                } => {
+                    if generation != self.generation {
+                        continue;
+                    }
+                    match result {
+                        Err(err) => {
+                            self.busy = false;
+                            self.log_detail(format!("截图失败（{window_title}）：{err}"));
+                            self.notice = Some(err.clone());
+                            if err.contains("关闭") || err.contains("最小化") {
+                                self.set_window(None);
+                            }
+                        }
+                        Ok(captured) => {
+                            self.update_preview(captured.full);
+                            self.notice = None;
+                            // 快捷键 / 「立即识别一次」是明确的用户意图，不能因为画面
+                            // 没变就跳过；自动识别才需要去重。
+                            if !force && self.last_signature == Some(captured.signature) {
+                                self.busy = false;
+                                self.log_detail(format!("{window_title}：识别区域未变化，跳过"));
+                                continue;
+                            }
+                            self.pending_signature = Some(captured.signature);
+                            self.start_ocr(generation, captured.panel, &window_title);
+                        }
+                    }
+                    continue;
+                }
                 OcrEvent::Local { generation, result } => (generation, result),
                 OcrEvent::Remote { generation, result } => (generation, result),
                 OcrEvent::Test { result } => {

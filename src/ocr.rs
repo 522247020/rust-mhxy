@@ -22,8 +22,24 @@ pub struct OcrText {
     pub elapsed_secs: f64,
 }
 
+/// 后台线程完成「截图 → 裁剪 → 预处理 → 放大」后的结果。
+/// 把这些像素操作从 UI 线程拿走，避免每次识别时窗口拖动卡顿。
+#[derive(Debug)]
+pub struct Captured {
+    pub full: RgbImage,
+    pub panel: RgbImage,
+    pub signature: u64,
+}
+
 #[derive(Debug)]
 pub enum OcrEvent {
+    /// 截图 / 预处理完成，UI 再决定是否真的送去 OCR。
+    Captured {
+        generation: u64,
+        window_title: String,
+        force: bool,
+        result: Result<Captured, String>,
+    },
     Local {
         generation: u64,
         result: Result<OcrText, String>,

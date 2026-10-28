@@ -37,6 +37,13 @@ pub(super) struct MapWindowRuntime {
     map_aspect: Option<f32>,
     /// 正在拖边缩放的起点信息；系统 BeginResize 不能锁比例，所以自己算。
     resize_drag: Option<ResizeDrag>,
+    /// 上一帧是否正在拖动（移动或缩放）：拖动期间不写配置，避免卡顿。
+    interacting: bool,
+    /// 上一帧鼠标是否按在浮窗上；用于在按下瞬间就开始拖动 / 缩放。
+    pointer_down: bool,
+    /// 上一次下发缩放命令的时间：限制到约 60Hz，避免鼠标高回报率时
+    /// 每来一个事件就重建一次窗口表面，反而更卡。
+    last_resize_at: Option<Instant>,
     shadow_attempts: u8,
     /// 上一帧是否最小化：无边框工具窗口没有任务栏按钮，Win+D 之后必须自己还原。
     minimized: bool,
@@ -389,32 +396,48 @@ impl MhxyApp {
         let pointer = ctx
             .input(|input| input.pointer.interact_pos())
             .or_else(|| response.hover_pos());
-        if response.hovered() {
-            if let Some(pos) = pointer {
+        let hovering_close = pointer.is_some_and(|pos| close_rect.contains(pos));
+        if let Some(pos) = pointer {
+            if hovering_close {
+                ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+            } else if let Some(direction) = resize_direction(rect, pos, RESIZE_BORDER) {
+                ctx.set_cursor_icon(cursor_for(direction));
+            }
+        }
+        // 关闭按钮直接画在地图上，不再嵌套 Button：整窗拖动热区会和它抢点击，
+        // 之前按钮刚出现就被热区顶掉，看起来就是“点了没反应”。
+        if pointer.is_some_and(|pos| rect.contains(pos)) {
+            let painter = ui.painter();
+            let alpha = if hovering_close { 210 } else { 140 };
+            painter.rect_filled(
+                close_rect,
+                CornerRadius::same(4),
+                Color32::from_black_alpha(alpha).gamma_multiply(opacity),
+            );
+            painter.text(
+                close_rect.center(),
+                Align2::CENTER_CENTER,
+                "✕",
+                FontId::proportional(13.0),
+                Color32::WHITE.gamma_multiply(opacity),
+            );
+        }
+        if response.clicked() {
+            if let Some(pos) = response.interact_pointer_pos().or(pointer) {
                 if close_rect.contains(pos) {
-                    ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
-                } else if let Some(direction) = resize_direction(rect, pos, RESIZE_BORDER) {
-                    ctx.set_cursor_icon(cursor_for(direction));
+                    // 只关掉这个任务的浮窗，其他任务的窗口保持不动。
+                    self.set_map_window_visible(task, false);
+                    return;
                 }
             }
         }
-        // 关闭按钮后画，保证盖在拖动热区上面能正常点到；只在悬停时出现。
-        if response.hovered() {
-            let button = egui::Button::new(
-                egui::RichText::new("✕")
-                    .size(12.0)
-                    .color(Color32::WHITE.gamma_multiply(opacity)),
-            )
-            .fill(Color32::from_black_alpha(150).gamma_multiply(opacity))
-            .corner_radius(4.0)
-            .min_size(CLOSE_BUTTON_SIZE);
-            if ui.put(close_rect, button).clicked() {
-                // 只关掉这个任务的浮窗，其他任务的窗口保持不动。
-                self.set_map_window_visible(task, false);
-                return;
-            }
-        }
-        if response.drag_started() {
+        let pointer_down = response.is_pointer_button_down_on();
+        let was_down = self
+            .map_windows
+            .get(&task)
+            .is_some_and(|runtime| runtime.pointer_down);
+        // 按下就立即响应，不等 egui 的拖动阈值，避免窗口“慢半拍”。
+        if pointer_down && !was_down {
             if let Some(pos) = pointer {
                 if !close_rect.contains(pos) {
                     match resize_direction(rect, pos, RESIZE_BORDER) {
@@ -434,29 +457,40 @@ impl MhxyApp {
                                     start_outer: outer,
                                     aspect,
                                 };
-                                self.map_windows.entry(task).or_default().resize_drag = Some(drag);
+                                let runtime = self.map_windows.entry(task).or_default();
+                                runtime.resize_drag = Some(drag);
+                                runtime.last_resize_at = None;
                             } else {
                                 ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(
                                     direction,
                                 ));
                             }
                         }
-                        None => ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag),
+                        None => {
+                            // egui-winit 在窗口没有焦点时会忽略 StartDrag；
+                            // 先激活一次，保证第一次按下就能拖动。
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                        }
                     }
                 }
             }
         }
-        // 等比缩放：拖动过程中每帧按鼠标位置算尺寸，对边 / 对角保持不动。
+        // 等比缩放：按住期间每帧按鼠标位置算尺寸，对边 / 对角保持不动。
         let drag = self
             .map_windows
             .get(&task)
             .and_then(|runtime| runtime.resize_drag);
         if let Some(drag) = drag {
-            if response.dragged() {
+            if pointer_down {
                 if let Some(pos) = ctx.input(|input| input.pointer.interact_pos()) {
                     let outer = ctx
                         .input(|input| input.viewport().outer_rect)
                         .unwrap_or(drag.start_outer);
+                    let current_size = ctx
+                        .input(|input| input.viewport().inner_rect)
+                        .map(|rect| rect.size())
+                        .unwrap_or_else(|| outer.size());
                     let monitor = ctx.input(|input| {
                         input
                             .viewport()
@@ -464,12 +498,41 @@ impl MhxyApp {
                             .unwrap_or_else(|| vec2(1920.0, 1080.0))
                     });
                     let target = aspect_resize_rect(&drag, outer.min + pos.to_vec2(), monitor);
-                    // 先移动再改大小：尺寸以左上角为基准，移动后的左上角才是最终位置。
-                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(target.min));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(target.size()));
+                    // 限制缩放命令频率：高回报率鼠标每个事件都改一次窗口大小会让
+                    // 透明窗口不断重建表面，看起来反而一顿一顿的。
+                    let now = Instant::now();
+                    let due = self
+                        .map_windows
+                        .get(&task)
+                        .and_then(|runtime| runtime.last_resize_at)
+                        .is_none_or(|last| now.duration_since(last) >= Duration::from_millis(16));
+                    let mut sent = false;
+                    if due {
+                        // 只有目标真的变了才下命令。
+                        if (target.min - outer.min).length() > 1.0 {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(target.min));
+                            sent = true;
+                        }
+                        if (target.size() - current_size).length() > 1.0 {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(target.size()));
+                            sent = true;
+                        }
+                    }
+                    if sent {
+                        if let Some(runtime) = self.map_windows.get_mut(&task) {
+                            runtime.last_resize_at = Some(now);
+                        }
+                    }
+                    ctx.request_repaint();
                 }
-            } else if response.drag_stopped() {
-                self.map_windows.entry(task).or_default().resize_drag = None;
+            }
+        }
+        if let Some(runtime) = self.map_windows.get_mut(&task) {
+            // 下一帧 sync 看到这个标记就不写配置，拖动结束后再一次性保存。
+            runtime.interacting = pointer_down;
+            runtime.pointer_down = pointer_down;
+            if !pointer_down {
+                runtime.resize_drag = None;
             }
         }
     }
@@ -498,6 +561,14 @@ impl MhxyApp {
             let viewport = input.viewport();
             (viewport.outer_rect, viewport.inner_rect)
         });
+        // 拖动 / 缩放过程中不往配置里写几何值，结束后下一帧再一次性保存。
+        if self
+            .map_windows
+            .get(task)
+            .is_some_and(|runtime| runtime.interacting)
+        {
+            return;
+        }
         let mut layout =
             self.config
                 .map_window_layouts
