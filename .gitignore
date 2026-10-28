@@ -2,6 +2,8 @@
 /config.json
 /flight_flags.json
 *.tmp
+/.cargo/tmp/*
+!/.cargo/tmp/.gitkeep
 /dist
 /.ort-cache
 /.ocr-models
