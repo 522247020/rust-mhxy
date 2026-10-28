@@ -767,6 +767,72 @@ fn map_window_resize_hit_test_prefers_corners_then_edges() {
 }
 
 #[test]
+fn map_window_resize_keeps_the_map_aspect_ratio() {
+    use egui::ResizeDirection;
+    let start = Rect::from_min_size(pos2(100.0, 200.0), vec2(400.0, 300.0));
+    let start_pointer = pos2(500.0, 500.0);
+    let aspect = 400.0 / 300.0;
+    let monitor = vec2(1920.0, 1080.0);
+
+    // 拖右边：宽度 +100，高度按 4:3 增至 375，左上角不动。
+    let rect = map_window::resize_rect_keeping_aspect(
+        ResizeDirection::East,
+        start,
+        start_pointer,
+        aspect,
+        start_pointer + vec2(100.0, 0.0),
+        monitor,
+    );
+    assert!((rect.width() - 500.0).abs() < 0.05, "{rect:?}");
+    assert!((rect.height() - 375.0).abs() < 0.05, "{rect:?}");
+    assert_eq!(rect.min, start.min);
+
+    // 拖左边：右边界固定，宽度 / 高度同比例变化。
+    let rect = map_window::resize_rect_keeping_aspect(
+        ResizeDirection::West,
+        start,
+        start_pointer,
+        aspect,
+        start_pointer - vec2(50.0, 0.0),
+        monitor,
+    );
+    assert!((rect.width() - 450.0).abs() < 0.05, "{rect:?}");
+    assert!((rect.height() - 337.5).abs() < 0.05, "{rect:?}");
+    assert!((rect.right() - start.right()).abs() < 0.05, "{rect:?}");
+
+    // 拖上边：下边界固定，高度主导宽度。
+    let rect = map_window::resize_rect_keeping_aspect(
+        ResizeDirection::North,
+        start,
+        start_pointer,
+        aspect,
+        start_pointer - vec2(0.0, 60.0),
+        monitor,
+    );
+    assert!((rect.height() - 360.0).abs() < 0.05, "{rect:?}");
+    assert!((rect.width() - 480.0).abs() < 0.05, "{rect:?}");
+    assert!((rect.bottom() - start.bottom()).abs() < 0.05, "{rect:?}");
+
+    // 角落拖拽也保持地图比例，并按显示器限制最大尺寸。
+    let rect = map_window::resize_rect_keeping_aspect(
+        ResizeDirection::SouthEast,
+        start,
+        start_pointer,
+        aspect,
+        start_pointer + vec2(5000.0, 5000.0),
+        monitor,
+    );
+    assert!(
+        (rect.width() / rect.height() - aspect).abs() < 0.001,
+        "角落缩放后比例应保持不变：{rect:?}"
+    );
+    assert!(
+        rect.width() <= monitor.x && rect.height() <= monitor.y,
+        "{rect:?}"
+    );
+}
+
+#[test]
 fn map_window_opacity_stays_in_usable_range() {
     let mut app = app();
     app.config.map_window_opacity = 0.0;

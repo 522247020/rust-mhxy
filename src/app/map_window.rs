@@ -33,9 +33,25 @@ pub(super) struct MapWindowRuntime {
     spawn_layout: Option<MapWindowLayout>,
     /// 是否已经按地图图片大小收紧过窗口；只在第一次拿到地图时做一次。
     sized_to_map: bool,
+    /// 当前地图图片的宽高比，用来锁定等比缩放。
+    map_aspect: Option<f32>,
+    /// 正在拖边缩放的起点信息；系统 BeginResize 不能锁比例，所以自己算。
+    resize_drag: Option<ResizeDrag>,
     shadow_attempts: u8,
     /// 上一帧是否最小化：无边框工具窗口没有任务栏按钮，Win+D 之后必须自己还原。
     minimized: bool,
+}
+
+/// 一次等比缩放手势的起点。
+#[derive(Clone, Copy)]
+struct ResizeDrag {
+    direction: egui::ResizeDirection,
+    /// 按下时鼠标在屏幕上的位置（逻辑像素）。
+    start_pointer: egui::Pos2,
+    /// 按下时的窗口外框，用来固定对边 / 对角。
+    start_outer: Rect,
+    /// 要锁定的宽高比（地图图片的宽 / 高）。
+    aspect: f32,
 }
 
 pub(super) fn map_window_id(task: &str) -> egui::ViewportId {
@@ -211,9 +227,9 @@ impl MhxyApp {
             }
             let image_size = image_sizes.get(&task).copied();
             let mut layout = self.ensure_map_window_layout(task, index, ctx, image_size);
-            // 第一次识别到地图时把窗口收紧到图片大小；之后尊重用户手动调整的尺寸。
+            // 地图图片确定后：首次贴合图片大小；之后保持图片宽高比。
             // 旧版本存下来的固定 560×460 视为未调整过，迁移时也贴合图片。
-            let mut fitted_now = false;
+            let mut layout_changed = false;
             {
                 let legacy_default = (layout.width - MAP_WINDOW_SIZE.x).abs() < 1.0
                     && (layout.height - MAP_WINDOW_SIZE.y).abs() < 1.0;
@@ -226,23 +242,40 @@ impl MhxyApp {
                         ..Default::default()
                     });
                 if let Some(size) = image_size {
-                    if !runtime.sized_to_map {
+                    let aspect = size.x / size.y.max(1.0);
+                    let aspect_changed = runtime
+                        .map_aspect
+                        .is_none_or(|old| (old - aspect).abs() > 0.005);
+                    if aspect_changed {
                         let monitor = ctx.input(|input| {
                             input
                                 .viewport()
                                 .monitor_size
                                 .unwrap_or_else(|| vec2(1920.0, 1080.0))
                         });
-                        let size = fit_window_size(size, monitor);
-                        layout.width = size.x;
-                        layout.height = size.y;
+                        // 第一次拿到地图且窗口还是默认尺寸：直接用图片大小；
+                        // 否则保留用户已经调好的宽度，只把高度修正成等比。
+                        let current_aspect = layout.width / layout.height.max(1.0);
+                        if !runtime.sized_to_map && legacy_default {
+                            let size = fit_window_size(size, monitor);
+                            layout.width = size.x;
+                            layout.height = size.y;
+                            layout_changed = true;
+                        } else if (current_aspect - aspect).abs() > 0.005 {
+                            let size = aspect_size(layout.width, aspect, monitor);
+                            layout.width = size.x;
+                            layout.height = size.y;
+                            layout_changed = true;
+                        }
                         runtime.sized_to_map = true;
-                        runtime.spawn_layout = Some(layout);
-                        fitted_now = true;
+                        runtime.map_aspect = Some(aspect);
+                        if layout_changed {
+                            runtime.spawn_layout = Some(layout);
+                        }
                     }
                 }
             }
-            if fitted_now {
+            if layout_changed {
                 self.config
                     .map_window_layouts
                     .insert(task.to_string(), layout);
@@ -353,7 +386,9 @@ impl MhxyApp {
             ),
             CLOSE_BUTTON_SIZE,
         );
-        let pointer = response.hover_pos();
+        let pointer = ctx
+            .input(|input| input.pointer.interact_pos())
+            .or_else(|| response.hover_pos());
         if response.hovered() {
             if let Some(pos) = pointer {
                 if close_rect.contains(pos) {
@@ -380,15 +415,61 @@ impl MhxyApp {
             }
         }
         if response.drag_started() {
-            if let Some(pos) = response.interact_pointer_pos() {
+            if let Some(pos) = pointer {
                 if !close_rect.contains(pos) {
                     match resize_direction(rect, pos, RESIZE_BORDER) {
                         Some(direction) => {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(direction))
+                            // 系统 BeginResize 只能自由缩放，这里自己记录起点，
+                            // 后续每帧按地图宽高比算目标尺寸。
+                            if let Some(outer) = ctx.input(|input| input.viewport().outer_rect) {
+                                let aspect = self
+                                    .map_windows
+                                    .get(&task)
+                                    .and_then(|runtime| runtime.map_aspect)
+                                    .filter(|aspect| *aspect > 0.05)
+                                    .unwrap_or_else(|| outer.width() / outer.height().max(1.0));
+                                let drag = ResizeDrag {
+                                    direction,
+                                    start_pointer: outer.min + pos.to_vec2(),
+                                    start_outer: outer,
+                                    aspect,
+                                };
+                                self.map_windows.entry(task).or_default().resize_drag = Some(drag);
+                            } else {
+                                ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(
+                                    direction,
+                                ));
+                            }
                         }
                         None => ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag),
                     }
                 }
+            }
+        }
+        // 等比缩放：拖动过程中每帧按鼠标位置算尺寸，对边 / 对角保持不动。
+        let drag = self
+            .map_windows
+            .get(&task)
+            .and_then(|runtime| runtime.resize_drag);
+        if let Some(drag) = drag {
+            if response.dragged() {
+                if let Some(pos) = ctx.input(|input| input.pointer.interact_pos()) {
+                    let outer = ctx
+                        .input(|input| input.viewport().outer_rect)
+                        .unwrap_or(drag.start_outer);
+                    let monitor = ctx.input(|input| {
+                        input
+                            .viewport()
+                            .monitor_size
+                            .unwrap_or_else(|| vec2(1920.0, 1080.0))
+                    });
+                    let target = aspect_resize_rect(&drag, outer.min + pos.to_vec2(), monitor);
+                    // 先移动再改大小：尺寸以左上角为基准，移动后的左上角才是最终位置。
+                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(target.min));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(target.size()));
+                }
+            } else if response.drag_stopped() {
+                self.map_windows.entry(task).or_default().resize_drag = None;
             }
         }
     }
@@ -483,7 +564,7 @@ impl MhxyApp {
         );
         // 提示文字按可用宽度换行，主窗口变窄时不会冲出面板。
         let hint = painter.layout(
-            "每个任务一个浮窗，可分别拖动、缩放；透明度、置顶和锁定在「显示与布局」里统一调整"
+            "每个任务一个浮窗，可分别拖动、等比缩放；透明度、置顶和锁定在「显示与布局」里统一调整"
                 .to_owned(),
             FontId::proportional(13.0),
             theme::muted(),
@@ -545,12 +626,110 @@ impl MhxyApp {
 
 /// 按图片大小开窗，但不超过当前显示器、也不小于浮窗下限。
 fn fit_window_size(size: Vec2, monitor: Vec2) -> Vec2 {
-    vec2(
-        size.x
-            .clamp(MAP_WINDOW_MIN_SIZE.x, monitor.x.max(MAP_WINDOW_MIN_SIZE.x)),
-        size.y
-            .clamp(MAP_WINDOW_MIN_SIZE.y, monitor.y.max(MAP_WINDOW_MIN_SIZE.y)),
+    // 按图片大小开窗时也要保持宽高比，避免被显示器 / 下限裁得比例不对。
+    aspect_size(size.x.max(1.0), size.x / size.y.max(1.0), monitor)
+}
+
+/// 保持宽高比，把宽度限制在浮窗下限和当前显示器范围内。
+fn aspect_size(width: f32, aspect: f32, monitor: Vec2) -> Vec2 {
+    let aspect = aspect.max(0.05);
+    let min_width = MAP_WINDOW_MIN_SIZE.x.max(MAP_WINDOW_MIN_SIZE.y * aspect);
+    let max_width = monitor.x.min(monitor.y * aspect).max(min_width);
+    let width = if width.is_finite() {
+        width.clamp(min_width, max_width)
+    } else {
+        min_width
+    };
+    vec2(width, width / aspect)
+}
+
+/// 测试用：直接按手势参数验证等比缩放计算。
+#[cfg(test)]
+pub(super) fn resize_rect_keeping_aspect(
+    direction: egui::ResizeDirection,
+    start_outer: Rect,
+    start_pointer: egui::Pos2,
+    aspect: f32,
+    pointer: egui::Pos2,
+    monitor: Vec2,
+) -> Rect {
+    aspect_resize_rect(
+        &ResizeDrag {
+            direction,
+            start_pointer,
+            start_outer,
+            aspect,
+        },
+        pointer,
+        monitor,
     )
+}
+
+/// 根据拖边方向和鼠标屏幕位置，算出等比缩放后的窗口外框。
+/// 拖左边 / 上边时固定右 / 下边，其余方向固定左上角。
+fn aspect_resize_rect(drag: &ResizeDrag, pointer: egui::Pos2, monitor: Vec2) -> Rect {
+    use egui::ResizeDirection as Direction;
+    let start = drag.start_outer;
+    let dx = pointer.x - drag.start_pointer.x;
+    let dy = pointer.y - drag.start_pointer.y;
+    let has_left = matches!(
+        drag.direction,
+        Direction::West | Direction::NorthWest | Direction::SouthWest
+    );
+    let has_right = matches!(
+        drag.direction,
+        Direction::East | Direction::NorthEast | Direction::SouthEast
+    );
+    let has_top = matches!(
+        drag.direction,
+        Direction::North | Direction::NorthWest | Direction::NorthEast
+    );
+    let has_bottom = matches!(
+        drag.direction,
+        Direction::South | Direction::SouthWest | Direction::SouthEast
+    );
+    let start_width = start.width().max(1.0);
+    let start_height = start.height().max(1.0);
+
+    let scale_x = if has_left {
+        (start_width - dx) / start_width
+    } else if has_right {
+        (start_width + dx) / start_width
+    } else {
+        1.0
+    };
+    let scale_y = if has_top {
+        (start_height - dy) / start_height
+    } else if has_bottom {
+        (start_height + dy) / start_height
+    } else {
+        1.0
+    };
+    let scale = match (has_left || has_right, has_top || has_bottom) {
+        // 角落：以鼠标位移更明显的那个方向为准，避免两轴比例互相打架。
+        (true, true) => {
+            if (scale_x - 1.0).abs() >= (scale_y - 1.0).abs() {
+                scale_x
+            } else {
+                scale_y
+            }
+        }
+        (true, false) => scale_x,
+        (false, true) => scale_y,
+        (false, false) => 1.0,
+    };
+    let size = aspect_size(start_width * scale, drag.aspect, monitor);
+    let x = if has_left {
+        start.right() - size.x
+    } else {
+        start.left()
+    };
+    let y = if has_top {
+        start.bottom() - size.y
+    } else {
+        start.top()
+    };
+    Rect::from_min_size(pos2(x, y), size)
 }
 
 /// 指针落在窗口哪条边 / 哪个角：角落优先于单边。
