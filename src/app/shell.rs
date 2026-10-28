@@ -99,7 +99,7 @@ impl MhxyApp {
             })
             .clicked()
         {
-            self.set_map_window(!self.config.map_window_enabled, ctx);
+            self.set_map_window(!self.config.map_window_enabled);
             ui.close();
         }
         if ui.button("精简界面").clicked() {
@@ -383,7 +383,7 @@ impl eframe::App for MhxyApp {
                                     .clicked()
                             {
                                 let enabled = !self.config.map_window_enabled;
-                                self.set_map_window(enabled, &ctx);
+                                self.set_map_window(enabled);
                             }
                             let on_top = self.config.on_top;
                             if !narrow
@@ -889,8 +889,8 @@ impl eframe::App for MhxyApp {
         if self.config.meditation_enabled {
             self.meditation_overlay(&ctx);
         }
-        // 地图浮窗：和主窗口同帧调度，关闭模式后下一帧就不再创建。
-        self.map_window(&ctx);
+        // 地图浮窗：和主窗口同帧调度所有任务窗口，关闭模式后下一帧就不再创建。
+        self.map_windows(&ctx);
         // 精简模式没有顶栏和状态栏，进入后给一个短暂的退出提示。
         if self.compact {
             if let Some(until) = self.compact_hint_until {

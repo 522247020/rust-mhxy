@@ -622,11 +622,11 @@ impl MhxyApp {
                 if ui
                     .checkbox(&mut map_window, "地图浮窗（无边框）")
                     .on_hover_text(
-                        "把地图从主窗口弹到可拖动、可缩放的独立浮窗里，适合叠在游戏画面上看",
+                        "每个任务类型单独一个浮窗，可分别拖动、缩放，适合叠在游戏画面上看",
                     )
                     .changed()
                 {
-                    self.set_map_window(map_window, ui.ctx());
+                    self.set_map_window(map_window);
                 }
                 if self.config.map_window_enabled {
                     let mut opacity = self
@@ -660,7 +660,11 @@ impl MhxyApp {
                     {
                         self.persist();
                     }
-                    if ui.button("重置浮窗位置与大小").clicked() {
+                    if ui
+                        .button("重置浮窗位置与大小")
+                        .on_hover_text("所有任务浮窗恢复默认大小，并逐个错开摆回主窗口中间")
+                        .clicked()
+                    {
                         self.reset_map_window_geometry(ui.ctx());
                     }
                 }
@@ -864,7 +868,7 @@ impl MhxyApp {
             "3. 在「任务类型」里勾选要显示的任务，侧栏会自动出现对应地图面板。",
             "4. 基础区「设置识别区域」打开独立窗口，可调整任务栏截图区域并点击取点配置图色门控。",
             "5. 识别方式、方案、合成旗在顶栏「高级设置」里；打坐计时在顶栏「打坐」里。",
-            "6. 想把地图单独放一边，点顶栏「地图浮窗」弹出无边框浮窗，可拖动、缩放并调整透明度。",
+            "6. 想把地图单独放一边，点顶栏「地图浮窗」为每个任务各开一个无边框浮窗，可分别拖动、缩放并调整透明度。",
         ] {
             ui.label(egui::RichText::new(line).small());
         }
@@ -881,7 +885,7 @@ impl MhxyApp {
         for line in [
             "界面主题：顶栏「界面主题」可选跟随系统 / 亮色 / 暗色，默认跟随系统，系统切换亮暗时立即跟随。",
             "精简界面：顶栏「精简界面」隐藏按钮栏、状态栏和设置栏，只保留地图；按 Esc 恢复默认界面。",
-            "地图浮窗：顶栏「地图浮窗」把地图放到无边框窗口，拖动移动、拖边缘缩放，右上角 ✕ 关闭；透明度在侧栏「显示与布局」里调。",
+            "地图浮窗：顶栏「地图浮窗」为每个任务各开一个无边框窗口，可分别拖动移动、拖边缘缩放，右上角 ✕ 只关当前任务；透明度在侧栏「显示与布局」里调。",
             "置顶：让本窗口始终保持在其他窗口之上，方便对照游戏。",
         ] {
             ui.label(egui::RichText::new(line).small());

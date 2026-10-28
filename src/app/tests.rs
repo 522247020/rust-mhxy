@@ -655,44 +655,70 @@ fn entering_compact_mode_shows_exit_hint() {
 }
 
 #[test]
-fn map_window_mode_replaces_the_main_map_with_a_placeholder() {
+fn map_window_mode_gives_each_task_its_own_popout() {
     let mut app = app();
     let ctx = app.ctx.clone();
     let mut frame = eframe::Frame::_new_kittest();
+    let input = || egui::RawInput {
+        screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1120.0, 800.0))),
+        ..Default::default()
+    };
     assert!(!app.config.map_window_enabled, "地图浮窗默认关闭");
 
-    app.set_map_window(true, &ctx);
+    app.set_map_window(true);
     assert!(app.config.map_window_enabled);
-    let position = app
-        .config
-        .map_window_position
-        .expect("第一次打开时应给出默认位置");
-    assert!(position.0 >= 0.0 && position.1 >= 0.0);
-
-    let mut output = ctx.run_ui(
-        egui::RawInput {
-            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1120.0, 800.0))),
-            ..Default::default()
-        },
-        |ui| app.ui(ui, &mut frame),
-    );
+    let mut output = ctx.run_ui(input(), |ui| app.ui(ui, &mut frame));
     let texts = collect_texts(&output.shapes);
     assert!(
         texts.iter().any(|text| text == "地图已在独立浮窗中显示"),
         "开启浮窗后主窗口应显示占位说明：{texts:?}"
     );
     assert!(
-        texts.iter().any(|text| text == "关闭地图浮窗"),
-        "占位区应提供关闭入口：{texts:?}"
+        texts.iter().any(|text| text == "抓鬼浮窗：开"),
+        "占位区应为每个任务提供独立开关：{texts:?}"
+    );
+    assert!(
+        texts.iter().any(|text| text == "鬼王浮窗：开"),
+        "鬼王也应单独一个浮窗：{texts:?}"
     );
     output.textures_delta.clear();
 
-    app.set_map_window(false, &ctx);
+    let zhuagui = app
+        .config
+        .map_window_layouts
+        .get("抓鬼")
+        .copied()
+        .expect("抓鬼浮窗应有默认位置");
+    let ghost = app
+        .config
+        .map_window_layouts
+        .get("鬼王")
+        .copied()
+        .expect("鬼王浮窗应有默认位置");
+    assert!(
+        (zhuagui.x - ghost.x).abs() > 1.0 || (zhuagui.y - ghost.y).abs() > 1.0,
+        "两个任务的浮窗初始位置应错开，避免完全叠在一起"
+    );
+
+    // 单个任务浮窗可以独立关闭，不影响另一个任务。
+    app.set_map_window_visible("抓鬼", false);
+    assert!(!app.map_window_open("抓鬼"));
+    assert!(app.map_window_open("鬼王"));
+    let mut output = ctx.run_ui(input(), |ui| app.ui(ui, &mut frame));
+    let texts = collect_texts(&output.shapes);
+    assert!(texts.iter().any(|text| text == "抓鬼浮窗：关"));
+    assert!(texts.iter().any(|text| text == "鬼王浮窗：开"));
+    output.textures_delta.clear();
+
+    // 取消勾选鬼王后它的浮窗消失，但布局仍保留在配置里。
+    app.config.ghost_king_enabled = false;
+    assert!(!app.map_window_open("鬼王"));
+    app.set_map_window(false);
     assert!(!app.config.map_window_enabled);
-    assert_eq!(
-        app.config.map_window_position,
-        Some(position),
-        "关闭后应保留用户上次的位置"
+    assert!(
+        app.config.map_window_layouts.contains_key("抓鬼")
+            && app.config.map_window_layouts.contains_key("鬼王"),
+        "关闭浮窗模式不应丢掉各窗口的位置和大小"
     );
 }
 
@@ -741,7 +767,7 @@ fn map_window_resize_hit_test_prefers_corners_then_edges() {
 }
 
 #[test]
-fn map_window_opacity_and_size_stay_in_usable_range() {
+fn map_window_opacity_stays_in_usable_range() {
     let mut app = app();
     app.config.map_window_opacity = 0.0;
     assert_eq!(
@@ -751,12 +777,6 @@ fn map_window_opacity_and_size_stay_in_usable_range() {
     );
     app.config.map_window_opacity = 1.0;
     assert_eq!(app.map_window_alpha(), 255);
-    app.config.map_window_size = Some((50.0, 50.0));
-    assert_eq!(
-        app.map_window_size(),
-        map_window::MAP_WINDOW_MIN_SIZE,
-        "过小的浮窗尺寸应被抬到下限"
-    );
 }
 
 #[test]

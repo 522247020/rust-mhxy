@@ -237,16 +237,10 @@ pub struct MhxyApp {
     last_client_size: Option<(u32, u32)>,
     /// 悬浮窗去阴影的尝试次数；窗口重建后归零重试。
     meditation_shadow_attempts: u8,
-    /// 独立地图浮窗：最近一次同步给窗口的位置 / 大小，用于把用户拖动、
-    /// 缩放后的结果写回配置，避免每帧重复保存。
-    map_window_last_outer: Option<egui::Pos2>,
-    map_window_last_size: Option<Vec2>,
-    applied_map_window_on_top: Option<bool>,
-    applied_map_window_passthrough: Option<bool>,
-    map_window_shadow_attempts: u8,
-    /// 地图浮窗上一帧是否处于最小化：无边框工具窗口没有任务栏按钮，
-    /// Win+D 之后必须自己还原，否则用户再也找不回来。
-    map_window_minimized: bool,
+    /// 每个任务类型独立地图浮窗的运行时状态（位置 / 大小缓存、层级、最小化）。
+    map_windows: HashMap<&'static str, map_window::MapWindowRuntime>,
+    /// 用户手动关掉的浮窗任务类型；重新开启地图浮窗模式时清空。
+    closed_map_windows: HashSet<&'static str>,
     /// 悬浮窗上一帧是否处于最小化；用于只在「可见→最小化」边沿发一次还原命令。
     meditation_overlay_minimized: bool,
     /// 正在录制打坐计时的全局快捷键。
@@ -447,12 +441,8 @@ impl MhxyApp {
             meditation_pending_size: None,
             last_client_size: None,
             meditation_shadow_attempts: 0,
-            map_window_last_outer: None,
-            map_window_last_size: None,
-            applied_map_window_on_top: None,
-            applied_map_window_passthrough: None,
-            map_window_shadow_attempts: 0,
-            map_window_minimized: false,
+            map_windows: HashMap::new(),
+            closed_map_windows: HashSet::new(),
             meditation_overlay_minimized: false,
             meditation_recording_hotkey: false,
             flight_flags,
