@@ -871,7 +871,8 @@ fn aspect_size(width: f32, aspect: f32, monitor: Vec2) -> Vec2 {
 }
 
 /// 非 Windows 手工等比缩放回退的数据；Windows 直接由原生 WM_SIZING 处理。
-#[cfg(not(windows))]
+/// 纯数学部分测试也要跑，所以测试构建同样编译。
+#[cfg(any(test, not(windows)))]
 #[derive(Clone, Copy)]
 struct ResizeDrag {
     direction: egui::ResizeDirection,
@@ -881,7 +882,7 @@ struct ResizeDrag {
 }
 
 /// 测试用：验证非 Windows 手工缩放回退的纯数学约束。
-#[cfg(all(test, not(windows)))]
+#[cfg(test)]
 pub(super) fn resize_rect_keeping_aspect(
     direction: egui::ResizeDirection,
     start_outer: Rect,
@@ -904,7 +905,7 @@ pub(super) fn resize_rect_keeping_aspect(
 
 /// 根据拖边方向和鼠标屏幕位置，算出等比缩放后的窗口外框。
 /// 拖左边 / 上边时固定右 / 下边，其余方向固定左上角。
-#[cfg(not(windows))]
+#[cfg(any(test, not(windows)))]
 fn aspect_resize_rect(drag: &ResizeDrag, pointer: egui::Pos2, monitor: Vec2) -> Rect {
     use egui::ResizeDirection as Direction;
     let start = drag.start_outer;
@@ -971,7 +972,7 @@ fn aspect_resize_rect(drag: &ResizeDrag, pointer: egui::Pos2, monitor: Vec2) -> 
 }
 
 /// 指针落在窗口哪条边 / 哪个角：角落优先于单边。
-#[cfg(not(windows))]
+#[cfg(any(test, not(windows)))]
 pub(super) fn resize_direction(
     rect: Rect,
     pos: egui::Pos2,
