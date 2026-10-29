@@ -13,10 +13,18 @@ pub(super) const MAP_WINDOW_MIN_SIZE: Vec2 = Vec2::new(240.0, 180.0);
 /// 浮窗不透明度下限：0 会让窗口完全看不见，也找不回来。
 pub(super) const MAP_WINDOW_MIN_OPACITY: f32 = 0.1;
 /// 贴边多少像素算「拖动缩放」而不是「拖动窗口」。
+#[cfg(not(windows))]
 const RESIZE_BORDER: f32 = 6.0;
 /// 右上角关闭按钮的尺寸与边距。
 const CLOSE_BUTTON_SIZE: Vec2 = Vec2::new(20.0, 20.0);
 const CLOSE_BUTTON_MARGIN: f32 = 6.0;
+pub(super) const MAP_WIDTH_PRESETS: [(&str, f32); 5] = [
+    ("420 px", 420.0),
+    ("560 px", 560.0),
+    ("700 px", 700.0),
+    ("840 px", 840.0),
+    ("1120 px", 1120.0),
+];
 /// 多个浮窗首次出现时逐层错开的距离，避免完全叠在一起。
 const CASCADE_OFFSET: f32 = 28.0;
 
@@ -35,33 +43,22 @@ pub(super) struct MapWindowRuntime {
     sized_to_map: bool,
     /// 当前地图图片的宽高比，用来锁定等比缩放。
     map_aspect: Option<f32>,
-    /// 正在拖边缩放的起点信息；系统 BeginResize 不能锁比例，所以自己算。
-    resize_drag: Option<ResizeDrag>,
-    /// 上一帧是否正在拖动（移动或缩放）：拖动期间不写配置，避免卡顿。
+    /// 上一帧是否处于移动/缩放循环；期间延迟写入最终几何。
     interacting: bool,
-    /// 上一帧鼠标是否按在浮窗上；用于在按下瞬间就开始拖动 / 缩放。
+    /// 上一帧鼠标是否按在浮窗上，用于首次按下激活窗口。
     pointer_down: bool,
-    /// 上一次下发缩放命令的时间：限制到约 60Hz，避免鼠标高回报率时
-    /// 每来一个事件就重建一次窗口表面，反而更卡。
+    pending_size: Option<Vec2>,
+    #[cfg(not(windows))]
+    resize_drag: Option<ResizeDrag>,
+    #[cfg(not(windows))]
     last_resize_at: Option<Instant>,
+
     /// 窗口是否已经显示过。第一帧先隐藏着画好，再显示，
     /// 避免创建 / 重新打开浮窗的瞬间闪出 Windows 默认的白底和边框。
     visible: bool,
     shadow_attempts: u8,
     /// 上一帧是否最小化：无边框工具窗口没有任务栏按钮，Win+D 之后必须自己还原。
     minimized: bool,
-}
-
-/// 一次等比缩放手势的起点。
-#[derive(Clone, Copy)]
-struct ResizeDrag {
-    direction: egui::ResizeDirection,
-    /// 按下时鼠标在屏幕上的位置（逻辑像素）。
-    start_pointer: egui::Pos2,
-    /// 按下时的窗口外框，用来固定对边 / 对角。
-    start_outer: Rect,
-    /// 要锁定的宽高比（地图图片的宽 / 高）。
-    aspect: f32,
 }
 
 pub(super) fn map_window_id(task: &str) -> egui::ViewportId {
@@ -80,6 +77,61 @@ impl MhxyApp {
             .map_window_opacity
             .clamp(MAP_WINDOW_MIN_OPACITY, 1.0);
         (opacity * 255.0).round() as u8
+    }
+
+    pub(super) fn set_map_window_width(&mut self, task: &'static str, width: f32) {
+        if !width.is_finite() {
+            return;
+        }
+        let aspect = self
+            .map_windows
+            .get(task)
+            .and_then(|runtime| runtime.map_aspect)
+            .or_else(|| {
+                self.tasks
+                    .get(task)
+                    .and_then(|state| state.map_index)
+                    .and_then(|index| self.maps.get(index))
+                    .and_then(|definition| crate::core::load_rgb_image(&definition.image).ok())
+                    .map(|image| image.width() as f32 / image.height().max(1) as f32)
+            })
+            .or_else(|| {
+                self.config
+                    .map_window_layouts
+                    .get(task)
+                    .map(|layout| layout.width / layout.height.max(1.0))
+            })
+            .filter(|aspect| aspect.is_finite() && *aspect > 0.05)
+            .unwrap_or(MAP_WINDOW_SIZE.x / MAP_WINDOW_SIZE.y);
+        let monitor = self.ctx.input(|input| {
+            input
+                .viewport()
+                .monitor_size
+                .unwrap_or_else(|| vec2(1920.0, 1080.0))
+        });
+        let size = aspect_size(width.max(MAP_WINDOW_MIN_SIZE.x), aspect, monitor);
+        let layout = self
+            .config
+            .map_window_layouts
+            .entry(task.to_string())
+            .or_insert(MapWindowLayout {
+                x: 0.0,
+                y: 0.0,
+                width: MAP_WINDOW_SIZE.x,
+                height: MAP_WINDOW_SIZE.y,
+            });
+        layout.width = size.x;
+        layout.height = size.y;
+        if let Some(runtime) = self.map_windows.get_mut(task) {
+            runtime.spawn_layout = Some(*layout);
+            runtime.last_size = Some(size);
+            runtime.pending_size = Some(size);
+        }
+        self.ctx.send_viewport_cmd_to(
+            map_window_id(task),
+            egui::ViewportCommand::InnerSize(vec2(size.x, size.y)),
+        );
+        self.persist();
     }
 
     /// 当前启用的任务类型（顺序与 TASK_ORDER 一致）。
@@ -164,7 +216,6 @@ impl MhxyApp {
                     runtime.last_size = None;
                     runtime.last_outer = None;
                     runtime.sized_to_map = image_size.is_some();
-                    runtime.resize_drag = None;
                 }
             }
         }
@@ -352,12 +403,25 @@ impl MhxyApp {
             return;
         }
         let title = map_window_title(task);
+        let aspect = self
+            .map_windows
+            .get(&task)
+            .and_then(|runtime| runtime.map_aspect)
+            .or_else(|| {
+                self.config
+                    .map_window_layouts
+                    .get(task)
+                    .map(|layout| layout.width / layout.height.max(1.0))
+            })
+            .filter(|aspect| aspect.is_finite() && *aspect > 0.05)
+            .or(Some(MAP_WINDOW_SIZE.x / MAP_WINDOW_SIZE.y));
+        borderless::set_resize_aspect(&title, aspect);
         let attempts = self.map_windows.entry(task).or_default().shadow_attempts;
         let mut prepared = true;
         if attempts < 30 {
             // Windows 会给无边框窗口加 DWM 投影和圆角，透明背景下看得到；
             // 窗口刚创建时可能还找不到，下一帧再试（其他平台是空操作）。
-            let found = borderless::prepare(&title, true);
+            let found = borderless::prepare(&title, true, aspect);
             // 正常第一帧就能找到窗口；万一找不到，也别一直藏着不显示。
             prepared = found || attempts >= 2;
             self.map_windows.entry(task).or_default().shadow_attempts =
@@ -449,11 +513,14 @@ impl MhxyApp {
             .input(|input| input.pointer.interact_pos())
             .or_else(|| response.hover_pos());
         let hovering_close = pointer.is_some_and(|pos| close_rect.contains(pos));
-        if let Some(pos) = pointer {
-            if hovering_close {
-                ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
-            } else if let Some(direction) = resize_direction(rect, pos, RESIZE_BORDER) {
-                ctx.set_cursor_icon(cursor_for(direction));
+        if hovering_close {
+            ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+        } else {
+            #[cfg(not(windows))]
+            if let Some(pointer) = pointer {
+                if let Some(direction) = resize_direction(rect, pointer, RESIZE_BORDER) {
+                    ctx.set_cursor_icon(cursor_for(direction));
+                }
             }
         }
         // 关闭按钮直接画在地图上，不再嵌套 Button：整窗拖动热区会和它抢点击，
@@ -501,102 +568,105 @@ impl MhxyApp {
             .map_windows
             .get(&task)
             .is_some_and(|runtime| runtime.pointer_down);
-        // 按下就立即响应，不等 egui 的拖动阈值，避免窗口“慢半拍”。
         if pointer_down && !was_down {
-            if let Some(pos) = pointer {
-                if !close_rect.contains(pos) {
-                    match resize_direction(rect, pos, RESIZE_BORDER) {
-                        Some(direction) => {
-                            // 系统 BeginResize 只能自由缩放，这里自己记录起点，
-                            // 后续每帧按地图宽高比算目标尺寸。
-                            if let Some(outer) = ctx.input(|input| input.viewport().outer_rect) {
-                                let aspect = self
-                                    .map_windows
-                                    .get(&task)
-                                    .and_then(|runtime| runtime.map_aspect)
-                                    .filter(|aspect| *aspect > 0.05)
-                                    .unwrap_or_else(|| outer.width() / outer.height().max(1.0));
-                                let drag = ResizeDrag {
-                                    direction,
-                                    start_pointer: outer.min + pos.to_vec2(),
-                                    start_outer: outer,
-                                    aspect,
-                                };
-                                let runtime = self.map_windows.entry(task).or_default();
-                                runtime.resize_drag = Some(drag);
-                                runtime.last_resize_at = None;
-                            } else {
-                                ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(
-                                    direction,
-                                ));
-                            }
+            if let Some(pos) = pointer.filter(|pos| !close_rect.contains(*pos)) {
+                #[cfg(windows)]
+                {
+                    let border = 8.0;
+                    let left = pos.x - rect.left() <= border;
+                    let right = rect.right() - pos.x <= border;
+                    let top = pos.y - rect.top() <= border;
+                    let bottom = rect.bottom() - pos.y <= border;
+                    if !(left || right || top || bottom) {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                    }
+                }
+                #[cfg(not(windows))]
+                match resize_direction(rect, pos, RESIZE_BORDER) {
+                    Some(direction) => {
+                        if let Some(outer) = ctx.input(|input| input.viewport().outer_rect) {
+                            let aspect = self
+                                .map_windows
+                                .get(task)
+                                .and_then(|runtime| runtime.map_aspect)
+                                .unwrap_or_else(|| outer.width() / outer.height().max(1.0));
+                            let runtime = self.map_windows.entry(task).or_default();
+                            runtime.resize_drag = Some(ResizeDrag {
+                                direction,
+                                start_pointer: outer.min + pos.to_vec2(),
+                                start_outer: outer,
+                                aspect,
+                            });
+                            runtime.last_resize_at = None;
                         }
-                        None => {
-                            // egui-winit 在窗口没有焦点时会忽略 StartDrag；
-                            // 先激活一次，保证第一次按下就能拖动。
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
-                        }
+                    }
+                    None => {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
                     }
                 }
             }
         }
-        // 等比缩放：按住期间每帧按鼠标位置算尺寸，对边 / 对角保持不动。
+        #[cfg(not(windows))]
+        self.update_manual_resize(ui, task, pointer_down);
+        if let Some(runtime) = self.map_windows.get_mut(&task) {
+            runtime.interacting = if cfg!(windows) {
+                borderless::is_interacting(&title)
+            } else {
+                pointer_down
+            };
+            runtime.pointer_down = pointer_down;
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn update_manual_resize(&mut self, ui: &egui::Ui, task: &'static str, pointer_down: bool) {
         let drag = self
             .map_windows
-            .get(&task)
+            .get(task)
             .and_then(|runtime| runtime.resize_drag);
         if let Some(drag) = drag {
             if pointer_down {
-                if let Some(pos) = ctx.input(|input| input.pointer.interact_pos()) {
-                    let outer = ctx
+                if let Some(pointer) = ui.ctx().input(|input| input.pointer.interact_pos()) {
+                    let outer = ui
+                        .ctx()
                         .input(|input| input.viewport().outer_rect)
                         .unwrap_or(drag.start_outer);
-                    let current_size = ctx
+                    let current_size = ui
+                        .ctx()
                         .input(|input| input.viewport().inner_rect)
                         .map(|rect| rect.size())
                         .unwrap_or_else(|| outer.size());
-                    let monitor = ctx.input(|input| {
-                        input
-                            .viewport()
-                            .monitor_size
-                            .unwrap_or_else(|| vec2(1920.0, 1080.0))
-                    });
-                    let target = aspect_resize_rect(&drag, outer.min + pos.to_vec2(), monitor);
-                    // 限制缩放命令频率：高回报率鼠标每个事件都改一次窗口大小会让
-                    // 透明窗口不断重建表面，看起来反而一顿一顿的。
+                    let monitor = ui
+                        .ctx()
+                        .input(|input| input.viewport().monitor_size)
+                        .unwrap_or_else(|| vec2(1920.0, 1080.0));
+                    let target = aspect_resize_rect(&drag, outer.min + pointer.to_vec2(), monitor);
                     let now = Instant::now();
                     let due = self
                         .map_windows
-                        .get(&task)
+                        .get(task)
                         .and_then(|runtime| runtime.last_resize_at)
                         .is_none_or(|last| now.duration_since(last) >= Duration::from_millis(16));
-                    let mut sent = false;
                     if due {
-                        // 只有目标真的变了才下命令。
                         if (target.min - outer.min).length() > 1.0 {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(target.min));
-                            sent = true;
+                            ui.ctx()
+                                .send_viewport_cmd(egui::ViewportCommand::OuterPosition(
+                                    target.min,
+                                ));
                         }
                         if (target.size() - current_size).length() > 1.0 {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(target.size()));
-                            sent = true;
+                            ui.ctx()
+                                .send_viewport_cmd(egui::ViewportCommand::InnerSize(target.size()));
                         }
-                    }
-                    if sent {
-                        if let Some(runtime) = self.map_windows.get_mut(&task) {
+                        if let Some(runtime) = self.map_windows.get_mut(task) {
                             runtime.last_resize_at = Some(now);
                         }
                     }
-                    ctx.request_repaint();
+                    ui.ctx().request_repaint();
                 }
-            }
-        }
-        if let Some(runtime) = self.map_windows.get_mut(&task) {
-            // 下一帧 sync 看到这个标记就不写配置，拖动结束后再一次性保存。
-            runtime.interacting = pointer_down;
-            runtime.pointer_down = pointer_down;
-            if !pointer_down {
+            } else if let Some(runtime) = self.map_windows.get_mut(task) {
                 runtime.resize_drag = None;
             }
         }
@@ -626,12 +696,18 @@ impl MhxyApp {
             let viewport = input.viewport();
             (viewport.outer_rect, viewport.inner_rect)
         });
-        // 拖动 / 缩放过程中不往配置里写几何值，结束后下一帧再一次性保存。
-        if self
-            .map_windows
-            .get(task)
-            .is_some_and(|runtime| runtime.interacting)
-        {
+        // 拖动 / 缩放过程中不写配置；Windows 在 WM_EXITSIZEMOVE 后读取最终几何，
+        // 其他后端则由 map_window_ui 的 egui drag 状态控制。
+        let title = map_window_title(task);
+        let completed = borderless::completed_size(&title);
+        let interacting = if cfg!(windows) {
+            borderless::is_interacting(&title)
+        } else {
+            self.map_windows
+                .get(task)
+                .is_some_and(|runtime| runtime.interacting)
+        };
+        if interacting {
             return;
         }
         let mut layout =
@@ -646,33 +722,48 @@ impl MhxyApp {
                     height: MAP_WINDOW_SIZE.y,
                 });
         let mut changed = false;
+        if let Some([width, height]) = completed {
+            if (layout.width - width as f32).abs() > 0.5
+                || (layout.height - height as f32).abs() > 0.5
+            {
+                layout.width = width as f32;
+                layout.height = height as f32;
+                changed = true;
+            }
+        }
         {
             let runtime = self.map_windows.entry(task).or_default();
-            if let Some(inner) = inner {
-                let size = inner.size();
-                if runtime
-                    .last_size
-                    .is_none_or(|last| (last - size).length() > 0.5)
-                {
-                    runtime.last_size = Some(size);
-                    if (vec2(layout.width, layout.height) - size).length() > 0.5 {
-                        layout.width = size.x;
-                        layout.height = size.y;
-                        changed = true;
+            if completed.is_none() {
+                if let Some(inner) = inner {
+                    let size = inner.size();
+                    if let Some(pending) = runtime.pending_size {
+                        if (pending - size).length() <= 1.0 {
+                            runtime.pending_size = None;
+                        }
+                    } else if runtime
+                        .last_size
+                        .is_none_or(|last| (last - size).length() > 0.5)
+                    {
+                        runtime.last_size = Some(size);
+                        if (vec2(layout.width, layout.height) - size).length() > 0.5 {
+                            layout.width = size.x;
+                            layout.height = size.y;
+                            changed = true;
+                        }
                     }
                 }
-            }
-            if let Some(outer) = outer {
-                let position = outer.min;
-                if runtime
-                    .last_outer
-                    .is_none_or(|last| last.distance(position) > 0.5)
-                {
-                    runtime.last_outer = Some(position);
-                    if pos2(layout.x, layout.y).distance(position) > 0.5 {
-                        layout.x = position.x;
-                        layout.y = position.y;
-                        changed = true;
+                if let Some(outer) = outer {
+                    let position = outer.min;
+                    if runtime
+                        .last_outer
+                        .is_none_or(|last| last.distance(position) > 0.5)
+                    {
+                        runtime.last_outer = Some(position);
+                        if pos2(layout.x, layout.y).distance(position) > 0.5 {
+                            layout.x = position.x;
+                            layout.y = position.y;
+                            changed = true;
+                        }
                     }
                 }
             }
@@ -779,8 +870,18 @@ fn aspect_size(width: f32, aspect: f32, monitor: Vec2) -> Vec2 {
     vec2(width, width / aspect)
 }
 
-/// 测试用：直接按手势参数验证等比缩放计算。
-#[cfg(test)]
+/// 非 Windows 手工等比缩放回退的数据；Windows 直接由原生 WM_SIZING 处理。
+#[cfg(not(windows))]
+#[derive(Clone, Copy)]
+struct ResizeDrag {
+    direction: egui::ResizeDirection,
+    start_pointer: egui::Pos2,
+    start_outer: Rect,
+    aspect: f32,
+}
+
+/// 测试用：验证非 Windows 手工缩放回退的纯数学约束。
+#[cfg(all(test, not(windows)))]
 pub(super) fn resize_rect_keeping_aspect(
     direction: egui::ResizeDirection,
     start_outer: Rect,
@@ -803,6 +904,7 @@ pub(super) fn resize_rect_keeping_aspect(
 
 /// 根据拖边方向和鼠标屏幕位置，算出等比缩放后的窗口外框。
 /// 拖左边 / 上边时固定右 / 下边，其余方向固定左上角。
+#[cfg(not(windows))]
 fn aspect_resize_rect(drag: &ResizeDrag, pointer: egui::Pos2, monitor: Vec2) -> Rect {
     use egui::ResizeDirection as Direction;
     let start = drag.start_outer;
@@ -869,6 +971,7 @@ fn aspect_resize_rect(drag: &ResizeDrag, pointer: egui::Pos2, monitor: Vec2) -> 
 }
 
 /// 指针落在窗口哪条边 / 哪个角：角落优先于单边。
+#[cfg(not(windows))]
 pub(super) fn resize_direction(
     rect: Rect,
     pos: egui::Pos2,
@@ -891,6 +994,7 @@ pub(super) fn resize_direction(
     }
 }
 
+#[cfg(not(windows))]
 fn cursor_for(direction: egui::ResizeDirection) -> egui::CursorIcon {
     match direction {
         egui::ResizeDirection::North | egui::ResizeDirection::South => {

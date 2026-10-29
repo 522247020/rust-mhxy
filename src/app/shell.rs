@@ -2,42 +2,55 @@
 use super::*;
 
 impl MhxyApp {
-    pub(super) fn header_overflow_menu(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let update_label = match self.update_phase {
-            UpdatePhase::Checking => "正在检查…".to_string(),
-            UpdatePhase::Available => format!(
-                "更新到 {}",
-                self.update_info
-                    .as_ref()
-                    .map(|info| info.version.as_str())
-                    .unwrap_or("")
+    /// 顶栏唯一的次级入口：一个「更多」菜单收好显示、工具、帮助和设置。
+    pub(super) fn header_more_menu(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        narrow: bool,
+    ) {
+        let (label, color, strong) = match self.update_help_badge(narrow) {
+            Some((badge, color, strong)) => (
+                if narrow {
+                    format!("更多·{badge}")
+                } else {
+                    format!("更多 · {badge}")
+                },
+                color,
+                strong,
             ),
-            UpdatePhase::Downloading => "查看下载进度".to_string(),
-            UpdatePhase::Downloaded => "重启并更新".to_string(),
-            UpdatePhase::Failed => "重新检查更新".to_string(),
-            UpdatePhase::Idle => "检查更新".to_string(),
+            None => ("更多".to_string(), theme::text(), false),
         };
-        let update_enabled = self.update_phase != UpdatePhase::Checking;
-        if ui
-            .add_enabled(update_enabled, egui::Button::new(update_label))
-            .clicked()
-        {
-            match self.update_phase {
-                UpdatePhase::Available | UpdatePhase::Downloading | UpdatePhase::Downloaded => {
-                    self.show_update_dialog = true;
-                    self.update_window_pos =
-                        Some(centered_window_position(ctx, UPDATE_WINDOW_SIZE));
-                }
-                _ => self.start_update_check(true),
-            }
-            ui.close();
+        let mut text = egui::RichText::new(label).color(color);
+        if strong {
+            text = text.strong();
         }
-        if ui
-            .button(if self.show_advanced_window {
-                "关闭高级设置"
-            } else {
-                "高级设置"
+        ui.scope(|ui| {
+            ui.spacing_mut().interact_size.y = 34.0;
+            ui.menu_button(text, |ui| {
+                ui.set_min_width(240.0);
+                self.more_menu_ui(ui, ctx);
             })
+            .response
+            .on_hover_text("显示方式、工具、帮助和高级设置都在这一个菜单里");
+        });
+    }
+
+    /// 「更多」菜单：用分组标题收纳次要入口，避免顶栏一排平铺按钮。
+    pub(super) fn more_menu_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.label(egui::RichText::new("显示").small().strong());
+        self.display_mode_ui(ui, ctx);
+        ui.separator();
+        ui.label(egui::RichText::new("工具").small().strong());
+        self.tools_menu_ui(ui, ctx);
+        ui.separator();
+        ui.label(egui::RichText::new("帮助").small().strong());
+        self.help_menu_ui(ui, ctx);
+        ui.separator();
+        ui.label(egui::RichText::new("设置").small().strong());
+        if ui
+            .selectable_label(self.show_advanced_window, "高级设置…")
+            .on_hover_text("识别方式、方案管理、合成旗标注和日志级别")
             .clicked()
         {
             self.show_advanced_window = !self.show_advanced_window;
@@ -50,12 +63,148 @@ impl MhxyApp {
             }
             ui.close();
         }
+    }
+
+    pub(super) fn display_mode_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.set_min_width(240.0);
+        let normal = !self.compact && !self.config.map_window_enabled;
+        if ui.radio(normal, "普通界面").clicked() {
+            self.apply_normal_display();
+            ui.close();
+        }
+        if ui.radio(self.compact, "精简界面").clicked() {
+            self.apply_compact_display();
+            ui.close();
+        }
         if ui
-            .button(if self.show_meditation_window {
-                "关闭打坐计时"
-            } else {
-                "打坐计时"
-            })
+            .radio(self.config.map_window_enabled, "地图浮窗")
+            .on_hover_text("每个任务一个无边框浮窗；透明度、置顶和锁定就在下面")
+            .clicked()
+        {
+            self.apply_map_window_display();
+            // 不关闭菜单：勾选后马上就能在下面调浮窗参数。
+        }
+        ui.separator();
+        ui.menu_button("界面主题", |ui| {
+            for (value, label) in [("system", "跟随系统"), ("light", "亮色"), ("dark", "暗色")]
+            {
+                if ui.radio(self.config.theme == value, label).clicked() {
+                    self.config.theme = value.to_string();
+                    self.persist();
+                    ui.close();
+                }
+            }
+        });
+        let mut on_top = self.config.on_top;
+        if ui
+            .checkbox(&mut on_top, "窗口置顶")
+            .on_hover_text("让本窗口始终显示在游戏窗口前面")
+            .changed()
+        {
+            self.set_on_top(on_top, ctx);
+        }
+        // 浮窗参数紧跟在「地图浮窗」选项下面，不再散到侧栏另一个分组。
+        if self.config.map_window_enabled {
+            ui.separator();
+            ui.label(egui::RichText::new("浮窗设置").small().strong());
+            let mut opacity = self
+                .config
+                .map_window_opacity
+                .clamp(map_window::MAP_WINDOW_MIN_OPACITY, 1.0);
+            if ui
+                .add(
+                    egui::Slider::new(&mut opacity, map_window::MAP_WINDOW_MIN_OPACITY..=1.0)
+                        .text("浮窗不透明度"),
+                )
+                .on_hover_text("1 = 完全不透明；越小越能看到浮窗后面的游戏画面")
+                .changed()
+            {
+                self.config.map_window_opacity = opacity;
+                self.persist();
+            }
+            for task in self.active_tasks() {
+                ui.horizontal(|ui| {
+                    ui.label(format!("{task}宽度"));
+                    let current = self
+                        .config
+                        .map_window_layouts
+                        .get(task)
+                        .map(|layout| layout.width)
+                        .unwrap_or(map_window::MAP_WINDOW_SIZE.x);
+                    let mut width = current;
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut width)
+                                .range(240.0..=16384.0)
+                                .suffix(" px"),
+                        )
+                        .changed()
+                    {
+                        self.set_map_window_width(task, width);
+                    }
+                    egui::ComboBox::from_id_salt(("map-width", task))
+                        .selected_text("比例")
+                        .show_ui(ui, |ui| {
+                            for (label, width) in map_window::MAP_WIDTH_PRESETS {
+                                if ui.button(label).clicked() {
+                                    self.set_map_window_width(task, width);
+                                    ui.close();
+                                }
+                            }
+                        });
+                });
+            }
+            if ui
+                .checkbox(&mut self.config.map_window_on_top, "浮窗置顶")
+                .changed()
+            {
+                self.persist();
+            }
+            if ui
+                .checkbox(&mut self.config.map_window_locked, "锁定浮窗（鼠标穿透）")
+                .on_hover_text("锁定后浮窗点不到、拖不动，只能回主界面取消")
+                .changed()
+            {
+                self.persist();
+            }
+            if ui
+                .button("重置浮窗位置与大小")
+                .on_hover_text("所有任务浮窗恢复默认大小，并逐个错开摆回主窗口中间")
+                .clicked()
+            {
+                self.reset_map_window_geometry(ui.ctx());
+            }
+        }
+    }
+
+    /// 普通界面：退出精简，并关掉地图浮窗，让地图回到主窗口。
+    pub(super) fn apply_normal_display(&mut self) {
+        self.compact = false;
+        self.compact_hint_until = None;
+        if self.config.map_window_enabled {
+            self.set_map_window(false);
+        }
+    }
+
+    /// 精简界面：只留地图；浮窗模式和精简界面互斥。
+    pub(super) fn apply_compact_display(&mut self) {
+        if self.config.map_window_enabled {
+            self.set_map_window(false);
+        }
+        self.enter_compact_mode();
+    }
+
+    /// 地图浮窗：先退出精简，再把地图交给各任务浮窗。
+    pub(super) fn apply_map_window_display(&mut self) {
+        self.compact = false;
+        self.compact_hint_until = None;
+        self.set_map_window(true);
+    }
+
+    pub(super) fn tools_menu_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if ui
+            .selectable_label(self.show_meditation_window, "打坐计时")
+            .on_hover_text("打坐倒计时设置：启用开关、时长、悬浮窗样式和快捷键")
             .clicked()
         {
             self.show_meditation_window = !self.show_meditation_window;
@@ -68,6 +217,17 @@ impl MhxyApp {
             }
             ui.close();
         }
+        if ui
+            .selectable_label(self.show_flight_flags_window, "合成旗编辑器")
+            .on_hover_text("维护各大地图的飞行点；点位保存在本地")
+            .clicked()
+        {
+            self.show_flight_flags_window = !self.show_flight_flags_window;
+            ui.close();
+        }
+    }
+
+    pub(super) fn help_menu_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         if ui.button("说明").clicked() {
             let opening = !self.show_help;
             self.show_help = opening;
@@ -76,35 +236,152 @@ impl MhxyApp {
             }
             ui.close();
         }
-        ui.menu_button("界面主题", |ui| {
-            for (value, label) in [("system", "跟随系统"), ("light", "亮色"), ("dark", "暗色")]
-            {
-                if ui.radio(self.config.theme == value, label).clicked() {
-                    self.config.theme = value.to_string();
-                    self.persist();
-                    ui.close();
-                }
-            }
-        });
-        let mut on_top = self.config.on_top;
-        if ui.checkbox(&mut on_top, "窗口置顶").changed() {
-            self.set_on_top(on_top, ctx);
-        }
         ui.separator();
+        let (label, color, enabled, highlight, tooltip) = self.update_menu_entry();
+        let mut text = egui::RichText::new(label).color(color);
+        if highlight {
+            text = text.strong();
+        }
         if ui
-            .button(if self.config.map_window_enabled {
-                "关闭地图浮窗"
-            } else {
-                "地图浮窗"
-            })
+            .add_enabled(enabled, egui::Button::new(text))
+            .on_hover_text(tooltip)
             .clicked()
         {
-            self.set_map_window(!self.config.map_window_enabled);
+            self.handle_update_click(ctx);
             ui.close();
         }
-        if ui.button("精简界面").clicked() {
-            self.enter_compact_mode();
-            ui.close();
+        if self.update_phase == UpdatePhase::Downloaded {
+            ui.label(
+                egui::RichText::new("安装包已就绪，点上面的「重启并更新」完成安装")
+                    .small()
+                    .color(theme::gold()),
+            );
+        }
+    }
+
+    /// 帮助按钮上的更新徽标：只在需要用户注意的阶段出现，状态不藏在菜单里。
+    pub(super) fn update_help_badge(&self, narrow: bool) -> Option<(String, Color32, bool)> {
+        match self.update_phase {
+            UpdatePhase::Available => Some((
+                if narrow {
+                    "更新".to_string()
+                } else {
+                    format!(
+                        "更新 {}",
+                        self.update_info
+                            .as_ref()
+                            .map(|info| info.version.as_str())
+                            .unwrap_or("")
+                    )
+                },
+                theme::gold(),
+                true,
+            )),
+            UpdatePhase::Downloading => Some((
+                if narrow {
+                    format!("{:.0}%", self.update_percent())
+                } else {
+                    format!("下载 {:.0}%", self.update_percent())
+                },
+                theme::gold(),
+                false,
+            )),
+            UpdatePhase::Downloaded => Some((
+                if narrow {
+                    "重启".to_string()
+                } else {
+                    "重启更新".to_string()
+                },
+                theme::gold(),
+                true,
+            )),
+            UpdatePhase::Failed
+                if self
+                    .update_message_at
+                    .is_some_and(|at| at.elapsed() < UPDATE_FLASH_DURATION) =>
+            {
+                Some((
+                    if narrow {
+                        "失败".to_string()
+                    } else {
+                        "更新失败".to_string()
+                    },
+                    theme::red(),
+                    false,
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    pub(super) fn update_percent(&self) -> f32 {
+        let total = self.update_info.as_ref().map(|info| info.size).unwrap_or(0);
+        let downloaded = self.update_progress.load(Ordering::Relaxed);
+        if total > 0 {
+            (downloaded as f32 / total as f32 * 100.0).clamp(0.0, 100.0)
+        } else {
+            0.0
+        }
+    }
+
+    /// 帮助菜单里的更新项：沿用原来顶栏更新按钮的各阶段文案和点击行为。
+    pub(super) fn update_menu_entry(&self) -> (String, Color32, bool, bool, String) {
+        let percent = self.update_percent();
+        let flash_active = self
+            .update_message_at
+            .is_some_and(|at| at.elapsed() < UPDATE_FLASH_DURATION);
+        let flash_text = self.update_message.clone().unwrap_or_default();
+        let (text, color, enabled, highlight) = match self.update_phase {
+            UpdatePhase::Checking => ("正在检查…".to_string(), theme::muted(), false, false),
+            UpdatePhase::Available => (
+                format!(
+                    "发现新版本 {}",
+                    self.update_info
+                        .as_ref()
+                        .map(|info| info.version.as_str())
+                        .unwrap_or("")
+                ),
+                theme::gold(),
+                true,
+                true,
+            ),
+            UpdatePhase::Downloading => (format!("下载 {percent:.0}%"), theme::text(), true, false),
+            UpdatePhase::Downloaded => ("重启并更新".to_string(), theme::gold(), true, true),
+            UpdatePhase::Failed if flash_active => (flash_text, theme::red(), true, false),
+            UpdatePhase::Failed => ("重新检查更新".to_string(), theme::text(), true, false),
+            UpdatePhase::Idle if flash_active => (flash_text, theme::muted(), true, false),
+            UpdatePhase::Idle => ("检查更新".to_string(), theme::text(), true, false),
+        };
+        let tooltip = match self.update_phase {
+            UpdatePhase::Available => format!(
+                "发现新版本 {}\n点击查看更新说明",
+                self.update_info
+                    .as_ref()
+                    .map(|info| info.version.as_str())
+                    .unwrap_or("")
+            ),
+            UpdatePhase::Downloading => "点击查看下载进度".to_string(),
+            UpdatePhase::Downloaded => "安装包已就绪，点击完成更新".to_string(),
+            UpdatePhase::Failed => self
+                .update_error
+                .clone()
+                .unwrap_or_else(|| "检查更新失败".to_string()),
+            UpdatePhase::Checking => "正在检查更新".to_string(),
+            UpdatePhase::Idle => self
+                .update_message
+                .clone()
+                .unwrap_or_else(|| "检查更新".to_string()),
+        };
+        (text, color, enabled, highlight, tooltip)
+    }
+
+    pub(super) fn handle_update_click(&mut self, ctx: &egui::Context) {
+        match self.update_phase {
+            UpdatePhase::Available | UpdatePhase::Downloading | UpdatePhase::Downloaded => {
+                self.show_update_dialog = true;
+                self.update_window_pos = Some(centered_window_position(ctx, UPDATE_WINDOW_SIZE));
+            }
+            _ => self.start_update_check(true),
         }
     }
 }
@@ -276,25 +553,22 @@ impl eframe::App for MhxyApp {
                         .inner_margin(egui::Margin::symmetric(16, 12)),
                 )
                 .show(ui, |ui| {
-                    // Below this width the title and all utilities no longer fit in one row.
-                    // Keep primary controls visible and move secondary actions into a menu.
                     let narrow = ui.available_width() < 900.0;
                     ui.horizontal(|ui| {
+                        let sidebar_label = if self.config.sidebar_expanded {
+                            if narrow {
+                                "收起"
+                            } else {
+                                "收起设置"
+                            }
+                        } else if narrow {
+                            "侧栏"
+                        } else {
+                            "展开设置"
+                        };
                         if ui
-                            .add(
-                                egui::Button::new(if self.config.sidebar_expanded {
-                                    if narrow {
-                                        "收起"
-                                    } else {
-                                        "收起设置"
-                                    }
-                                } else if narrow {
-                                    "设置"
-                                } else {
-                                    "展开设置"
-                                })
-                                .min_size(vec2(0.0, 34.0)),
-                            )
+                            .add(egui::Button::new(sidebar_label).min_size(vec2(0.0, 34.0)))
+                            .on_hover_text("显示或隐藏设置侧栏")
                             .clicked()
                         {
                             self.config.sidebar_expanded = !self.config.sidebar_expanded;
@@ -305,237 +579,35 @@ impl eframe::App for MhxyApp {
                             ui.label(egui::RichText::new("任务坐标辅助").color(theme::muted()));
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui
-                                .add(theme::primary_button(if self.running {
-                                    if self.manual_mode() {
-                                        "暂停监听"
-                                    } else {
-                                        "暂停识别"
-                                    }
-                                } else if self.manual_mode() {
-                                    "开始监听"
+                            ui.spacing_mut().item_spacing.x = if narrow { 4.0 } else { 8.0 };
+                            let full_start = if self.running {
+                                if self.manual_mode() {
+                                    "暂停监听"
                                 } else {
-                                    "开始识别"
-                                }))
+                                    "暂停识别"
+                                }
+                            } else if self.manual_mode() {
+                                "开始监听"
+                            } else {
+                                "开始识别"
+                            };
+                            let start_label = if narrow {
+                                if self.running {
+                                    "暂停"
+                                } else {
+                                    "开始"
+                                }
+                            } else {
+                                full_start
+                            };
+                            if ui
+                                .add(theme::primary_button(start_label))
+                                .on_hover_text(full_start)
                                 .clicked()
                             {
                                 self.toggle_running();
                             }
-                            if narrow {
-                                ui.scope(|ui| {
-                                    ui.spacing_mut().interact_size.y = 34.0;
-                                    ui.menu_button("更多", |ui| {
-                                        self.header_overflow_menu(ui, &ctx)
-                                    });
-                                });
-                            }
-                            if !narrow
-                                && ui
-                                    .add(header_button("打坐", self.show_meditation_window))
-                                    .on_hover_text("打坐倒计时设置")
-                                    .clicked()
-                            {
-                                self.show_meditation_window = !self.show_meditation_window;
-                                if self.show_meditation_window {
-                                    self.meditation_window_pos = Some(centered_window_position(
-                                        &ctx,
-                                        MEDITATION_WINDOW_SIZE,
-                                    ));
-                                    self.applied_meditation_window_on_top = None;
-                                } else {
-                                    self.meditation_window_pos = None;
-                                }
-                            }
-                            if !narrow
-                                && ui
-                                    .add(header_button("高级设置", self.show_advanced_window))
-                                    .on_hover_text("识别方式、方案、显示与合成旗")
-                                    .clicked()
-                            {
-                                self.show_advanced_window = !self.show_advanced_window;
-                                if self.show_advanced_window {
-                                    self.advanced_window_pos =
-                                        Some(centered_window_position(&ctx, ADVANCED_WINDOW_SIZE));
-                                    self.applied_advanced_on_top = None;
-                                } else {
-                                    self.advanced_window_pos = None;
-                                }
-                            }
-                            if !narrow
-                                && ui
-                                    .add(header_button("精简界面", false))
-                                    .on_hover_text(
-                                        "只显示地图，隐藏顶部按钮、状态栏和设置侧栏；按 Esc 退出",
-                                    )
-                                    .clicked()
-                            {
-                                self.enter_compact_mode();
-                            }
-                            if !narrow
-                                && ui
-                                    .add(header_button(
-                                        "地图浮窗",
-                                        self.config.map_window_enabled,
-                                    ))
-                                    .on_hover_text(
-                                        "把地图弹到无边框浮窗里：可拖动、可缩放，透明度在侧栏「显示与布局」调",
-                                    )
-                                    .clicked()
-                            {
-                                let enabled = !self.config.map_window_enabled;
-                                self.set_map_window(enabled);
-                            }
-                            let on_top = self.config.on_top;
-                            if !narrow
-                                && ui
-                                    .add(header_button("置顶", on_top))
-                                    .on_hover_text("让本窗口始终显示在游戏窗口前面")
-                                    .clicked()
-                            {
-                                self.set_on_top(!on_top, &ctx);
-                            }
-                            if !narrow {
-                                ui.scope(|ui| {
-                                    ui.spacing_mut().interact_size.y = 34.0;
-                                    ui.menu_button("界面主题", |ui| {
-                                        for (value, label) in [
-                                            ("system", "跟随系统"),
-                                            ("light", "亮色"),
-                                            ("dark", "暗色"),
-                                        ] {
-                                            if ui.radio(self.config.theme == value, label).clicked()
-                                            {
-                                                self.config.theme = value.to_string();
-                                                self.persist();
-                                                ui.close();
-                                            }
-                                        }
-                                    })
-                                    .response
-                                    .on_hover_text("默认跟随系统，也可以固定亮色或暗色");
-                                });
-                            }
-                            if !narrow
-                                && ui
-                                    .add(header_button("说明", self.show_help))
-                                    .on_hover_text("使用说明")
-                                    .clicked()
-                            {
-                                let opening = !self.show_help;
-                                self.show_help = opening;
-                                if opening {
-                                    self.help_window_pos =
-                                        Some(centered_window_position(ui.ctx(), HELP_WINDOW_SIZE));
-                                }
-                            }
-                            // 更新按钮：无更新时是普通「检查更新」；发现更新后变成金色按钮，
-                            // 点击弹出更新说明，不主动弹窗。
-                            let total =
-                                self.update_info.as_ref().map(|info| info.size).unwrap_or(0);
-                            let downloaded = self.update_progress.load(Ordering::Relaxed);
-                            let percent = if total > 0 {
-                                (downloaded as f32 / total as f32 * 100.0).clamp(0.0, 100.0)
-                            } else {
-                                0.0
-                            };
-                            let flash_active = self
-                                .update_message_at
-                                .is_some_and(|at| at.elapsed() < UPDATE_FLASH_DURATION);
-                            let flash_text = self.update_message.clone().unwrap_or_default();
-                            let (text, color, enabled, highlight) = match self.update_phase {
-                                UpdatePhase::Checking => {
-                                    ("检查中…".to_string(), theme::muted(), false, false)
-                                }
-                                UpdatePhase::Available => (
-                                    format!(
-                                        "{} {}",
-                                        if narrow { "更新" } else { "发现新版本" },
-                                        self.update_info
-                                            .as_ref()
-                                            .map(|info| info.version.as_str())
-                                            .unwrap_or("")
-                                    ),
-                                    theme::on_accent(),
-                                    true,
-                                    true,
-                                ),
-                                UpdatePhase::Downloading => {
-                                    (format!("下载 {percent:.0}%"), theme::text(), true, false)
-                                }
-                                UpdatePhase::Downloaded => (
-                                    if narrow {
-                                        "重启更新"
-                                    } else {
-                                        "重启并更新"
-                                    }
-                                    .to_string(),
-                                    theme::on_accent(),
-                                    true,
-                                    true,
-                                ),
-                                UpdatePhase::Failed if flash_active => {
-                                    (flash_text, theme::red(), true, false)
-                                }
-                                UpdatePhase::Failed => {
-                                    ("检查更新".to_string(), theme::text(), true, false)
-                                }
-                                UpdatePhase::Idle if flash_active => {
-                                    (flash_text, theme::muted(), true, false)
-                                }
-                                UpdatePhase::Idle => (
-                                    if narrow { "更新" } else { "检查更新" }.to_string(),
-                                    theme::text(),
-                                    true,
-                                    false,
-                                ),
-                            };
-                            let tooltip = match self.update_phase {
-                                UpdatePhase::Available => format!(
-                                    "发现新版本 {}\n点击查看更新说明",
-                                    self.update_info
-                                        .as_ref()
-                                        .map(|info| info.version.as_str())
-                                        .unwrap_or("")
-                                ),
-                                UpdatePhase::Downloading => "点击查看下载进度".to_string(),
-                                UpdatePhase::Downloaded => "安装包已就绪，点击完成更新".to_string(),
-                                UpdatePhase::Failed => self
-                                    .update_error
-                                    .clone()
-                                    .unwrap_or_else(|| "检查更新失败".to_string()),
-                                UpdatePhase::Checking => "正在检查更新".to_string(),
-                                UpdatePhase::Idle => self
-                                    .update_message
-                                    .clone()
-                                    .unwrap_or_else(|| "检查更新".to_string()),
-                            };
-                            let mut label = egui::RichText::new(text).color(color);
-                            if highlight {
-                                label = label.strong();
-                            }
-                            let mut button = egui::Button::new(label).min_size(vec2(0.0, 34.0));
-                            if highlight {
-                                button = button.fill(theme::gold());
-                            }
-                            if !narrow
-                                && ui
-                                    .add_enabled(enabled, button)
-                                    .on_hover_text(tooltip)
-                                    .clicked()
-                            {
-                                match self.update_phase {
-                                    UpdatePhase::Available
-                                    | UpdatePhase::Downloading
-                                    | UpdatePhase::Downloaded => {
-                                        self.show_update_dialog = true;
-                                        self.update_window_pos = Some(centered_window_position(
-                                            ui.ctx(),
-                                            UPDATE_WINDOW_SIZE,
-                                        ));
-                                    }
-                                    _ => self.start_update_check(true),
-                                }
-                            }
+                            self.header_more_menu(ui, &ctx, narrow);
                         });
                     });
                 });
@@ -961,12 +1033,6 @@ impl eframe::App for MhxyApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.flush_config();
     }
-}
-
-fn header_button(text: &str, selected: bool) -> egui::Button<'static> {
-    egui::Button::new(egui::RichText::new(text.to_owned()))
-        .selected(selected)
-        .min_size(vec2(0.0, 34.0))
 }
 
 /// 说明 / 更新窗口在主窗口中间打开，并限制在屏幕内。

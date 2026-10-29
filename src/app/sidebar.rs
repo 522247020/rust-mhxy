@@ -211,85 +211,11 @@ impl MhxyApp {
         }
     }
     pub(super) fn controls(&mut self, ui: &mut egui::Ui) {
-        // 最常用的「开始 / 暂停」固定在侧栏底部，窗口再矮也不用滚动去找。
-        let footer_height = 78.0;
-        let scroll_height = (ui.available_height() - footer_height).max(160.0);
+        // 开始 / 暂停固定在顶栏，侧栏不再重复主按钮，只保留常用设置。
         egui::ScrollArea::vertical()
             .id_salt("sidebar")
-            .max_height(scroll_height)
             .auto_shrink([false, false])
             .show(ui, |ui| self.basic_controls(ui));
-        ui.separator();
-        ui.add_space(4.0);
-        self.sidebar_action(ui);
-    }
-
-    pub(super) fn sidebar_action(&mut self, ui: &mut egui::Ui) {
-        let label = if self.running {
-            if self.manual_mode() {
-                "暂停监听"
-            } else {
-                "暂停识别"
-            }
-        } else if self.manual_mode() {
-            "开始监听"
-        } else {
-            "开始识别"
-        };
-        if ui
-            .add_sized([ui.available_width(), 34.0], theme::primary_button(label))
-            .clicked()
-        {
-            self.toggle_running();
-        }
-        let window = self
-            .windows
-            .iter()
-            .find(|window| Some(window.handle) == self.selected_handle)
-            .map(|window| window.title.clone())
-            .unwrap_or_else(|| "未选择游戏窗口".to_string());
-        ui.add(
-            egui::Label::new(
-                egui::RichText::new(format!("窗口：{window}"))
-                    .small()
-                    .weak(),
-            )
-            .truncate(),
-        )
-        .on_hover_text(&window);
-        let mode = if self.config.ocr_mode == "remote" {
-            if self.config.api_url.trim().is_empty() {
-                "远端 PP-OCR（未配置地址）"
-            } else {
-                "远端 PP-OCR"
-            }
-        } else {
-            "本地 PP-OCRv5"
-        };
-        let trigger = if self.manual_mode() {
-            let hotkey = Hotkey::parse(&self.config.ocr_hotkey)
-                .map(|hotkey| hotkey.display())
-                .unwrap_or_else(|_| self.config.ocr_hotkey.clone());
-            format!("手动 · {hotkey}")
-        } else {
-            format!("每 {} 秒自动识别", self.config.interval_seconds)
-        };
-        let remote_unconfigured =
-            self.config.ocr_mode == "remote" && self.config.api_url.trim().is_empty();
-        let summary = format!("{mode} · {trigger}");
-        ui.add(
-            egui::Label::new(
-                egui::RichText::new(&summary)
-                    .small()
-                    .color(if remote_unconfigured {
-                        theme::gold()
-                    } else {
-                        theme::muted()
-                    }),
-            )
-            .truncate(),
-        )
-        .on_hover_text(&summary);
     }
 
     pub(super) fn basic_controls(&mut self, ui: &mut egui::Ui) {
@@ -618,56 +544,14 @@ impl MhxyApp {
                 if previous != self.config.horizontal_layout {
                     self.persist();
                 }
-                let mut map_window = self.config.map_window_enabled;
-                if ui
-                    .checkbox(&mut map_window, "地图浮窗（无边框）")
-                    .on_hover_text(
-                        "每个任务类型单独一个浮窗，可分别拖动、等比缩放，适合叠在游戏画面上看",
+                // 浮窗参数已经并入顶栏「更多 → 显示」，这里只留一句指路，不重复控件。
+                ui.label(
+                    egui::RichText::new(
+                        "地图浮窗的开关、不透明度、置顶和锁定都在顶栏「更多 → 显示」里",
                     )
-                    .changed()
-                {
-                    self.set_map_window(map_window);
-                }
-                if self.config.map_window_enabled {
-                    let mut opacity = self
-                        .config
-                        .map_window_opacity
-                        .clamp(map_window::MAP_WINDOW_MIN_OPACITY, 1.0);
-                    if ui
-                        .add(
-                            egui::Slider::new(
-                                &mut opacity,
-                                map_window::MAP_WINDOW_MIN_OPACITY..=1.0,
-                            )
-                            .text("浮窗不透明度"),
-                        )
-                        .on_hover_text("1 = 完全不透明；越小越能看到浮窗后面的游戏画面")
-                        .changed()
-                    {
-                        self.config.map_window_opacity = opacity;
-                        self.persist();
-                    }
-                    if ui
-                        .checkbox(&mut self.config.map_window_on_top, "浮窗置顶")
-                        .changed()
-                    {
-                        self.persist();
-                    }
-                    if ui
-                        .checkbox(&mut self.config.map_window_locked, "锁定浮窗（鼠标穿透）")
-                        .on_hover_text("锁定后浮窗点不到、拖不动，只能回主界面取消")
-                        .changed()
-                    {
-                        self.persist();
-                    }
-                    if ui
-                        .button("重置浮窗位置与大小")
-                        .on_hover_text("所有任务浮窗恢复默认大小，并逐个错开摆回主窗口中间")
-                        .clicked()
-                    {
-                        self.reset_map_window_geometry(ui.ctx());
-                    }
-                }
+                    .small()
+                    .weak(),
+                );
             },
         );
         if now != fold_display {
@@ -864,11 +748,11 @@ impl MhxyApp {
         ui.label(egui::RichText::new("基本流程").strong());
         for line in [
             "1. 打开游戏，程序会自动扫描并选中游戏窗口（也可用下拉框选择、点「刷新」）。",
-            "2. 在侧栏底部点「开始识别」/「开始监听」启动，「暂停」停止；按钮始终固定可见。",
+            "2. 点顶栏右侧「开始识别」/「开始监听」启动，运行时同一个按钮变成「暂停识别」/「暂停监听」。",
             "3. 在「任务类型」里勾选要显示的任务，侧栏会自动出现对应地图面板。",
             "4. 基础区「设置识别区域」打开独立窗口，可调整任务栏截图区域并点击取点配置图色门控。",
-            "5. 识别方式、方案、合成旗在顶栏「高级设置」里；打坐计时在顶栏「打坐」里。",
-            "6. 想把地图单独放一边，点顶栏「地图浮窗」为每个任务各开一个无边框浮窗，可分别拖动、等比缩放并调整透明度。",
+            "5. 识别方式、方案和日志在顶栏「更多 → 设置 → 高级设置」里；打坐计时和合成旗编辑器在「更多 → 工具」里。",
+            "6. 想把地图单独放一边，在顶栏「更多 → 显示」里选「地图浮窗」，每个任务各开一个无边框浮窗；不透明度、浮窗置顶和锁定就在同一分组里调。",
         ] {
             ui.label(egui::RichText::new(line).small());
         }
@@ -883,10 +767,11 @@ impl MhxyApp {
         ui.add_space(4.0);
         ui.label(egui::RichText::new("界面").strong());
         for line in [
-            "界面主题：顶栏「界面主题」可选跟随系统 / 亮色 / 暗色，默认跟随系统，系统切换亮暗时立即跟随。",
-            "精简界面：顶栏「精简界面」隐藏按钮栏、状态栏和设置栏，只保留地图；按 Esc 恢复默认界面。",
-            "地图浮窗：顶栏「地图浮窗」为每个任务各开一个无边框窗口，可分别拖动移动、拖边缘缩放，右上角 ✕ 只关当前任务；透明度在侧栏「显示与布局」里调。",
-            "置顶：让本窗口始终保持在其他窗口之上，方便对照游戏。",
+            "界面主题：顶栏「更多 → 显示 → 界面主题」可选跟随系统 / 亮色 / 暗色，默认跟随系统，系统切换亮暗时立即跟随。",
+            "精简界面：顶栏「更多 → 显示 → 精简界面」隐藏按钮栏、状态栏和设置栏，只保留地图；按 Esc 恢复默认界面。",
+            "地图浮窗：顶栏「更多 → 显示 → 地图浮窗」为每个任务各开一个无边框窗口，可分别移动和等比缩放；Windows 用系统原生缩放，宽度可输入或选预设。右上角 ✕ 只关当前任务；透明度、浮窗置顶和锁定在同一分组里。",
+            "窗口置顶：顶栏「更多 → 显示 → 窗口置顶」让本窗口始终保持在其他窗口之上，方便对照游戏。",
+            "帮助：顶栏「更多 → 帮助」里有使用说明和更新；发现新版本、下载中或已下载时，「更多」按钮会直接显示更新状态。",
         ] {
             ui.label(egui::RichText::new(line).small());
         }
@@ -904,9 +789,10 @@ impl MhxyApp {
         ui.label(egui::RichText::new("其它").strong());
         for line in [
             "任务类型：抓鬼 / 鬼王可以同时勾选；通用任务与它们互斥，单独使用。",
-            "显示与布局（基础区）：高概率区域开关和上下 / 左右布局。",
-            "高级设置（顶栏）：识别方式、方案管理、合成旗标注。",
-            "打坐计时（顶栏）：独立设置窗口，启用后显示透明悬浮窗并注册快捷键。",
+            "显示与布局（基础区）：高概率区域开关和上下 / 左右布局；地图浮窗的开关和浮窗参数不在这里重复，统一在顶栏「更多 → 显示」里。",
+            "设置（顶栏「更多 → 设置 → 高级设置」）：识别方式、方案管理、合成旗标注和日志级别。",
+            "工具（顶栏「更多 → 工具」）：打坐计时和合成旗编辑器；打坐计时启用后显示透明悬浮窗并注册快捷键。",
+            "帮助（顶栏「更多 → 帮助」）：使用说明和更新；更新发现新版本、下载中或已下载时，「更多」按钮会直接显示状态。",
             "日志：直接写入配置目录下的 logs/rust-mhxy.log，不在界面显示；详细级别记录 OCR 过程。",
             "设置会自动保存到程序目录的 config.json。",
         ] {

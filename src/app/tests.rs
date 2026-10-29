@@ -270,18 +270,33 @@ fn meditation_panel_shows_countdown_and_controls() {
         screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1120.0, 900.0))),
         ..Default::default()
     };
-    // 侧栏不再有打坐分组，顶栏提供「打坐」按钮。
+    // 侧栏不再有打坐分组；顶栏只留一个「更多」菜单，打坐和合成旗在其中的工具分组里。
     let mut output = ctx.run_ui(input(), |ui| app.ui(ui, &mut frame));
     let texts = collect_texts(&output.shapes);
     output.textures_delta.clear();
     assert!(
-        texts.iter().any(|text| text == "打坐"),
-        "顶栏应有打坐按钮：{texts:?}"
+        texts.iter().any(|text| text == "更多"),
+        "顶栏应有唯一的更多菜单：{texts:?}"
+    );
+    assert!(
+        !texts.iter().any(|text| text == "工具"),
+        "工具分组只应在更多菜单里：{texts:?}"
     );
     assert!(
         !texts.iter().any(|text| text == "启用打坐计时"),
         "打坐设置不应再出现在侧栏：{texts:?}"
     );
+
+    // 工具菜单里的两个入口。
+    let mut output = ctx.run_ui(input(), |ui| app.tools_menu_ui(ui, &ctx));
+    let texts = collect_texts(&output.shapes);
+    output.textures_delta.clear();
+    for expected in ["打坐计时", "合成旗编辑器"] {
+        assert!(
+            texts.iter().any(|text| text == expected),
+            "工具菜单缺少「{expected}」：{texts:?}"
+        );
+    }
 
     // 独立窗口里的设置项。
     let mut output = ctx.run_ui(input(), |ui| app.meditation_controls(ui));
@@ -318,16 +333,22 @@ fn basic_sidebar_keeps_primary_path_and_hides_advanced_details() {
         "游戏窗口",
         "识别模式",
         "任务类型",
+        "显示与布局",
         "设置识别区域",
-        "开始识别",
-        "高级设置",
     ] {
         assert!(
             texts.iter().any(|text| text == expected),
             "基础侧栏缺少「{expected}」：{texts:?}"
         );
     }
-    // 高级设置默认收起，低频项不应出现在首屏。
+    // 主操作固定在顶栏，次级入口全部收进「更多」，侧栏不重复。
+    for expected in ["开始识别", "更多"] {
+        assert!(
+            texts.iter().any(|text| text == expected),
+            "顶栏缺少「{expected}」：{texts:?}"
+        );
+    }
+    // 高级设置、工具菜单内容默认收起，低频项不应出现在首屏。
     for hidden in [
         "远端 PP-OCR",
         "服务地址",
@@ -336,35 +357,42 @@ fn basic_sidebar_keeps_primary_path_and_hides_advanced_details() {
         "打坐计时",
         "合成旗标注",
         "日志",
+        "地图浮窗（无边框）",
     ] {
         assert!(
             !texts.iter().any(|text| text == hidden),
-            "高级设置收起时不应显示「{hidden}」：{texts:?}"
+            "默认收起时不应显示「{hidden}」：{texts:?}"
         );
     }
-    // 底部固定区始终给出当前窗口、识别方式和主操作。
+    // 底栏始终给出当前识别方式、触发摘要和更新入口。
     assert!(texts.iter().any(|text| text == "本地 PP-OCRv5"));
-    assert!(texts.iter().any(|text| text.contains("每 5 秒自动识别")));
+    assert!(texts.iter().any(|text| text.contains("每 5 秒识别")));
 
     let find = |needle: &str| {
         positions
             .iter()
             .find(|(text, _)| text == needle)
             .map(|(_, pos)| *pos)
-            .unwrap_or_else(|| panic!("侧栏缺少「{needle}」：{positions:?}"))
+            .unwrap_or_else(|| panic!("界面缺少「{needle}」：{positions:?}"))
     };
     let window = find("游戏窗口");
+    let trigger = find("识别模式");
     let task = find("任务类型");
-    let start = positions
+    let starts: Vec<egui::Pos2> = positions
         .iter()
         .filter(|(text, _)| text == "开始识别")
         .map(|(_, pos)| *pos)
-        .find(|pos| pos.x < 420.0)
-        .expect("侧栏底部应有开始识别按钮");
+        .collect();
+    assert_eq!(starts.len(), 1, "开始按钮只应出现在顶栏一次：{starts:?}");
+    let start = starts[0];
     assert!(
-            window.y < task.y && task.y < start.y,
-            "基础路径应为 游戏窗口 → 任务类型 → 开始识别：window={window:?} task={task:?} start={start:?}"
-        );
+        window.y < trigger.y && trigger.y < task.y,
+        "侧栏顺序应为 游戏窗口 → 识别模式 → 任务类型：window={window:?} trigger={trigger:?} task={task:?}"
+    );
+    assert!(
+        start.y < window.y && start.x > 420.0,
+        "开始按钮应在顶栏右侧，而不是侧栏底部：start={start:?} window={window:?}"
+    );
 }
 
 #[test]
@@ -402,38 +430,40 @@ fn interval_is_only_shown_in_auto_mode() {
 }
 
 #[test]
-fn sidebar_action_follows_trigger_mode_and_running() {
+fn header_start_button_follows_trigger_mode_and_running() {
     let mut app = app();
     let ctx = app.ctx.clone();
+    let mut frame = eframe::Frame::_new_kittest();
     let input = || egui::RawInput {
-        screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(320.0, 240.0))),
+        screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1120.0, 800.0))),
         ..Default::default()
     };
 
     app.config.trigger_mode = "manual".into();
     app.running = false;
-    let mut output = ctx.run_ui(input(), |ui| app.sidebar_action(ui));
+    let mut output = ctx.run_ui(input(), |ui| app.ui(ui, &mut frame));
     let texts = collect_texts(&output.shapes);
     output.textures_delta.clear();
     assert!(texts.iter().any(|text| text == "开始监听"));
-    assert!(texts.iter().any(|text| text.contains("手动 · F8")));
+    assert!(texts
+        .iter()
+        .any(|text| text.contains("手动识别 · 快捷键 F8")));
 
     app.running = true;
-    let mut output = ctx.run_ui(input(), |ui| app.sidebar_action(ui));
+    let mut output = ctx.run_ui(input(), |ui| app.ui(ui, &mut frame));
     let texts = collect_texts(&output.shapes);
     output.textures_delta.clear();
     assert!(texts.iter().any(|text| text == "暂停监听"));
+    assert!(texts.iter().any(|text| text.contains("手动识别 · 按 F8")));
 
     app.config.trigger_mode = "auto".into();
     app.config.interval_seconds = 5;
     app.running = false;
-    let mut output = ctx.run_ui(input(), |ui| app.sidebar_action(ui));
+    let mut output = ctx.run_ui(input(), |ui| app.ui(ui, &mut frame));
     let texts = collect_texts(&output.shapes);
     output.textures_delta.clear();
     assert!(texts.iter().any(|text| text == "开始识别"));
-    assert!(texts
-        .iter()
-        .any(|text| text == "本地 PP-OCRv5 · 每 5 秒自动识别"));
+    assert!(texts.iter().any(|text| text == "每 5 秒识别"));
 }
 
 #[test]
@@ -567,15 +597,16 @@ fn task_panel_has_no_high_chance_checkbox() {
 }
 
 #[test]
-fn header_orders_update_help_theme_top_compact_start() {
+fn header_keeps_title_more_and_start_only() {
     let mut app = app();
     let ctx = app.ctx.clone();
     let mut frame = eframe::Frame::_new_kittest();
-    let input = egui::RawInput {
+    let input = || egui::RawInput {
         screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1120.0, 800.0))),
         ..Default::default()
     };
-    let mut output = ctx.run_ui(input, |ui| app.ui(ui, &mut frame));
+    let mut output = ctx.run_ui(input(), |ui| app.ui(ui, &mut frame));
+    let texts = collect_texts(&output.shapes);
     let positions = text_positions(&output.shapes);
     let find = |needle: &str| {
         positions
@@ -584,61 +615,210 @@ fn header_orders_update_help_theme_top_compact_start() {
             .map(|(_, pos)| *pos)
             .unwrap_or_else(|| panic!("顶栏缺少「{needle}」：{positions:?}"))
     };
-    let update = find("检查更新");
-    let help = find("说明");
-    let theme = find("界面主题");
-    let on_top = find("置顶");
-    let compact = find("精简界面");
+    assert!(
+        texts.iter().any(|text| text == "梦幻西游"),
+        "顶栏应保留应用标题：{texts:?}"
+    );
+    let more = find("更多");
     let start = find("开始识别");
     assert!(
-        update.x < help.x
-            && help.x < theme.x
-            && theme.x < on_top.x
-            && on_top.x < compact.x
-            && compact.x < start.x,
-        "顶栏顺序应为 检查更新 | 说明 | 界面主题 | 置顶 | 精简界面 | 开始识别：\
-             update={update:?} help={help:?} theme={theme:?} on_top={on_top:?} \
-             compact={compact:?} start={start:?}"
+        more.x < start.x,
+        "顶栏右侧应为「更多」+「开始识别」：more={more:?} start={start:?}"
     );
+    // 原来的分类按钮和平铺按钮都不再直接占位。
+    for hidden in [
+        "显示方式",
+        "显示",
+        "工具",
+        "设置",
+        "帮助",
+        "检查更新",
+        "说明",
+        "界面主题",
+        "置顶",
+        "精简界面",
+        "地图浮窗",
+        "高级设置",
+        "打坐",
+    ] {
+        assert!(
+            !texts.iter().any(|text| text == hidden),
+            "顶栏不应再直接显示「{hidden}」：{texts:?}"
+        );
+    }
     output.textures_delta.clear();
+
+    // 「更多」菜单里的分组和条目仍然齐全。
+    let mut output = ctx.run_ui(input(), |ui| app.more_menu_ui(ui, &ctx));
+    let texts = collect_texts(&output.shapes);
+    output.textures_delta.clear();
+    for expected in [
+        "显示",
+        "工具",
+        "帮助",
+        "设置",
+        "普通界面",
+        "精简界面",
+        "地图浮窗",
+        "界面主题",
+        "窗口置顶",
+        "打坐计时",
+        "合成旗编辑器",
+        "说明",
+        "检查更新",
+        "高级设置…",
+    ] {
+        assert!(
+            texts.iter().any(|text| text == expected),
+            "更多菜单缺少「{expected}」：{texts:?}"
+        );
+    }
+
+    // 地图浮窗的透明度、置顶和锁定紧跟在「地图浮窗」选项下面。
+    app.config.map_window_enabled = true;
+    let mut output = ctx.run_ui(input(), |ui| app.more_menu_ui(ui, &ctx));
+    let texts = collect_texts(&output.shapes);
+    output.textures_delta.clear();
+    for expected in [
+        "浮窗设置",
+        "抓鬼宽度",
+        "鬼王宽度",
+        "浮窗不透明度",
+        "浮窗置顶",
+        "锁定浮窗（鼠标穿透）",
+        "重置浮窗位置与大小",
+    ] {
+        assert!(
+            texts.iter().any(|text| text == expected),
+            "显示分组缺少浮窗参数「{expected}」：{texts:?}"
+        );
+    }
 }
 
 #[test]
-fn narrow_header_moves_secondary_actions_into_more_menu() {
+fn narrow_header_keeps_start_and_more_inside_bounds() {
+    fn text_bounds(shapes: &[egui::epaint::ClippedShape], needle: &str) -> Option<Rect> {
+        fn walk(shape: &egui::Shape, needle: &str) -> Option<Rect> {
+            match shape {
+                egui::Shape::Text(text) if text.galley.text() == needle => {
+                    Some(text.visual_bounding_rect())
+                }
+                egui::Shape::Vec(shapes) => shapes.iter().find_map(|shape| walk(shape, needle)),
+                _ => None,
+            }
+        }
+        shapes
+            .iter()
+            .find_map(|clipped| walk(&clipped.shape, needle))
+    }
+
     let mut app = app();
     app.config.sidebar_expanded = false;
     let ctx = app.ctx.clone();
     let mut frame = eframe::Frame::_new_kittest();
-    let input = egui::RawInput {
+    let input = || egui::RawInput {
         screen_rect: Some(Rect::from_min_size(
             pos2(0.0, 0.0),
             MIN_WINDOW_SIZE_COLLAPSED,
         )),
         ..Default::default()
     };
-    let mut output = ctx.run_ui(input, |ui| app.ui(ui, &mut frame));
+    let mut output = ctx.run_ui(input(), |ui| app.ui(ui, &mut frame));
     let texts = collect_texts(&output.shapes);
-    assert!(
-        texts.iter().any(|text| text == "更多"),
-        "窄窗口应显示更多菜单：{texts:?}"
-    );
-    assert!(
-        texts.iter().any(|text| text == "开始识别"),
-        "窄窗口仍应保留主操作：{texts:?}"
-    );
-    for hidden in [
-        "检查更新",
-        "说明",
-        "界面主题",
-        "置顶",
-        "地图浮窗",
-        "精简界面",
-    ] {
+    for expected in ["开始", "更多"] {
         assert!(
-            !texts.iter().any(|text| text == hidden),
-            "窄窗口不应在顶栏直接显示 {hidden}：{texts:?}"
+            texts.iter().any(|text| text == expected),
+            "窄窗口顶栏缺少「{expected}」：{texts:?}"
         );
     }
+    for label in ["开始", "更多"] {
+        let bounds = text_bounds(&output.shapes, label)
+            .unwrap_or_else(|| panic!("窄窗口顶栏没有绘制「{label}」"));
+        assert!(
+            bounds.min.x >= 0.0 && bounds.max.x <= MIN_WINDOW_SIZE_COLLAPSED.x,
+            "「{label}」超出窄窗口：{bounds:?}"
+        );
+    }
+    output.textures_delta.clear();
+
+    // 更新状态直接写在「更多」按钮上，菜单里仍保留重启入口。
+    app.update_info = Some(UpdateInfo {
+        version: "v9.9.9".into(),
+        notes: "测试".into(),
+        url: "https://example.com/a.zip".into(),
+        sha256: "abc".into(),
+        size: 1024,
+    });
+    app.update_phase = UpdatePhase::Downloaded;
+    let mut output = ctx.run_ui(input(), |ui| app.ui(ui, &mut frame));
+    let texts = collect_texts(&output.shapes);
+    assert!(
+        texts.iter().any(|text| text == "更多·重启"),
+        "已下载时窄窗口的更多按钮应直接显示重启状态：{texts:?}"
+    );
+    let badge = text_bounds(&output.shapes, "更多·重启").expect("窄窗口应绘制更新状态");
+    assert!(
+        badge.min.x >= 0.0 && badge.max.x <= MIN_WINDOW_SIZE_COLLAPSED.x,
+        "更新状态不应把窄窗口顶栏挤出边界：{badge:?}"
+    );
+    output.textures_delta.clear();
+
+    let mut output = ctx.run_ui(input(), |ui| app.help_menu_ui(ui, &ctx));
+    let texts = collect_texts(&output.shapes);
+    assert!(
+        texts.iter().any(|text| text == "重启并更新"),
+        "帮助菜单应保留已下载安装按钮：{texts:?}"
+    );
+    assert!(
+        texts.iter().any(|text| text.contains("安装包已就绪")),
+        "帮助菜单应提示安装包已就绪：{texts:?}"
+    );
+    output.textures_delta.clear();
+}
+
+#[test]
+fn update_status_is_shown_on_more_button() {
+    let mut app = app();
+    app.update_info = Some(UpdateInfo {
+        version: "v9.9.9".into(),
+        notes: "测试".into(),
+        url: "https://example.com/a.zip".into(),
+        sha256: "abc".into(),
+        size: 1024,
+    });
+    let ctx = app.ctx.clone();
+    let mut frame = eframe::Frame::_new_kittest();
+    let input = || egui::RawInput {
+        screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1120.0, 800.0))),
+        ..Default::default()
+    };
+
+    app.update_phase = UpdatePhase::Available;
+    let mut output = ctx.run_ui(input(), |ui| app.ui(ui, &mut frame));
+    let texts = collect_texts(&output.shapes);
+    assert!(
+        texts.iter().any(|text| text == "更多 · 更新 v9.9.9"),
+        "有更新时更多按钮应显示版本：{texts:?}"
+    );
+    output.textures_delta.clear();
+
+    app.update_phase = UpdatePhase::Downloading;
+    app.update_progress.store(512, Ordering::Relaxed);
+    let mut output = ctx.run_ui(input(), |ui| app.ui(ui, &mut frame));
+    let texts = collect_texts(&output.shapes);
+    assert!(
+        texts.iter().any(|text| text == "更多 · 下载 50%"),
+        "下载中更多按钮应显示进度：{texts:?}"
+    );
+    output.textures_delta.clear();
+
+    app.update_phase = UpdatePhase::Downloaded;
+    let mut output = ctx.run_ui(input(), |ui| app.ui(ui, &mut frame));
+    let texts = collect_texts(&output.shapes);
+    assert!(
+        texts.iter().any(|text| text == "更多 · 重启更新"),
+        "已下载时更多按钮应显示重启入口：{texts:?}"
+    );
     output.textures_delta.clear();
 }
 
@@ -651,6 +831,74 @@ fn entering_compact_mode_shows_exit_hint() {
     assert!(
         app.compact_hint_until.is_some(),
         "进入精简模式应显示按 Esc 退出的提示"
+    );
+}
+
+#[test]
+fn display_mode_choices_are_mutually_exclusive() {
+    let mut app = app();
+    app.apply_map_window_display();
+    assert!(app.config.map_window_enabled);
+    assert!(!app.compact);
+
+    app.apply_compact_display();
+    assert!(app.compact);
+    assert!(!app.config.map_window_enabled, "精简界面与地图浮窗互斥");
+
+    app.apply_normal_display();
+    assert!(!app.compact);
+    assert!(!app.config.map_window_enabled);
+
+    // 从精简直接切到地图浮窗，也要退出精简。
+    app.apply_compact_display();
+    app.apply_map_window_display();
+    assert!(app.config.map_window_enabled);
+    assert!(!app.compact);
+}
+
+#[test]
+fn sidebar_points_to_map_window_settings_in_header() {
+    let mut app = app();
+    let ctx = app.ctx.clone();
+    let input = || egui::RawInput {
+        screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(420.0, 900.0))),
+        ..Default::default()
+    };
+
+    let mut output = ctx.run_ui(input(), |ui| app.basic_controls(ui));
+    let texts = collect_texts(&output.shapes);
+    output.textures_delta.clear();
+    assert!(
+        !texts.iter().any(|text| text == "地图浮窗（无边框）"),
+        "地图浮窗开关只应在顶栏「更多 → 显示」里：{texts:?}"
+    );
+    assert!(
+        texts
+            .iter()
+            .any(|text| text.contains("地图浮窗") && text.contains("更多 → 显示")),
+        "侧栏应指向新的浮窗入口：{texts:?}"
+    );
+
+    app.config.map_window_enabled = true;
+    let mut output = ctx.run_ui(input(), |ui| app.basic_controls(ui));
+    let texts = collect_texts(&output.shapes);
+    output.textures_delta.clear();
+    for control in [
+        "浮窗不透明度",
+        "浮窗置顶",
+        "锁定浮窗（鼠标穿透）",
+        "重置浮窗位置与大小",
+    ] {
+        assert!(
+            !texts.iter().any(|text| text == control),
+            "浮窗参数应集中在顶栏显示分组，侧栏不再重复「{control}」：{texts:?}"
+        );
+    }
+    assert!(
+        texts
+            .iter()
+            .any(|text| text.contains("地图浮窗") && text.contains("更多 → 显示")),
+        "开启浮窗后侧栏仍应指向同一组参数：{texts:?}"
     );
 }
 
@@ -833,6 +1081,28 @@ fn map_window_resize_keeps_the_map_aspect_ratio() {
 }
 
 #[test]
+fn native_resize_constraints_keep_aspect_and_fixed_anchor() {
+    let minimum = [240, 180];
+    let maximum = [1600, 1200];
+    let rect = borderless::constrain_sizing(2, [10, 20, 610, 420], 1.5, minimum, maximum, true);
+    assert_eq!(rect, [10, 20, 610, 420]);
+
+    let rect = borderless::constrain_sizing(2, [10, 20, 810, 420], 1.5, minimum, maximum, true);
+    assert_eq!(rect[2] - rect[0], 800);
+    assert_eq!(rect[3] - rect[1], 533);
+    assert_eq!(rect[0], 10);
+    assert_eq!(rect[1], -46);
+
+    let rect = borderless::constrain_sizing(4, [100, 100, 500, 300], 2.0, minimum, maximum, false);
+    assert_eq!(rect, [100, 100, 500, 300]);
+    let rect = borderless::constrain_sizing(4, [100, 100, 500, 500], 2.0, minimum, maximum, false);
+    assert_eq!(rect[2] - rect[0], 800);
+    assert_eq!(rect[3] - rect[1], 400);
+    assert_eq!(rect[2], 500);
+    assert_eq!(rect[3], 500);
+}
+
+#[test]
 fn map_window_opacity_stays_in_usable_range() {
     let mut app = app();
     app.config.map_window_opacity = 0.0;
@@ -971,6 +1241,11 @@ fn compact_mode_hides_chrome_and_esc_restores_it() {
     let texts = collect_texts(&output.shapes);
     for hidden in [
         "开始识别",
+        "更多",
+        "显示方式",
+        "工具",
+        "设置",
+        "帮助",
         "精简界面",
         "置顶",
         "界面主题",
@@ -995,6 +1270,10 @@ fn compact_mode_hides_chrome_and_esc_restores_it() {
     assert!(
         texts.iter().any(|text| text == "开始识别"),
         "退出精简模式后应重新出现开始识别按钮：{texts:?}"
+    );
+    assert!(
+        texts.iter().any(|text| text == "更多"),
+        "退出精简模式后顶栏菜单应恢复：{texts:?}"
     );
     output.textures_delta.clear();
 }
@@ -1302,9 +1581,9 @@ fn region_window_uses_left_right_layout() {
         "截图范围内顺序应为 主区域 → 备用区域 → 启用备用区域"
     );
     assert!(
-            main_preprocess.y > gate.y && main_preprocess.y < extra_preprocess.y,
-            "预处理应为 主区域在上、备用区域在下，且在门控设置之后：{main_preprocess:?} {extra_preprocess:?}"
-        );
+        main_preprocess.y > gate.y && main_preprocess.y < extra_preprocess.y,
+        "预处理应为 主区域在上、备用区域在下，且在门控设置之后：{main_preprocess:?} {extra_preprocess:?}"
+    );
     assert!(
         preprocess_title.y > gate.y,
         "识别预处理应在分隔线下方、门控设置之后"

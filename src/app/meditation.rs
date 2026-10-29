@@ -175,7 +175,7 @@ impl MhxyApp {
                 #[cfg(windows)]
                 if self.meditation_shadow_attempts < 30 {
                     self.meditation_shadow_attempts += 1;
-                    if borderless::prepare("打坐计时", false) {
+                    if borderless::prepare("打坐计时", false, None) {
                         self.meditation_shadow_attempts = 30;
                     }
                 }
