@@ -53,6 +53,9 @@ pub(super) struct MapWindowRuntime {
     #[cfg(not(windows))]
     last_resize_at: Option<Instant>,
 
+    /// 浮窗最近的几何值（内框大小 / 外框位置），用来发现「窗口变了但还没重绘」。
+    painted_geometry: (Option<Vec2>, Option<egui::Pos2>),
+
     /// 窗口是否已经显示过。第一帧先隐藏着画好，再显示，
     /// 避免创建 / 重新打开浮窗的瞬间闪出 Windows 默认的白底和边框。
     visible: bool,
@@ -402,6 +405,26 @@ impl MhxyApp {
             self.set_map_window_visible(task, false);
             return;
         }
+        // 浮窗的尺寸 / 位置一旦变化（原生拖拽缩放、程序化改宽度、系统移动窗口），
+        // eframe 的交换链会重建，但根视口如果没有新的重绘请求，子视口就会停在
+        // 上一帧甚至一片空白：看起来就是「拖的时候画面不动 / 窗口消失」。
+        // 这里按帧对几何变化补一次重绘请求，保证缩放过程中画面跟着走。
+        let geometry = ctx.input(|input| {
+            let viewport = input.viewport();
+            (
+                viewport.inner_rect.map(|rect| rect.size()),
+                viewport.outer_rect.map(|rect| rect.min),
+            )
+        });
+        {
+            let runtime = self.map_windows.entry(task).or_default();
+            // 用容差比较：DPI 取整会让逻辑尺寸在小数位上抖，不能因此每帧重绘。
+            if !geometry_close(runtime.painted_geometry, geometry) {
+                runtime.painted_geometry = geometry;
+                self.ctx.request_repaint_of(egui::ViewportId::ROOT);
+                ctx.request_repaint();
+            }
+        }
         let title = map_window_title(task);
         let aspect = self
             .map_windows
@@ -494,6 +517,9 @@ impl MhxyApp {
                 runtime.visible = true;
             }
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            // 刚显示出来的窗口需要再走一帧，否则可能停在一片透明上。
+            self.ctx.request_repaint_of(egui::ViewportId::ROOT);
+            ctx.request_repaint();
         }
 
         // 锁定（鼠标穿透）时窗口不接收任何输入，只能回主界面取消。
@@ -610,12 +636,18 @@ impl MhxyApp {
         }
         #[cfg(not(windows))]
         self.update_manual_resize(ui, task, pointer_down);
+        let interacting = if cfg!(windows) {
+            borderless::is_interacting(&title)
+        } else {
+            pointer_down
+        };
+        if interacting {
+            // 原生移动 / 缩放循环里继续按帧重绘，地图跟着鼠标走，不会出现卡顿的残影。
+            self.ctx.request_repaint_of(egui::ViewportId::ROOT);
+            ctx.request_repaint();
+        }
         if let Some(runtime) = self.map_windows.get_mut(&task) {
-            runtime.interacting = if cfg!(windows) {
-                borderless::is_interacting(&title)
-            } else {
-                pointer_down
-            };
+            runtime.interacting = interacting;
             runtime.pointer_down = pointer_down;
         }
     }
@@ -849,6 +881,28 @@ impl MhxyApp {
             self.set_map_window(false);
         }
     }
+}
+
+/// 两次浮窗几何值是否足够接近：容差吸收 DPI 取整带来的小数抖动。
+pub(super) fn geometry_close(
+    previous: (Option<Vec2>, Option<egui::Pos2>),
+    current: (Option<Vec2>, Option<egui::Pos2>),
+) -> bool {
+    fn size_close(a: Option<Vec2>, b: Option<Vec2>) -> bool {
+        match (a, b) {
+            (Some(a), Some(b)) => (a - b).length() <= 0.5,
+            (None, None) => true,
+            _ => false,
+        }
+    }
+    fn pos_close(a: Option<egui::Pos2>, b: Option<egui::Pos2>) -> bool {
+        match (a, b) {
+            (Some(a), Some(b)) => a.distance(b) <= 0.5,
+            (None, None) => true,
+            _ => false,
+        }
+    }
+    size_close(previous.0, current.0) && pos_close(previous.1, current.1)
 }
 
 /// 按图片大小开窗，但不超过当前显示器、也不小于浮窗下限。

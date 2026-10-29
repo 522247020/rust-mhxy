@@ -1091,7 +1091,22 @@ fn native_resize_constraints_keep_aspect_and_fixed_anchor() {
     assert_eq!(rect[2] - rect[0], 800);
     assert_eq!(rect[3] - rect[1], 533);
     assert_eq!(rect[0], 10);
-    assert_eq!(rect[1], -46);
+    // 拖右边只向右下长，左上角钉死（以前会按中心重排，窗口跟着上下跳）。
+    assert_eq!(rect[1], 20);
+
+    // 拖左边时右上角钉死，上下位置同样不能动。
+    let rect = borderless::constrain_sizing(1, [410, 20, 810, 420], 1.5, minimum, maximum, true);
+    assert_eq!(rect[0], 810 - 400);
+    assert_eq!(rect[2], 810);
+    assert_eq!(rect[1], 20);
+    assert_eq!(rect[3] - rect[1], 267);
+
+    // 拖下边时只向下、向右长，左边钉死。
+    let rect = borderless::constrain_sizing(6, [10, 20, 610, 500], 1.5, minimum, maximum, false);
+    assert_eq!(rect[0], 10);
+    assert_eq!(rect[1], 20);
+    assert_eq!(rect[2] - rect[0], 720);
+    assert_eq!(rect[3] - rect[1], 480);
 
     let rect = borderless::constrain_sizing(4, [100, 100, 500, 300], 2.0, minimum, maximum, false);
     assert_eq!(rect, [100, 100, 500, 300]);
@@ -1100,6 +1115,30 @@ fn native_resize_constraints_keep_aspect_and_fixed_anchor() {
     assert_eq!(rect[3] - rect[1], 400);
     assert_eq!(rect[2], 500);
     assert_eq!(rect[3], 500);
+}
+
+#[test]
+fn map_window_geometry_change_detection_ignores_rounding_noise() {
+    let size = Some(vec2(600.0, 450.0));
+    let pos = Some(pos2(100.0, 200.0));
+    // 完全没变 / 只在亚像素上抖：不需要重绘。
+    assert!(map_window::geometry_close((size, pos), (size, pos)));
+    assert!(map_window::geometry_close(
+        (size, pos),
+        (Some(vec2(600.3, 449.8)), Some(pos2(100.2, 199.9)))
+    ));
+    // 尺寸或位置真的变了：必须补一帧。
+    assert!(!map_window::geometry_close(
+        (size, pos),
+        (Some(vec2(620.0, 465.0)), pos)
+    ));
+    assert!(!map_window::geometry_close(
+        (size, pos),
+        (size, Some(pos2(104.0, 200.0)))
+    ));
+    // 视口信息还没准备好时不应被当成变化。
+    assert!(map_window::geometry_close((None, None), (None, None)));
+    assert!(!map_window::geometry_close((size, pos), (None, None)));
 }
 
 #[test]

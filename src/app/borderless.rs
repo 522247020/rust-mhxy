@@ -45,23 +45,11 @@ pub(super) fn constrain_sizing(
     .round() as i32;
     let height = (f64::from(width) / aspect).round().max(1.0) as i32;
     let left_edge = matches!(edge, 1 | 4 | 7);
-    let right_edge = matches!(edge, 2 | 5 | 8);
     let top_edge = matches!(edge, 3..=5);
-    let bottom_edge = matches!(edge, 6..=8);
-    let new_left = if left_edge {
-        right - width
-    } else if right_edge {
-        left
-    } else {
-        ((i64::from(left) + i64::from(right) - i64::from(width)) / 2) as i32
-    };
-    let new_top = if top_edge {
-        bottom - height
-    } else if bottom_edge {
-        top
-    } else {
-        ((i64::from(top) + i64::from(bottom) - i64::from(height)) / 2) as i32
-    };
+    // 锚点只看被拖的那条边：拖左/右边时上下位置必须钉死，拖上/下边时左右位置钉死。
+    // 以前在“没有竖直边”时按中心重排，导致拖右边窗口会上下乱跳。
+    let new_left = if left_edge { right - width } else { left };
+    let new_top = if top_edge { bottom - height } else { top };
     [new_left, new_top, new_left + width, new_top + height]
 }
 
@@ -196,7 +184,7 @@ unsafe extern "system" fn borderless_wndproc(
             return DefWindowProcW(hwnd, msg, wparam, lparam);
         };
         if lparam.0 != 0 {
-            let edge = wparam.0 as usize;
+            let edge = wparam.0;
             let aspect = state.aspect.unwrap();
             let mut rect = *(lparam.0 as *const RECT);
             let minimum = [240, 180];
@@ -360,8 +348,8 @@ pub(super) fn completed_size(_title: &str) -> Option<[i32; 2]> {
 pub(super) fn prepare(title: &str, resizable: bool, aspect: Option<f32>) -> bool {
     use std::ffi::c_void;
     use windows::Win32::Graphics::Dwm::{
-        DwmSetWindowAttribute, DWMNCRP_DISABLED, DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE,
-        DWMWA_NCRENDERING_POLICY, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND,
+        DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE,
+        DWMWA_VISIBLE_FRAME_BORDER_THICKNESS, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWLP_WNDPROC, GWL_EXSTYLE, GWL_STYLE,
@@ -422,13 +410,10 @@ pub(super) fn prepare(title: &str, resizable: bool, aspect: Option<f32>) -> bool
             0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
         );
-        let policy = DWMNCRP_DISABLED;
-        let _ = DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_NCRENDERING_POLICY,
-            &policy as *const _ as *const c_void,
-            std::mem::size_of_val(&policy) as u32,
-        );
+        // 不要关掉 DWM 的非客户区渲染（DWMNCRP_DISABLED）：那样窗口在缩放 / 激活时
+        // 会退回 GDI 用经典主题画一圈 Win2000 风格的边框，看着像带标题栏的旧窗口。
+        // 非客户区已经由 WM_NCCALCSIZE 全部让给客户区，这里只需要把 DWM 自己那圈
+        // 描边 / 圆角关掉。
         let corner = DWMWCP_DONOTROUND;
         let _ = DwmSetWindowAttribute(
             hwnd,
@@ -442,6 +427,14 @@ pub(super) fn prepare(title: &str, resizable: bool, aspect: Option<f32>) -> bool
             DWMWA_BORDER_COLOR,
             &border as *const _ as *const c_void,
             std::mem::size_of_val(&border) as u32,
+        );
+        // Windows 11 起还可以把那条 1px 可视边框整个关掉（旧系统会返回错误，忽略即可）。
+        let border_thickness: u32 = 0;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_VISIBLE_FRAME_BORDER_THICKNESS,
+            &border_thickness as *const _ as *const c_void,
+            std::mem::size_of_val(&border_thickness) as u32,
         );
         true
     }
