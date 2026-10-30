@@ -488,3 +488,25 @@ pub(super) fn tuck_below(title: &str, anchor_title: &str) -> bool {
 pub(super) fn tuck_below(_title: &str, _anchor_title: &str) -> bool {
     false
 }
+
+/// 前台窗口是不是本进程自己的窗口（主窗口、各种设置窗口）。
+/// 地图浮窗靠它决定要不要让出置顶：自己的窗口在前台时用户是在调参数，
+/// 浮窗不能盖在菜单 / 滑块上面。
+#[cfg(windows)]
+pub(super) fn foreground_is_ours() -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.0.is_null() {
+            return false;
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        pid == std::process::id()
+    }
+}
+
+#[cfg(not(windows))]
+pub(super) fn foreground_is_ours() -> bool {
+    false
+}

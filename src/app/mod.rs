@@ -59,6 +59,9 @@ const FLIGHT_FLAGS_WINDOW_SIZE: Vec2 = Vec2::new(900.0, 760.0);
 /// 高级设置与打坐设置的独立窗口尺寸。
 const ADVANCED_WINDOW_SIZE: Vec2 = Vec2::new(560.0, 640.0);
 const MEDITATION_WINDOW_SIZE: Vec2 = Vec2::new(480.0, 560.0);
+/// 地图浮窗设置独立窗口。
+const MAP_WINDOW_SETTINGS_SIZE: Vec2 = Vec2::new(520.0, 620.0);
+const MAP_WINDOW_SETTINGS_TITLE: &str = "地图浮窗设置";
 #[derive(Default)]
 struct TaskState {
     location: Option<TaskLocation>,
@@ -162,8 +165,9 @@ pub struct MhxyApp {
     testing_remote: bool,
     applied_min_inner_size: Option<Vec2>,
     applied_on_top: Option<bool>,
-    /// 上一帧主窗口是否在前台。地图浮窗靠它决定要不要让出置顶。
-    main_window_focused: bool,
+    /// 上一帧本进程是否有窗口在前台（主窗口、设置窗口……）。
+    /// 地图浮窗靠它决定要不要让出置顶，免得盖住菜单和滑块。
+    app_window_in_foreground: bool,
     /// 取点窗口自己的置顶状态。子视口默认不会被父窗口的置顶带上，
     /// 不同步的话主窗口置顶时会把取点窗口整个压住。
     applied_region_on_top: Option<bool>,
@@ -259,6 +263,10 @@ pub struct MhxyApp {
     show_meditation_window: bool,
     meditation_window_pos: Option<egui::Pos2>,
     applied_meditation_window_on_top: Option<bool>,
+    /// 地图浮窗设置窗口（每个任务的开关 + 不透明度 / 宽度 / 置顶 / 锁定）。
+    show_map_window_settings: bool,
+    map_window_settings_pos: Option<egui::Pos2>,
+    applied_map_window_settings_on_top: Option<bool>,
     /// 日志落盘路径（不再在界面里展示）。
     log_path: PathBuf,
     flight_map_edit: String,
@@ -406,7 +414,7 @@ impl MhxyApp {
             testing_remote: false,
             applied_min_inner_size: None,
             applied_on_top: None,
-            main_window_focused: false,
+            app_window_in_foreground: false,
             applied_region_on_top: None,
             remote_feedback: None,
             notice: None,
@@ -457,6 +465,9 @@ impl MhxyApp {
             show_meditation_window: false,
             meditation_window_pos: None,
             applied_meditation_window_on_top: None,
+            show_map_window_settings: false,
+            map_window_settings_pos: None,
+            applied_map_window_settings_on_top: None,
             log_path,
             flight_map_edit: SUPPORTED_MAPS[0].to_string(),
             flight_flag_index: 0,

@@ -674,23 +674,19 @@ fn header_keeps_title_more_and_start_only() {
         );
     }
 
-    // 地图浮窗的透明度、置顶和锁定紧跟在「地图浮窗」选项下面。
+    // 地图浮窗的参数已搬进独立窗口，菜单里只留入口。
     app.config.map_window_enabled = true;
     let mut output = ctx.run_ui(input(), |ui| app.more_menu_ui(ui, &ctx));
     let texts = collect_texts(&output.shapes);
     output.textures_delta.clear();
-    for expected in [
-        "浮窗设置",
-        "抓鬼宽度",
-        "鬼王宽度",
-        "浮窗不透明度",
-        "浮窗置顶",
-        "锁定浮窗（鼠标穿透）",
-        "重置浮窗位置与大小",
-    ] {
+    assert!(
+        texts.iter().any(|text| text == "浮窗设置…"),
+        "地图浮窗开启后菜单应提供「浮窗设置…」入口：{texts:?}"
+    );
+    for absent in ["浮窗不透明度", "抓鬼宽度", "重置浮窗位置与大小"] {
         assert!(
-            texts.iter().any(|text| text == expected),
-            "显示分组缺少浮窗参数「{expected}」：{texts:?}"
+            !texts.iter().any(|text| text == absent),
+            "「{absent}」已经搬到地图浮窗设置窗口，菜单里不再重复：{texts:?}"
         );
     }
 }
@@ -922,13 +918,27 @@ fn map_window_mode_gives_each_task_its_own_popout() {
         "开启浮窗后主窗口应显示占位说明：{texts:?}"
     );
     assert!(
-        texts.iter().any(|text| text == "抓鬼浮窗：开"),
-        "占位区应为每个任务提供独立开关：{texts:?}"
+        texts.iter().any(|text| text == "浮窗设置…"),
+        "占位区应提供「浮窗设置…」入口：{texts:?}"
     );
-    assert!(
-        texts.iter().any(|text| text == "鬼王浮窗：开"),
-        "鬼王也应单独一个浮窗：{texts:?}"
-    );
+    output.textures_delta.clear();
+
+    // 每个任务的开关搬到了独立的「地图浮窗设置」窗口。
+    let mut output = ctx.run_ui(input(), |ui| app.map_window_settings_controls(ui));
+    let texts = collect_texts(&output.shapes);
+    for expected in [
+        "抓鬼浮窗",
+        "鬼王浮窗",
+        "浮窗不透明度",
+        "浮窗置顶",
+        "锁定浮窗（鼠标穿透）",
+        "重置浮窗位置与大小",
+    ] {
+        assert!(
+            texts.iter().any(|text| text == expected),
+            "地图浮窗设置窗口缺少「{expected}」：{texts:?}"
+        );
+    }
     output.textures_delta.clear();
 
     let zhuagui = app
@@ -952,10 +962,16 @@ fn map_window_mode_gives_each_task_its_own_popout() {
     app.set_map_window_visible("抓鬼", false);
     assert!(!app.map_window_open("抓鬼"));
     assert!(app.map_window_open("鬼王"));
-    let mut output = ctx.run_ui(input(), |ui| app.ui(ui, &mut frame));
+    let mut output = ctx.run_ui(input(), |ui| app.map_window_settings_controls(ui));
     let texts = collect_texts(&output.shapes);
-    assert!(texts.iter().any(|text| text == "抓鬼浮窗：关"));
-    assert!(texts.iter().any(|text| text == "鬼王浮窗：开"));
+    assert!(
+        texts.iter().any(|text| text == "抓鬼浮窗"),
+        "关掉后这个任务的开关仍应留在设置窗口里：{texts:?}"
+    );
+    assert!(
+        texts.iter().any(|text| text == "鬼王浮窗"),
+        "另一个任务的开关不应受影响：{texts:?}"
+    );
     output.textures_delta.clear();
 
     // 取消勾选鬼王后它的浮窗消失，但布局仍保留在配置里。

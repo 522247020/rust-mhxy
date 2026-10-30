@@ -389,7 +389,7 @@ impl MhxyApp {
                 .with_inner_size(vec2(spawn.width, spawn.height))
                 .with_min_inner_size(MAP_WINDOW_MIN_SIZE)
                 .with_position(pos2(spawn.x, spawn.y));
-            if desired_on_top(self.config.map_window_on_top, self.main_window_focused) {
+            if desired_on_top(self.config.map_window_on_top, self.app_window_in_foreground) {
                 builder = builder.with_always_on_top();
             }
             ctx.show_viewport_immediate(map_window_id(task), builder, |ui, _class| {
@@ -711,7 +711,7 @@ impl MhxyApp {
     fn sync_map_window_state(&mut self, ctx: &egui::Context, task: &'static str) {
         // 主窗口在前台（用户在调设置、看菜单）时，浮窗让位：降成普通窗口并压到
         // 主窗口下面。否则置顶浮窗会盖住「更多」菜单、下拉框和滑块，点了等于没点。
-        let on_top = desired_on_top(self.config.map_window_on_top, self.main_window_focused);
+        let on_top = desired_on_top(self.config.map_window_on_top, self.app_window_in_foreground);
         let locked = self.config.map_window_locked;
         let title = map_window_title(task);
         {
@@ -819,7 +819,7 @@ impl MhxyApp {
         }
     }
 
-    /// 主窗口里的占位：地图已经弹到浮窗，这里只留说明和各窗口的开关。
+    /// 主窗口里的占位：地图已经弹到浮窗，这里只留说明和设置入口。
     pub(super) fn map_window_placeholder(&mut self, ui: &mut egui::Ui) {
         let available = ui.available_rect_before_wrap();
         let (rect, _) = ui.allocate_exact_size(available.size(), Sense::hover());
@@ -834,7 +834,8 @@ impl MhxyApp {
         );
         // 提示文字按可用宽度换行，主窗口变窄时不会冲出面板。
         let hint = painter.layout(
-            "每个任务一个浮窗，可分别拖动、等比缩放；透明度、置顶和锁定在「显示与布局」里统一调整"
+            "每个任务的浮窗开关、不透明度、宽度、置顶和锁定都在「地图浮窗设置」窗口里；\
+             也可以从顶栏「更多 → 显示 → 浮窗设置…」打开"
                 .to_owned(),
             FontId::proportional(13.0),
             theme::muted(),
@@ -849,54 +850,21 @@ impl MhxyApp {
             theme::muted(),
         );
 
-        let tasks = self.active_tasks();
-        if tasks.is_empty() {
-            painter.text(
-                pos2(rect.center().x, rect.center().y + 24.0),
-                Align2::CENTER_CENTER,
-                "未勾选任务类型",
-                FontId::proportional(14.0),
-                theme::muted(),
-            );
-        } else {
-            let button_size = vec2(108.0, 30.0);
-            let gap = 8.0;
-            let total = tasks.len() as f32 * button_size.x + (tasks.len() - 1) as f32 * gap;
-            let start_x = rect.center().x - total / 2.0;
-            let row_y = rect.center().y + 12.0;
-            for (index, task) in tasks.iter().enumerate() {
-                let open = self.map_window_open(task);
-                let label = format!("{task}浮窗：{}", if open { "开" } else { "关" });
-                let button_rect = Rect::from_min_size(
-                    pos2(start_x + index as f32 * (button_size.x + gap), row_y),
-                    button_size,
-                );
-                if ui
-                    .put(button_rect, egui::Button::new(label).selected(open))
-                    .on_hover_text(if open {
-                        "点击关闭这个任务的浮窗"
-                    } else {
-                        "点击重新打开这个任务的浮窗"
-                    })
-                    .clicked()
-                {
-                    self.set_map_window_visible(task, !open);
-                }
-            }
-        }
-        let exit_rect = Rect::from_center_size(rect.center() + vec2(0.0, 64.0), vec2(150.0, 30.0));
+        let button_rect =
+            Rect::from_center_size(rect.center() + vec2(0.0, 40.0), vec2(150.0, 32.0));
         if ui
-            .put(exit_rect, egui::Button::new("退出地图浮窗模式"))
+            .put(button_rect, egui::Button::new("浮窗设置…"))
+            .on_hover_text("每个任务的浮窗开关、不透明度、宽度、置顶和锁定")
             .clicked()
         {
-            self.set_map_window(false);
+            self.toggle_map_window_settings(ui.ctx());
         }
     }
 }
 
-/// 浮窗实际是否置顶：配置要置顶，而且主窗口不在前台。
-pub(super) fn desired_on_top(configured: bool, main_focused: bool) -> bool {
-    configured && !main_focused
+/// 浮窗实际是否置顶：配置要置顶，而且本进程没有窗口在前台。
+pub(super) fn desired_on_top(configured: bool, app_in_foreground: bool) -> bool {
+    configured && !app_in_foreground
 }
 
 /// 两次浮窗几何值是否足够接近：容差吸收 DPI 取整带来的小数抖动。

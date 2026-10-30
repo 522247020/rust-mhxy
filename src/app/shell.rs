@@ -78,11 +78,14 @@ impl MhxyApp {
         }
         if ui
             .radio(self.config.map_window_enabled, "地图浮窗")
-            .on_hover_text("每个任务一个无边框浮窗；透明度、置顶和锁定就在下面")
+            .on_hover_text("每个任务一个无边框浮窗；开关和参数在「浮窗设置」窗口里")
             .clicked()
         {
             self.apply_map_window_display();
-            // 不关闭菜单：勾选后马上就能在下面调浮窗参数。
+            // 打开模式后直接把设置窗口弹出来，不用再多点一层。
+            if !self.show_map_window_settings {
+                self.toggle_map_window_settings(ctx);
+            }
         }
         ui.separator();
         ui.menu_button("界面主题", |ui| {
@@ -103,47 +106,160 @@ impl MhxyApp {
         {
             self.set_on_top(on_top, ctx);
         }
-        // 浮窗参数紧跟在「地图浮窗」选项下面，不再散到侧栏另一个分组。
+        // 浮窗参数在独立窗口「地图浮窗设置」里，菜单只留入口。
         if self.config.map_window_enabled {
             ui.separator();
-            ui.label(egui::RichText::new("浮窗设置").small().strong());
-            let mut opacity = self
-                .config
-                .map_window_opacity
-                .clamp(map_window::MAP_WINDOW_MIN_OPACITY, 1.0);
             if ui
-                .add(
-                    egui::Slider::new(&mut opacity, map_window::MAP_WINDOW_MIN_OPACITY..=1.0)
-                        .text("浮窗不透明度"),
-                )
-                .on_hover_text("1 = 完全不透明；越小越能看到浮窗后面的游戏画面")
-                .changed()
+                .selectable_label(self.show_map_window_settings, "浮窗设置…")
+                .on_hover_text("每个任务的浮窗开关，以及不透明度、宽度、置顶、锁定和重置")
+                .clicked()
             {
-                self.config.map_window_opacity = opacity;
-                self.persist();
+                self.toggle_map_window_settings(ctx);
+                ui.close();
             }
-            for task in self.active_tasks() {
+        }
+    }
+
+    /// 打开 / 收起「地图浮窗设置」独立窗口。
+    pub(super) fn toggle_map_window_settings(&mut self, ctx: &egui::Context) {
+        self.show_map_window_settings = !self.show_map_window_settings;
+        if self.show_map_window_settings {
+            self.map_window_settings_pos =
+                Some(centered_window_position(ctx, MAP_WINDOW_SETTINGS_SIZE));
+            self.applied_map_window_settings_on_top = None;
+        } else {
+            self.map_window_settings_pos = None;
+        }
+    }
+
+    /// 独立的「地图浮窗设置」窗口：每个任务的开关和所有浮窗参数都在这里。
+    pub(super) fn map_window_settings_window(&mut self, ctx: &egui::Context) {
+        if !self.show_map_window_settings {
+            return;
+        }
+        let on_top = self.config.on_top;
+        let mut builder = egui::ViewportBuilder::default()
+            .with_title(MAP_WINDOW_SETTINGS_TITLE)
+            .with_inner_size(MAP_WINDOW_SETTINGS_SIZE)
+            .with_min_inner_size([420.0, 420.0]);
+        if on_top {
+            builder = builder.with_always_on_top();
+        }
+        if let Some(position) = self.map_window_settings_pos {
+            builder = builder.with_position(position);
+        }
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("map_window_settings"),
+            builder,
+            |ui, _class| {
+                if ui.ctx().viewport_id() == egui::ViewportId::ROOT {
+                    egui::Window::new(MAP_WINDOW_SETTINGS_TITLE)
+                        .default_size(MAP_WINDOW_SETTINGS_SIZE)
+                        .show(ui.ctx(), |ui| self.map_window_settings_controls(ui));
+                    return;
+                }
+                if ui.ctx().input(|input| input.viewport().close_requested()) {
+                    self.show_map_window_settings = false;
+                }
+                if self.applied_map_window_settings_on_top != Some(on_top) {
+                    let level = if on_top {
+                        egui::WindowLevel::AlwaysOnTop
+                    } else {
+                        egui::WindowLevel::Normal
+                    };
+                    ui.ctx()
+                        .send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
+                    self.applied_map_window_settings_on_top = Some(on_top);
+                }
+                egui::Frame::central_panel(ui.style())
+                    .inner_margin(16)
+                    .show(ui, |ui| {
+                        let height = ui.available_height();
+                        egui::ScrollArea::vertical()
+                            .id_salt("map_window_settings_scroll")
+                            .auto_shrink([false, false])
+                            .max_height(height)
+                            .min_scrolled_height(height)
+                            .show(ui, |ui| {
+                                ui.set_min_width(ui.available_width());
+                                self.map_window_settings_controls(ui);
+                            });
+                    });
+            },
+        );
+    }
+
+    /// 「地图浮窗设置」窗口的内容：每个任务一行开关 + 宽度，下面是全局参数。
+    pub(super) fn map_window_settings_controls(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.heading("地图浮窗");
+            let open = self.config.map_window_enabled;
+            if ui
+                .selectable_label(open, if open { "已开启" } else { "已关闭" })
+                .on_hover_text("点一下切换：每个任务的地图各用一个无边框浮窗")
+                .clicked()
+            {
+                self.set_map_window(!open);
+            }
+        });
+        ui.label(
+            egui::RichText::new("一个任务一个无边框浮窗：在浮窗空白处拖动，拖边缘或四角等比缩放。")
+                .small()
+                .weak(),
+        );
+        if !self.config.map_window_enabled {
+            ui.add_space(6.0);
+            if ui
+                .button("打开地图浮窗")
+                .on_hover_text("打开后每个任务各弹一个浮窗")
+                .clicked()
+            {
+                self.set_map_window(true);
+            }
+            return;
+        }
+
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new("每个任务").small().strong());
+        let tasks = self.active_tasks();
+        if tasks.is_empty() {
+            ui.label(egui::RichText::new("未勾选任务类型").small().weak());
+        }
+        for task in tasks {
+            ui.group(|ui| {
                 ui.horizontal(|ui| {
-                    ui.label(format!("{task}宽度"));
-                    let current = self
+                    let open = self.map_window_open(task);
+                    if ui
+                        .selectable_label(open, format!("{task}浮窗"))
+                        .on_hover_text(if open {
+                            "点一下关闭这个任务的浮窗"
+                        } else {
+                            "点一下重新打开这个任务的浮窗"
+                        })
+                        .clicked()
+                    {
+                        self.set_map_window_visible(task, !open);
+                    }
+                    let mut width = self
                         .config
                         .map_window_layouts
                         .get(task)
                         .map(|layout| layout.width)
                         .unwrap_or(map_window::MAP_WINDOW_SIZE.x);
-                    let mut width = current;
                     if ui
                         .add(
                             egui::DragValue::new(&mut width)
                                 .range(240.0..=16384.0)
                                 .suffix(" px"),
                         )
+                        .on_hover_text("浮窗宽度（逻辑像素），高度按地图比例自动算")
                         .changed()
                     {
                         self.set_map_window_width(task, width);
                     }
                     egui::ComboBox::from_id_salt(("map-width", task))
                         .selected_text("比例")
+                        .width(72.0)
                         .show_ui(ui, |ui| {
                             for (label, width) in map_window::MAP_WIDTH_PRESETS {
                                 if ui.button(label).clicked() {
@@ -153,20 +269,43 @@ impl MhxyApp {
                             }
                         });
                 });
-            }
-            if ui
-                .checkbox(&mut self.config.map_window_on_top, "浮窗置顶")
-                .changed()
-            {
-                self.persist();
-            }
-            if ui
-                .checkbox(&mut self.config.map_window_locked, "锁定浮窗（鼠标穿透）")
-                .on_hover_text("锁定后浮窗点不到、拖不动，只能回主界面取消")
-                .changed()
-            {
-                self.persist();
-            }
+            });
+        }
+
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new("浮窗样式").small().strong());
+        let mut opacity = self
+            .config
+            .map_window_opacity
+            .clamp(map_window::MAP_WINDOW_MIN_OPACITY, 1.0);
+        if ui
+            .add(
+                egui::Slider::new(&mut opacity, map_window::MAP_WINDOW_MIN_OPACITY..=1.0)
+                    .text("浮窗不透明度"),
+            )
+            .on_hover_text("1 = 完全不透明；越小越能看到浮窗后面的游戏画面")
+            .changed()
+        {
+            self.config.map_window_opacity = opacity;
+            self.persist();
+        }
+        if ui
+            .checkbox(&mut self.config.map_window_on_top, "浮窗置顶")
+            .on_hover_text("让浮窗压在游戏前面；主窗口在前台时浮窗会自动让位")
+            .changed()
+        {
+            self.persist();
+        }
+        if ui
+            .checkbox(&mut self.config.map_window_locked, "锁定浮窗（鼠标穿透）")
+            .on_hover_text("锁定后浮窗点不到、拖不动，只能回这里或主界面取消")
+            .changed()
+        {
+            self.persist();
+        }
+
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
             if ui
                 .button("重置浮窗位置与大小")
                 .on_hover_text("所有任务浮窗恢复默认大小，并逐个错开摆回主窗口中间")
@@ -174,7 +313,14 @@ impl MhxyApp {
             {
                 self.reset_map_window_geometry(ui.ctx());
             }
-        }
+            if ui
+                .button("退出地图浮窗模式")
+                .on_hover_text("关闭浮窗模式，地图回到主窗口")
+                .clicked()
+            {
+                self.set_map_window(false);
+            }
+        });
     }
 
     /// 普通界面：退出精简，并关掉地图浮窗，让地图回到主窗口。
@@ -961,9 +1107,13 @@ impl eframe::App for MhxyApp {
         if self.config.meditation_enabled {
             self.meditation_overlay(&ctx);
         }
+        // 「地图浮窗设置」是普通独立窗口，和浮窗本身分开调度。
+        self.map_window_settings_window(&ctx);
         // 地图浮窗：和主窗口同帧调度所有任务窗口，关闭模式后下一帧就不再创建。
-        // 先记下主窗口是否在前台：浮窗据此让出置顶，不能盖住「更多」菜单和设置项。
-        self.main_window_focused = ctx.input(|input| input.viewport().focused.unwrap_or(true));
+        // 本进程有窗口在前台（主窗口、「地图浮窗设置」、说明……）时，浮窗让出置顶，
+        // 否则置顶浮窗会盖住菜单、下拉框和滑块，点了等于没点。
+        self.app_window_in_foreground = ctx.input(|input| input.viewport().focused.unwrap_or(true))
+            || borderless::foreground_is_ours();
         self.map_windows(&ctx);
         // 精简模式没有顶栏和状态栏，进入后给一个短暂的退出提示。
         if self.compact {
