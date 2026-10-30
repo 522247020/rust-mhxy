@@ -382,11 +382,14 @@ impl MhxyApp {
                 .with_decorations(false)
                 .with_transparent(true)
                 .with_resizable(true)
+                // 新视口默认是 active 的：浮窗一创建就抢走焦点，主窗口里刚打开的
+                // 「更多」菜单会立刻收起，浮窗设置根本来不及点。浮窗不需要键盘焦点。
+                .with_active(false)
                 .with_visible(visible)
                 .with_inner_size(vec2(spawn.width, spawn.height))
                 .with_min_inner_size(MAP_WINDOW_MIN_SIZE)
                 .with_position(pos2(spawn.x, spawn.y));
-            if self.config.map_window_on_top {
+            if desired_on_top(self.config.map_window_on_top, self.main_window_focused) {
                 builder = builder.with_always_on_top();
             }
             ctx.show_viewport_immediate(map_window_id(task), builder, |ui, _class| {
@@ -444,7 +447,7 @@ impl MhxyApp {
         if attempts < 30 {
             // Windows 会给无边框窗口加 DWM 投影和圆角，透明背景下看得到；
             // 窗口刚创建时可能还找不到，下一帧再试（其他平台是空操作）。
-            let found = borderless::prepare(&title, true, aspect);
+            let found = borderless::prepare(&title, true, aspect, true);
             // 正常第一帧就能找到窗口；万一找不到，也别一直藏着不显示。
             prepared = found || attempts >= 2;
             self.map_windows.entry(task).or_default().shadow_attempts =
@@ -706,8 +709,11 @@ impl MhxyApp {
 
     /// 同步置顶 / 鼠标穿透，并把当前任务浮窗的位置和大小写回配置。
     fn sync_map_window_state(&mut self, ctx: &egui::Context, task: &'static str) {
-        let on_top = self.config.map_window_on_top;
+        // 主窗口在前台（用户在调设置、看菜单）时，浮窗让位：降成普通窗口并压到
+        // 主窗口下面。否则置顶浮窗会盖住「更多」菜单、下拉框和滑块，点了等于没点。
+        let on_top = desired_on_top(self.config.map_window_on_top, self.main_window_focused);
         let locked = self.config.map_window_locked;
+        let title = map_window_title(task);
         {
             let runtime = self.map_windows.entry(task).or_default();
             if runtime.applied_on_top != Some(on_top) {
@@ -717,6 +723,11 @@ impl MhxyApp {
                     egui::WindowLevel::Normal
                 };
                 ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
+                if !on_top {
+                    // 只靠 WindowLevel 不够：从置顶降下来时窗口会停在原先的层叠位置，
+                    // 仍在主窗口之上。这里把它直接插到主窗口下面。
+                    borderless::tuck_below(&title, &crate::main_window_title());
+                }
                 runtime.applied_on_top = Some(on_top);
             }
             if runtime.applied_passthrough != Some(locked) {
@@ -881,6 +892,11 @@ impl MhxyApp {
             self.set_map_window(false);
         }
     }
+}
+
+/// 浮窗实际是否置顶：配置要置顶，而且主窗口不在前台。
+pub(super) fn desired_on_top(configured: bool, main_focused: bool) -> bool {
+    configured && !main_focused
 }
 
 /// 两次浮窗几何值是否足够接近：容差吸收 DPI 取整带来的小数抖动。

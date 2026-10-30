@@ -962,6 +962,8 @@ impl eframe::App for MhxyApp {
             self.meditation_overlay(&ctx);
         }
         // 地图浮窗：和主窗口同帧调度所有任务窗口，关闭模式后下一帧就不再创建。
+        // 先记下主窗口是否在前台：浮窗据此让出置顶，不能盖住「更多」菜单和设置项。
+        self.main_window_focused = ctx.input(|input| input.viewport().focused.unwrap_or(true));
         self.map_windows(&ctx);
         // 精简模式没有顶栏和状态栏，进入后给一个短暂的退出提示。
         if self.compact {

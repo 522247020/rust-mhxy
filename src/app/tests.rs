@@ -1118,6 +1118,17 @@ fn native_resize_constraints_keep_aspect_and_fixed_anchor() {
 }
 
 #[test]
+fn map_window_yields_topmost_while_main_window_is_focused() {
+    // 配置要置顶，且主窗口不在前台：浮窗压在其他窗口（游戏）上面。
+    assert!(map_window::desired_on_top(true, false));
+    // 主窗口在前台（正在调设置 / 开着菜单）：浮窗让位，否则会盖住菜单点不到。
+    assert!(!map_window::desired_on_top(true, true));
+    // 没开置顶就一直不是置顶。
+    assert!(!map_window::desired_on_top(false, false));
+    assert!(!map_window::desired_on_top(false, true));
+}
+
+#[test]
 fn map_window_geometry_change_detection_ignores_rounding_noise() {
     let size = Some(vec2(600.0, 450.0));
     let pos = Some(pos2(100.0, 200.0));

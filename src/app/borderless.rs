@@ -344,8 +344,14 @@ pub(super) fn completed_size(_title: &str) -> Option<[i32; 2]> {
 }
 
 /// 去掉 DWM 边缘，并安装原生尺寸消息处理。只在创建窗口时调用。
+/// `no_activate` 为真时窗口不抢焦点（浮窗不应该把主窗口 / 游戏的焦点抢走）。
 #[cfg(windows)]
-pub(super) fn prepare(title: &str, resizable: bool, aspect: Option<f32>) -> bool {
+pub(super) fn prepare(
+    title: &str,
+    resizable: bool,
+    aspect: Option<f32>,
+    no_activate: bool,
+) -> bool {
     use std::ffi::c_void;
     use windows::Win32::Graphics::Dwm::{
         DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE,
@@ -354,7 +360,7 @@ pub(super) fn prepare(title: &str, resizable: bool, aspect: Option<f32>) -> bool
     use windows::Win32::UI::WindowsAndMessaging::{
         GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWLP_WNDPROC, GWL_EXSTYLE, GWL_STYLE,
         SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WS_BORDER, WS_CAPTION, WS_DLGFRAME,
-        WS_EX_TOOLWINDOW, WS_EX_WINDOWEDGE, WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
+        WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_WINDOWEDGE, WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
     };
     let Some(hwnd) = find_own_window(title) else {
         return false;
@@ -370,11 +376,15 @@ pub(super) fn prepare(title: &str, resizable: bool, aspect: Option<f32>) -> bool
         }
         SetWindowLongPtrW(hwnd, GWL_STYLE, style as isize);
         let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
-        SetWindowLongPtrW(
-            hwnd,
-            GWL_EXSTYLE,
-            ((ex_style & !WS_EX_WINDOWEDGE.0) | WS_EX_TOOLWINDOW.0) as isize,
-        );
+        let mut ex_style = (ex_style & !WS_EX_WINDOWEDGE.0) | WS_EX_TOOLWINDOW.0;
+        if no_activate {
+            // 浮窗显示 / 重建时不能抢焦点：一抢焦点，主窗口里刚打开的「更多」
+            // 菜单就会立刻收起，里面的浮窗设置根本来不及点。
+            ex_style |= WS_EX_NOACTIVATE.0;
+        } else {
+            ex_style &= !WS_EX_NOACTIVATE.0;
+        }
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex_style as isize);
         let current = GetWindowLongPtrW(hwnd, GWLP_WNDPROC);
         let our_proc = borderless_wndproc as *const () as usize as isize;
         if current != our_proc {
@@ -441,6 +451,40 @@ pub(super) fn prepare(title: &str, resizable: bool, aspect: Option<f32>) -> bool
 }
 
 #[cfg(not(windows))]
-pub(super) fn prepare(_title: &str, _resizable: bool, _aspect: Option<f32>) -> bool {
+pub(super) fn prepare(
+    _title: &str,
+    _resizable: bool,
+    _aspect: Option<f32>,
+    _no_activate: bool,
+) -> bool {
     true
+}
+
+/// 把浮窗压到主窗口下面（但仍高于其他普通窗口）。
+/// 主窗口在前台时，菜单 / 下拉框 / 设置项就不会被置顶的浮窗挡住而点不到。
+#[cfg(windows)]
+pub(super) fn tuck_below(title: &str, anchor_title: &str) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SetWindowPos, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    };
+    let (Some(hwnd), Some(anchor)) = (find_own_window(title), find_own_window(anchor_title)) else {
+        return false;
+    };
+    unsafe {
+        SetWindowPos(
+            hwnd,
+            Some(anchor),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        )
+        .is_ok()
+    }
+}
+
+#[cfg(not(windows))]
+pub(super) fn tuck_below(_title: &str, _anchor_title: &str) -> bool {
+    false
 }

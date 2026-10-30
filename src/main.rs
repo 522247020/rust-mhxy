@@ -20,13 +20,18 @@ use std::sync::Arc;
 pub const APP_VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 pub const APP_REPO_URL: &str = "https://github.com/522247020/rust-mhxy";
 
+/// 主窗口标题。无边框修饰和浮窗避让都要靠它在系统里定位主窗口。
+pub fn main_window_title() -> String {
+    format!("梦幻西游任务坐标辅助（rust-mhxy {APP_VERSION}）")
+}
+
 fn main() -> eframe::Result {
     if !acquire_single_instance() {
         return Ok(());
     }
     let config = config::Config::load(&config::default_config_path());
     let mut viewport = egui::ViewportBuilder::default()
-        .with_title(format!("梦幻西游任务坐标辅助（rust-mhxy {APP_VERSION}）"))
+        .with_title(main_window_title())
         .with_inner_size([1120.0, 800.0])
         .with_min_inner_size([760.0, 540.0])
         .with_icon(app_icon());

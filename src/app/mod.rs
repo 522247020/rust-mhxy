@@ -162,6 +162,8 @@ pub struct MhxyApp {
     testing_remote: bool,
     applied_min_inner_size: Option<Vec2>,
     applied_on_top: Option<bool>,
+    /// 上一帧主窗口是否在前台。地图浮窗靠它决定要不要让出置顶。
+    main_window_focused: bool,
     /// 取点窗口自己的置顶状态。子视口默认不会被父窗口的置顶带上，
     /// 不同步的话主窗口置顶时会把取点窗口整个压住。
     applied_region_on_top: Option<bool>,
@@ -404,6 +406,7 @@ impl MhxyApp {
             testing_remote: false,
             applied_min_inner_size: None,
             applied_on_top: None,
+            main_window_focused: false,
             applied_region_on_top: None,
             remote_feedback: None,
             notice: None,
