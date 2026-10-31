@@ -412,12 +412,31 @@ fn interval_is_only_shown_in_auto_mode() {
         texts.iter().any(|text| text == "识别间隔"),
         "自动模式应显示识别间隔：{texts:?}"
     );
+    assert!(
+        texts.iter().any(|text| text == "实时模式"),
+        "自动模式应提供实时模式开关：{texts:?}"
+    );
     assert!(!texts.iter().any(|text| text == "快捷键"));
 
+    // 实时模式开启后开关仍然可见（否则关不掉）。
+    app.config.realtime = true;
+    let mut output = ctx.run_ui(input(), |ui| app.basic_controls(ui));
+    let texts = collect_texts(&output.shapes);
+    output.textures_delta.clear();
+    assert!(
+        texts.iter().any(|text| text == "实时模式"),
+        "实时模式开启后开关仍需可见：{texts:?}"
+    );
+
+    app.config.realtime = false;
     app.config.trigger_mode = "manual".into();
     let mut output = ctx.run_ui(input(), |ui| app.basic_controls(ui));
     let texts = collect_texts(&output.shapes);
     output.textures_delta.clear();
+    assert!(
+        !texts.iter().any(|text| text == "实时模式"),
+        "手动模式不需要实时模式开关：{texts:?}"
+    );
     assert!(
         !texts.iter().any(|text| text == "识别间隔"),
         "手动模式不应占位显示识别间隔：{texts:?}"

@@ -1091,8 +1091,12 @@ impl MhxyApp {
                             self.update_preview(captured.full);
                             self.notice = None;
                             // 快捷键 / 「立即识别一次」是明确的用户意图，不能因为画面
-                            // 没变就跳过；自动识别才需要去重。
-                            if !force && self.last_signature == Some(captured.signature) {
+                            // 没变就跳过；自动识别才需要去重。实时模式要的就是持续识别，
+                            // 也跳过去重，否则画面不动时永远不再做 OCR。
+                            if !force
+                                && !self.config.realtime
+                                && self.last_signature == Some(captured.signature)
+                            {
                                 self.busy = false;
                                 self.log_detail(format!("{window_title}：识别区域未变化，跳过"));
                                 continue;

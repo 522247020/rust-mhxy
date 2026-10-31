@@ -345,18 +345,30 @@ impl MhxyApp {
                 if !self.manual_mode() {
                     ui.horizontal(|ui| {
                         ui.label("识别间隔");
-                        if ui
-                            .add(
-                                egui::DragValue::new(&mut self.config.interval_seconds)
-                                    .range(1..=60)
-                                    .suffix(" 秒"),
-                            )
-                            .on_hover_text("自动模式下每隔多少秒识别一次")
-                            .changed()
-                        {
-                            self.persist();
-                        }
+                        ui.add_enabled_ui(!self.config.realtime, |ui| {
+                            if ui
+                                .add(
+                                    egui::DragValue::new(&mut self.config.interval_seconds)
+                                        .range(1..=60)
+                                        .suffix(" 秒"),
+                                )
+                                .on_hover_text("自动模式下每隔多少秒识别一次")
+                                .changed()
+                            {
+                                self.persist();
+                            }
+                        });
                     });
+                    if ui
+                        .checkbox(&mut self.config.realtime, "实时模式")
+                        .on_hover_text(
+                            "不等固定间隔：截图→OCR 一完成就立刻开始下一轮，\
+                             适合抓鬼飞行、赶路时追坐标；会持续占用 CPU / GPU",
+                        )
+                        .changed()
+                    {
+                        self.persist();
+                    }
                 }
                 if self.manual_mode() {
                     ui.horizontal(|ui| {
@@ -760,7 +772,8 @@ impl MhxyApp {
         ui.add_space(4.0);
         ui.label(egui::RichText::new("识别模式").strong());
         for line in [
-            "自动（按间隔）：按设定间隔定时识别。",
+            "自动（按间隔）：按设定间隔定时识别，间隔 1~60 秒。",
+            "自动 + 实时模式：勾上「实时模式」后不等间隔，截图 → OCR 一识别完就立刻开始下一轮（持续占用 CPU）。",
             "手动（快捷键）：点「开始监听」后，按快捷键触发一次识别；快捷键可填写或点「录制」。",
         ] {
             ui.label(egui::RichText::new(line).small());

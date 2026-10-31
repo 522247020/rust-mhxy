@@ -163,6 +163,9 @@ pub struct Config {
     pub ocr_mode: String,
     #[serde(rename = "ocr/interval_seconds")]
     pub interval_seconds: u32,
+    /// 实时模式：不等固定间隔，上一轮识别一结束就继续下一轮。
+    #[serde(rename = "ocr/realtime")]
+    pub realtime: bool,
     #[serde(rename = "ocr/task_region", with = "task_region_serde")]
     pub task_region: TaskRegion,
     /// 送 OCR 前把截图放大几倍（1 = 不放大）。
@@ -318,6 +321,7 @@ impl Default for Config {
         let mut config = Self {
             ocr_mode: "local".into(),
             interval_seconds: 5,
+            realtime: false,
             task_region: DEFAULT_TASK_REGION,
             ocr_upscale: 2,
             ocr_high_recall: true,
@@ -637,6 +641,7 @@ const STRING_KEYS: &[&str] = &[
 ];
 
 const BOOL_KEYS: &[&str] = &[
+    "ocr/realtime",
     "ocr/extra_region_enabled",
     "task/option/抓鬼",
     "task/option/鬼王",
@@ -1245,6 +1250,7 @@ mod tests {
             color_gate_enabled: true,
             high_chance: true,
             ghost_king_high_chance: false,
+            realtime: true,
             color_gate_points: vec![ColorPoint::new(100, 200, [0xd4, 0xa0, 0x17], 15, 1)],
             ..Default::default()
         };
@@ -1255,6 +1261,7 @@ mod tests {
         assert_eq!(loaded.log_level, "detailed");
         assert!(loaded.color_gate_enabled);
         assert!(loaded.high_chance);
+        assert!(loaded.realtime, "实时模式应写入 ocr/realtime 并读回");
         assert!(!loaded.ghost_king_high_chance);
         assert_eq!(loaded.color_gate_points.len(), 1);
         assert_eq!(loaded.color_gate_points[0].color, [0xd4, 0xa0, 0x17]);
@@ -1694,6 +1701,7 @@ mod tests {
             "ocr/preprocess",
             "ocr/preprocess_color",
             "ocr/preprocess_tolerance",
+            "ocr/realtime",
             "ocr/region_presets",
             "ocr/task_region",
             "ocr/trigger",

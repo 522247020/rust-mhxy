@@ -680,8 +680,16 @@ impl eframe::App for MhxyApp {
             ctx.request_repaint_after(gate_interval);
         }
         if self.running && !self.manual_mode() && !self.busy {
-            let interval = Duration::from_secs(self.config.interval_seconds.max(1) as u64);
-            let due = self.last_scan.is_none_or(|last| last.elapsed() >= interval);
+            // 实时模式：上一轮 OCR 一结束就继续下一轮，不再等固定间隔。
+            // 留 100ms 下限只是为了不空转：没窗口 / 图色未命中时 trigger_scan
+            // 不会置忙，否则会每帧刷一次日志。
+            let due = if self.config.realtime {
+                const MIN_GAP: Duration = Duration::from_millis(100);
+                self.last_scan.is_none_or(|last| last.elapsed() >= MIN_GAP)
+            } else {
+                let interval = Duration::from_secs(self.config.interval_seconds.max(1) as u64);
+                self.last_scan.is_none_or(|last| last.elapsed() >= interval)
+            };
             if due {
                 self.trigger_scan(false);
             }
@@ -797,6 +805,12 @@ impl eframe::App for MhxyApp {
                                 format!("手动识别 · 快捷键 {hotkey}（未开始监听）")
                             };
                             ui.label(egui::RichText::new(text).small().weak());
+                        } else if self.config.realtime {
+                            ui.label(
+                                egui::RichText::new("实时识别 · 上一轮完成立刻继续")
+                                    .small()
+                                    .weak(),
+                            );
                         } else {
                             ui.label(
                                 egui::RichText::new(format!(
