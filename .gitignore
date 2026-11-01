@@ -10,3 +10,4 @@
 __pycache__/
 /.ci-cache
 /logs
+/assets/fontlib.json
