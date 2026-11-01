@@ -361,7 +361,7 @@ impl Default for Config {
             meditation_opacity: 0.85,
             meditation_font_px: 0,
             meditation_text_color: [255, 255, 255],
-            meditation_hotkey: "F9".to_string(),
+            meditation_hotkey: "F5".to_string(),
             meditation_on_top: true,
             meditation_locked: false,
             meditation_enabled: false,
@@ -1349,6 +1349,19 @@ mod tests {
             .unwrap();
             assert_eq!(Config::load(&path).theme, mode);
         }
+    }
+
+    #[test]
+    fn default_hotkeys_are_distinct_and_parseable() {
+        let config = Config::default();
+        assert_eq!(config.meditation_hotkey, "F5");
+        assert_eq!(config.ocr_hotkey, "F8");
+        assert!(
+            crate::hotkey::Hotkey::parse(&config.meditation_hotkey).is_ok(),
+            "默认打坐快捷键必须能解析：{}",
+            config.meditation_hotkey
+        );
+        assert!(crate::hotkey::Hotkey::parse(&config.ocr_hotkey).is_ok());
     }
 
     #[test]

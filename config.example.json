@@ -89,7 +89,7 @@
   // 文字加粗（使用系统粗体字体）
   "meditation/bold": false,
   // 开始 / 重新计时的全局快捷键
-  "meditation/hotkey": "F9",
+  "meditation/hotkey": "F5",
   // 悬浮窗置顶（Windows 生效；Wayland 由桌面环境决定）
   "meditation/on_top": true,
   // 锁定后悬浮窗鼠标穿透，只能在主界面取消
