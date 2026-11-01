@@ -7,6 +7,9 @@ mod capture;
 mod config;
 mod core;
 mod flight_flags;
+// 点阵字库原型：已经过单测，还没接进正式识别流程，先不报 dead_code。
+#[allow(dead_code)]
+mod font_lib;
 mod gate;
 mod hotkey;
 mod meditation;

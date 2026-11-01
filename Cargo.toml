@@ -9,6 +9,11 @@ license = "MIT"
 name = "rust-mhxy"
 path = "src/main.rs"
 
+# 字库调试工具：建库 / 在截图上直接读字，不启动 UI。
+[[bin]]
+name = "font-tool"
+path = "src/bin/font_tool.rs"
+
 [dependencies]
 eframe = { version = "0.36", default-features = false, features = [
     "default_fonts",
