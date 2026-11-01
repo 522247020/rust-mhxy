@@ -16,6 +16,10 @@
   "ocr/high_recall": true,
   // 多帧投票：地图取最近几帧众数、坐标取中位数，抑制单帧错认导致的跳动。
   "ocr/vote_frames": true,
+  // 点阵字库复核坐标：用 16x24 模板重读 OCR 认到的坐标数字（需先用 font-tool 建库）。
+  "ocr/font_lib": false,
+  // 字库路径；留空用 assets/fontlib.json，相对路径也相对 assets 目录。
+  "ocr/font_lib_path": "",
   // 识别触发方式："auto" 按间隔自动识别；"manual" 按快捷键手动触发一次
   "ocr/trigger": "auto",
   // 手动模式的快捷键，例如 F8、Ctrl+F8；Windows 下全局生效

@@ -177,6 +177,12 @@ pub struct Config {
     /// 多帧投票：地图取最近几帧众数、坐标取中位数。
     #[serde(rename = "ocr/vote_frames")]
     pub ocr_vote_frames: bool,
+    /// 点阵字库复核坐标：用模板重读 OCR 认到的坐标数字（需先用 font-tool 建库）。
+    #[serde(rename = "ocr/font_lib")]
+    pub font_lib_enabled: bool,
+    /// 字库路径；留空用 `assets/fontlib.json`，相对路径相对 assets 目录。
+    #[serde(rename = "ocr/font_lib_path")]
+    pub font_lib_path: String,
     /// 按分辨率保存的识别区域：键是 "1920x1080"，值是 "0.65,0.23,0.98,0.50"。
     #[serde(rename = "ocr/region_presets", deserialize_with = "de_region_presets")]
     pub region_presets: std::collections::BTreeMap<String, String>,
@@ -326,6 +332,8 @@ impl Default for Config {
             ocr_upscale: 2,
             ocr_high_recall: true,
             ocr_vote_frames: true,
+            font_lib_enabled: false,
+            font_lib_path: String::new(),
             region_presets: std::collections::BTreeMap::new(),
             extra_task_region: DEFAULT_EXTRA_REGION,
             extra_region_enabled: false,
@@ -1208,6 +1216,21 @@ pub fn assets_dir() -> PathBuf {
     PathBuf::from(".")
 }
 
+/// 点阵字库的实际路径：配置为空时用 `assets/fontlib.json`，
+/// 相对路径也相对 assets 目录（和模型放在一起，方便随包分发）。
+pub fn font_lib_path(config: &Config) -> PathBuf {
+    let raw = config.font_lib_path.trim();
+    if raw.is_empty() {
+        return assets_dir().join("fontlib.json");
+    }
+    let path = PathBuf::from(raw);
+    if path.is_absolute() {
+        path
+    } else {
+        assets_dir().join(path)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1707,6 +1730,8 @@ mod tests {
             "ocr/extra_preprocess_tolerance",
             "ocr/extra_region_enabled",
             "ocr/extra_task_region",
+            "ocr/font_lib",
+            "ocr/font_lib_path",
             "ocr/high_recall",
             "ocr/hotkey",
             "ocr/interval_seconds",

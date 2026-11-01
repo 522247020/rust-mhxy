@@ -172,6 +172,10 @@ pub struct MhxyApp {
     /// 不同步的话主窗口置顶时会把取点窗口整个压住。
     applied_region_on_top: Option<bool>,
     remote_feedback: Option<Result<String, String>>,
+    /// 点阵字库（坐标复核用）：启用且加载成功时才有值。
+    font_lib: Option<Arc<crate::font_lib::GlyphLib>>,
+    /// 字库加载失败的原因，侧边栏直接展示。
+    font_lib_error: Option<String>,
     notice: Option<String>,
     show_help: bool,
     last_ocr_secs: Option<f64>,
@@ -320,6 +324,7 @@ impl MhxyApp {
         let config_path = crate::config::default_config_path();
         let config = Config::load(&config_path);
         let mut app = Self::from_config(config, config_path, cc.egui_ctx.clone());
+        app.reload_font_lib();
         app.refresh_windows(true);
         app
     }
@@ -417,6 +422,8 @@ impl MhxyApp {
             app_window_in_foreground: false,
             applied_region_on_top: None,
             remote_feedback: None,
+            font_lib: None,
+            font_lib_error: None,
             notice: None,
             show_help: false,
             last_ocr_secs: None,
@@ -1037,6 +1044,32 @@ impl MhxyApp {
         });
     }
 
+    /// 按当前配置加载点阵字库。关掉或加载失败时清空，后续只靠 OCR 文本。
+    pub(super) fn reload_font_lib(&mut self) {
+        self.font_lib = None;
+        self.font_lib_error = None;
+        if !self.config.font_lib_enabled {
+            return;
+        }
+        let path = crate::config::font_lib_path(&self.config);
+        match crate::font_lib::GlyphLib::load(&path) {
+            Ok(lib) if lib.is_empty() => {
+                self.font_lib_error = Some(format!("字库 {} 里没有字模", path.display()));
+            }
+            Ok(lib) => {
+                self.log_detail(format!(
+                    "点阵字库已加载：{}（{} 个字模，{}x{}）",
+                    path.display(),
+                    lib.len(),
+                    lib.cell_w,
+                    lib.cell_h
+                ));
+                self.font_lib = Some(Arc::new(lib));
+            }
+            Err(err) => self.font_lib_error = Some(err),
+        }
+    }
+
     /// 拿到后台线程的截图后，按当前识别方式提交 OCR。
     /// PNG 编码和远端请求都在后台线程里做，UI 线程只负责发结果。
     fn start_ocr(&mut self, generation: u64, panel: image::RgbImage, window_title: &str) {
@@ -1056,10 +1089,12 @@ impl MhxyApp {
             });
         } else {
             self.log_detail(format!("{window_title}：本地 PP-OCR 识别中"));
-            if let Err(err) = self
-                .worker
-                .submit(generation, panel, self.config.ocr_high_recall)
-            {
+            if let Err(err) = self.worker.submit(
+                generation,
+                panel,
+                self.config.ocr_high_recall,
+                self.font_lib.clone(),
+            ) {
                 self.busy = false;
                 self.notice = Some(err);
             }
@@ -1239,6 +1274,10 @@ impl MhxyApp {
     }
 
     fn apply_ocr(&mut self, ocr_text: &OcrText) {
+        // 字库复核等后处理结果先进详细日志，再解析任务。
+        for note in &ocr_text.notes {
+            self.log_detail(note.clone());
+        }
         let locations = parse_tasks(&ocr_text.text, &self.maps, self.task_filter());
         // 详细日志里始终留一份 OCR 原文：同时有两个任务时，能直接看出是
         // 只截到一段文字（区域 / 预处理）还是文字都在、只是没解析出来（解析）。

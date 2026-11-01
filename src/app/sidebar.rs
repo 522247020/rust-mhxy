@@ -707,6 +707,54 @@ impl MhxyApp {
             {
                 self.persist();
             }
+            if self.config.ocr_mode == "local" {
+                ui.add_space(4.0);
+                if ui
+                    .checkbox(&mut self.config.font_lib_enabled, "点阵字库复核坐标")
+                    .on_hover_text(
+                        "用 16x24 点阵模板重读 OCR 认到的坐标数字；需要先用 font-tool 建库，且只对本地识别生效",
+                    )
+                    .changed()
+                {
+                    self.reload_font_lib();
+                    self.invalidate_scan();
+                    self.persist();
+                }
+                if self.config.font_lib_enabled {
+                    ui.horizontal(|ui| {
+                        ui.label("字库");
+                        let response = ui.add(
+                            egui::TextEdit::singleline(&mut self.config.font_lib_path)
+                                .hint_text("默认 assets/fontlib.json")
+                                .desired_width(150.0),
+                        );
+                        if response.lost_focus() {
+                            self.reload_font_lib();
+                            self.persist();
+                        }
+                        if ui
+                            .button("重新加载")
+                            .on_hover_text("改了字库文件后点这里重新读取")
+                            .clicked()
+                        {
+                            self.reload_font_lib();
+                        }
+                    });
+                    match (&self.font_lib, &self.font_lib_error) {
+                        (Some(lib), _) => {
+                            ui.label(
+                                egui::RichText::new(format!("已加载 {} 个字模", lib.len()))
+                                    .small()
+                                    .color(theme::jade()),
+                            );
+                        }
+                        (None, Some(err)) => {
+                            ui.label(egui::RichText::new(err).small().color(theme::red()));
+                        }
+                        (None, None) => {}
+                    }
+                }
+            }
         });
         if now != fold_ocr {
             self.set_sidebar_section_open("ocr", now);

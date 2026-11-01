@@ -16,10 +16,28 @@ pub const LOCAL_DICT: &str = "ppocrv5_dict.txt";
 const LOCAL_INTRA_THREADS: usize = 4;
 const REMOTE_TIMEOUT: Duration = Duration::from_secs(10);
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct OcrText {
     pub text: String,
     pub elapsed_secs: f64,
+    /// 每个检测框的文本和位置。远端接口只回文本，所以可能是空的。
+    pub regions: Vec<OcrRegion>,
+    /// 后处理（例如点阵字库复核）产生的说明，由 UI 写详细日志。
+    pub notes: Vec<String>,
+}
+
+/// 一个 OCR 检测框：内容、置信度、在原图（送 OCR 的那张图）里的矩形，
+/// 以及它在 `OcrText::text` 里对应的字符区间（用于就地替换）。
+#[derive(Clone, Debug, PartialEq)]
+pub struct OcrRegion {
+    pub text: String,
+    pub score: f32,
+    pub left: f32,
+    pub top: f32,
+    pub right: f32,
+    pub bottom: f32,
+    /// 在 `OcrText::text` 中的字符下标区间（左闭右开）。
+    pub range: std::ops::Range<usize>,
 }
 
 /// 后台线程完成「截图 → 裁剪 → 预处理 → 放大」后的结果。
@@ -61,6 +79,8 @@ struct LocalJob {
     test: bool,
     /// 高召回检测：降低检测阈值，宁可多出噪声框也别漏字。
     high_recall: bool,
+    /// 坐标复核用的点阵字库；为空则只靠 OCR 文本。
+    font_lib: Option<std::sync::Arc<crate::font_lib::GlyphLib>>,
 }
 
 /// 常驻线程：收到第一张截图时才加载模型，远端模式不占用模型内存。
@@ -103,9 +123,28 @@ impl LocalWorker {
                     if slot.is_none() {
                         *slot = Some(LocalEngine::new(job.high_recall)?);
                     }
-                    slot.as_ref()
+                    let mut ocr = slot
+                        .as_ref()
                         .expect("initialized engine")
-                        .recognize(&job.image)
+                        .recognize(&job.image)?;
+                    // 点阵字库复核：OCR 负责「这段文字大概是什么」，字库负责
+                    // 「这几个数字到底是几」。字库读不确信时不改任何东西。
+                    if let Some(lib) = &job.font_lib {
+                        let (text, fixes) = crate::coord_fix::correct(
+                            &job.image,
+                            &ocr.text,
+                            &ocr.regions,
+                            lib,
+                            crate::coord_fix::DEFAULT_MATCH,
+                            crate::coord_fix::DEFAULT_PADDING,
+                        );
+                        for fix in fixes {
+                            ocr.notes
+                                .push(format!("字库复核坐标 {} → {}", fix.before, fix.after));
+                        }
+                        ocr.text = text;
+                    }
+                    Ok(ocr)
                 })();
                 let event = if job.test {
                     OcrEvent::PanelTest { result }
@@ -129,6 +168,7 @@ impl LocalWorker {
         generation: u64,
         image: RgbImage,
         high_recall: bool,
+        font_lib: Option<std::sync::Arc<crate::font_lib::GlyphLib>>,
     ) -> Result<(), String> {
         self.sender
             .send(LocalJob {
@@ -136,11 +176,13 @@ impl LocalWorker {
                 image,
                 test: false,
                 high_recall,
+                font_lib,
             })
             .map_err(|_| "本地识别线程已退出，请重启程序".to_string())
     }
 
     /// 取点窗口的「测试 OCR」：不占用正式识别的 generation。
+    /// 测试结果保持原文，不做字库复核，方便看出 OCR 本身错在哪里。
     pub fn submit_test(&self, image: RgbImage) -> Result<(), String> {
         self.sender
             .send(LocalJob {
@@ -148,6 +190,7 @@ impl LocalWorker {
                 image,
                 test: true,
                 high_recall: false,
+                font_lib: None,
             })
             .map_err(|_| "本地识别线程已退出，请重启程序".to_string())
     }
@@ -188,14 +231,26 @@ impl LocalEngine {
             .ocr
             .predict(vec![image.clone()])
             .map_err(|err| format!("本地 PP-OCR 推理失败：{err}"))?;
-        let text = results
-            .iter()
-            .map(regions_to_text)
-            .collect::<Vec<_>>()
-            .join("\n");
+        let mut text = String::new();
+        let mut regions = Vec::new();
+        for (index, result) in results.iter().enumerate() {
+            let (line_text, mut line_regions) = regions_to_text(result);
+            if index > 0 {
+                text.push('\n');
+            }
+            // `range` 是相对整段文本的字符下标，拼接后要整体平移。
+            let offset = text.chars().count();
+            for region in &mut line_regions {
+                region.range = (region.range.start + offset)..(region.range.end + offset);
+            }
+            text.push_str(&line_text);
+            regions.append(&mut line_regions);
+        }
         Ok(OcrText {
             text,
             elapsed_secs: started.elapsed().as_secs_f64(),
+            regions,
+            notes: Vec::new(),
         })
     }
 }
@@ -204,11 +259,15 @@ impl LocalEngine {
 ///
 /// `all_text()` 按检测顺序返回，遇到两个任务条目、或者倾斜/换行时顺序可能乱掉。
 /// 用检测框重新排一次，后续解析拿到的就是「从左到右、从上到下」的文本。
-fn regions_to_text(result: &oar_ocr::oarocr::OAROCRResult) -> String {
+///
+/// 同时返回每个检测框的坐标和在文本中的字符区间，供点阵字库复核使用。
+fn regions_to_text(result: &oar_ocr::oarocr::OAROCRResult) -> (String, Vec<OcrRegion>) {
     struct Item {
         top: f32,
         bottom: f32,
         left: f32,
+        right: f32,
+        score: f32,
         text: String,
     }
 
@@ -223,15 +282,19 @@ fn regions_to_text(result: &oar_ocr::oarocr::OAROCRResult) -> String {
             let mut top = f32::INFINITY;
             let mut bottom = f32::NEG_INFINITY;
             let mut left = f32::INFINITY;
+            let mut right = f32::NEG_INFINITY;
             for point in &region.bounding_box.points {
                 top = top.min(point.y);
                 bottom = bottom.max(point.y);
                 left = left.min(point.x);
+                right = right.max(point.x);
             }
             top.is_finite().then_some(Item {
                 top,
                 bottom,
                 left,
+                right,
+                score: region.confidence.unwrap_or(0.0),
                 text,
             })
         })
@@ -258,17 +321,35 @@ fn regions_to_text(result: &oar_ocr::oarocr::OAROCRResult) -> String {
         }
     }
 
-    lines
-        .iter_mut()
-        .map(|line| {
-            line.sort_by(|a, b| a.left.total_cmp(&b.left));
-            line.iter()
-                .map(|item| item.text.as_str())
-                .collect::<Vec<_>>()
-                .join(" ")
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    let mut text = String::new();
+    let mut regions = Vec::new();
+    let mut char_index = 0usize;
+    for (line_index, line) in lines.iter_mut().enumerate() {
+        line.sort_by(|a, b| a.left.total_cmp(&b.left));
+        if line_index > 0 {
+            text.push('\n');
+            char_index += 1;
+        }
+        for (item_index, item) in line.iter().enumerate() {
+            if item_index > 0 {
+                text.push(' ');
+                char_index += 1;
+            }
+            let start = char_index;
+            text.push_str(&item.text);
+            char_index += item.text.chars().count();
+            regions.push(OcrRegion {
+                text: item.text.clone(),
+                score: item.score,
+                left: item.left,
+                top: item.top,
+                right: item.right,
+                bottom: item.bottom,
+                range: start..char_index,
+            });
+        }
+    }
+    (text, regions)
 }
 
 /// 优先使用随包携带的模型（`assets/models` 或 exe 旁的 `models`）；
@@ -314,9 +395,12 @@ pub fn remote_recognize(
     let data = response_body
         .read_to_vec()
         .map_err(|err| format!("读取远程响应失败：{err}"))?;
+    // 远端接口只回文本，没有检测框，因此不做字库复核（`regions` 为空）。
     Ok(OcrText {
         text: extract_ocr_text(&data),
         elapsed_secs: started.elapsed().as_secs_f64(),
+        regions: Vec::new(),
+        notes: Vec::new(),
     })
 }
 

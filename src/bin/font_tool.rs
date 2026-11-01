@@ -10,7 +10,6 @@
 //! 配同名 `xxx.txt` 写这行的准确文字，例如 `79,26`。
 
 #[path = "../font_lib.rs"]
-#[allow(dead_code)]
 mod font_lib;
 
 use font_lib::{GlyphLib, MatchConfig};
@@ -96,7 +95,9 @@ fn cell_size(flags: &HashMap<String, String>) -> Result<(u32, u32), String> {
     let (width, height) = raw
         .split_once(['x', 'X', '*'])
         .ok_or_else(|| format!("--cell 需要 宽x高，例如 16x24：{raw}"))?;
-    let width = width.parse::<u32>().map_err(|err| format!("--cell 宽解析失败：{err}"))?;
+    let width = width
+        .parse::<u32>()
+        .map_err(|err| format!("--cell 宽解析失败：{err}"))?;
     let height = height
         .parse::<u32>()
         .map_err(|err| format!("--cell 高解析失败：{err}"))?;
@@ -111,7 +112,8 @@ fn build(args: &[String]) -> Result<(), String> {
     let samples: PathBuf = required(&flags, "samples")?.into();
     let out: PathBuf = required(&flags, "out")?.into();
     let (cell_w, cell_h) = cell_size(&flags)?;
-    let (lib, warnings) = font_lib::build_from_dir(&samples, cell_w, cell_h, MatchConfig::default())?;
+    let (lib, warnings) =
+        font_lib::build_from_dir(&samples, cell_w, cell_h, MatchConfig::default())?;
     for warning in &warnings {
         eprintln!("警告：{warning}");
     }
@@ -197,6 +199,7 @@ fn print_line(line: &font_lib::LineRead) {
 }
 
 fn load_rgb(path: &Path) -> Result<image::RgbImage, String> {
-    let image = image::open(path).map_err(|err| format!("读取图片 {} 失败：{err}", path.display()))?;
+    let image =
+        image::open(path).map_err(|err| format!("读取图片 {} 失败：{err}", path.display()))?;
     Ok(image.to_rgb8())
 }

@@ -12,6 +12,10 @@
 //! 建库和识别必须用同一套归一化：裁剪框是「字的 x 跨度 × 整行行高」，而不是
 //! 各自的墨迹外框 —— 否则逗号和句点归一化后会变成同一个墨团。
 
+// 这个模块同时被 GUI 和 `font-tool` 两个 target 编译：建库、多行读取这些只给工具用，
+// 在 GUI target 里必然是一片 dead_code，所以整模块放开。
+#![allow(dead_code)]
+
 use image::{GrayImage, Luma, RgbImage};
 
 /// 默认 cell 尺寸。取 16x24 是因为任务栏数字大致是 1:1.5 的竖长比例。
@@ -24,7 +28,8 @@ pub const DEFAULT_CELL_H: u32 = 24;
 pub fn to_gray(image: &RgbImage) -> GrayImage {
     GrayImage::from_fn(image.width(), image.height(), |x, y| {
         let pixel = image.get_pixel(x, y);
-        let value = ((77 * pixel[0] as u32 + 150 * pixel[1] as u32 + 29 * pixel[2] as u32) >> 8) as u8;
+        let value =
+            ((77 * pixel[0] as u32 + 150 * pixel[1] as u32 + 29 * pixel[2] as u32) >> 8) as u8;
         Luma([value])
     })
 }
@@ -66,12 +71,23 @@ pub fn otsu(gray: &GrayImage) -> u8 {
 }
 
 /// 二值化成「黑字白底」，字库的输入约定就是这个形态。
+///
+/// 自动判极性：预处理里勾了反色（白字黑底）时，黑像素会占多数，此时翻转输出，
+/// 这样字库不需要关心上游有没有反色。
 pub fn binarize(image: &RgbImage) -> GrayImage {
     let gray = to_gray(image);
     let threshold = otsu(&gray);
+    let mut dark = 0u32;
+    for pixel in gray.pixels() {
+        if pixel[0] <= threshold {
+            dark += 1;
+        }
+    }
+    let inverted = dark * 2 > gray.width() * gray.height();
     GrayImage::from_fn(gray.width(), gray.height(), |x, y| {
         let value = gray.get_pixel(x, y)[0];
-        Luma([if value > threshold { 255 } else { 0 }])
+        let is_text = (value <= threshold) != inverted;
+        Luma([if is_text { 0 } else { 255 }])
     })
 }
 
@@ -161,12 +177,13 @@ impl GlyphLib {
     pub fn load(path: &std::path::Path) -> Result<Self, String> {
         let text = std::fs::read_to_string(path)
             .map_err(|err| format!("读取字库 {} 失败：{err}", path.display()))?;
-        serde_json::from_str(&text).map_err(|err| format!("解析字库 {} 失败：{err}", path.display()))
+        serde_json::from_str(&text)
+            .map_err(|err| format!("解析字库 {} 失败：{err}", path.display()))
     }
 
     pub fn save(&self, path: &std::path::Path) -> Result<(), String> {
-        let text = serde_json::to_string_pretty(self)
-            .map_err(|err| format!("序列化字库失败：{err}"))?;
+        let text =
+            serde_json::to_string_pretty(self).map_err(|err| format!("序列化字库失败：{err}"))?;
         std::fs::write(path, text).map_err(|err| format!("写入字库 {} 失败：{err}", path.display()))
     }
 }
@@ -330,11 +347,7 @@ pub fn analyze(gray: &GrayImage, cfg: MatchConfig) -> Vec<GlyphBox> {
             }
         }
         if bottom > top {
-            boxes.push(GlyphBox {
-                span,
-                top,
-                bottom,
-            });
+            boxes.push(GlyphBox { span, top, bottom });
         }
     }
     if boxes.is_empty() {
@@ -343,11 +356,7 @@ pub fn analyze(gray: &GrayImage, cfg: MatchConfig) -> Vec<GlyphBox> {
 
     // 3) 行高取「够高的那些字」的外包络：逗号/句点/小数点太矮，不参与定基线，
     //    但它们最终也用这条基线裁剪，因此逗号和句点在 cell 里的位置不同，可以区分。
-    let max_height = boxes
-        .iter()
-        .map(|b| b.bottom - b.top)
-        .max()
-        .unwrap_or(1) as f32;
+    let max_height = boxes.iter().map(|b| b.bottom - b.top).max().unwrap_or(1) as f32;
     let line_top = boxes
         .iter()
         .filter(|b| ((b.bottom - b.top) as f32) >= 0.5 * max_height)
@@ -374,21 +383,23 @@ pub fn analyze(gray: &GrayImage, cfg: MatchConfig) -> Vec<GlyphBox> {
 
 /// 把一个字框裁出来缩放到固定 cell。
 pub fn cell_of(gray: &GrayImage, b: &GlyphBox, cell_w: u32, cell_h: u32) -> Vec<u8> {
-    let width = b.span.width().max(1).min(gray.width().saturating_sub(b.span.x0).max(1));
+    let width = b
+        .span
+        .width()
+        .max(1)
+        .min(gray.width().saturating_sub(b.span.x0).max(1));
     let top = b.top.min(gray.height().saturating_sub(1));
-    let height = (b.bottom.saturating_sub(top)).max(1).min(gray.height() - top);
+    let height = (b.bottom.saturating_sub(top))
+        .max(1)
+        .min(gray.height() - top);
     let crop = image::imageops::crop_imm(gray, b.span.x0.min(gray.width() - 1), top, width, height)
         .to_image();
     resize_to_cell(&crop, cell_w, cell_h)
 }
 
 fn resize_to_cell(gray: &GrayImage, cell_w: u32, cell_h: u32) -> Vec<u8> {
-    let resized = image::imageops::resize(
-        gray,
-        cell_w,
-        cell_h,
-        image::imageops::FilterType::Triangle,
-    );
+    let resized =
+        image::imageops::resize(gray, cell_w, cell_h, image::imageops::FilterType::Triangle);
     resized.pixels().map(|pixel| pixel[0]).collect()
 }
 
@@ -536,9 +547,10 @@ fn collect_matches(
             },
             ..*b
         };
-        let (Some((_, left_score, _)), Some((_, right_score, _))) =
-            (best_match(gray, &left, lib, cfg), best_match(gray, &right, lib, cfg))
-        else {
+        let (Some((_, left_score, _)), Some((_, right_score, _))) = (
+            best_match(gray, &left, lib, cfg),
+            best_match(gray, &right, lib, cfg),
+        ) else {
             out.push(GlyphMatch {
                 label,
                 score,
@@ -592,8 +604,7 @@ pub fn read_lines(panel: &RgbImage, lib: &GlyphLib, cfg: MatchConfig) -> Vec<Lin
         if height > gray.height() - top {
             break;
         }
-        let line_image =
-            image::imageops::crop_imm(&gray, 0, top, gray.width(), height).to_image();
+        let line_image = image::imageops::crop_imm(&gray, 0, top, gray.width(), height).to_image();
         let mut line = read_line_gray(&line_image, lib, cfg);
         if line.glyphs.is_empty() {
             continue;
@@ -648,8 +659,8 @@ pub fn build_from_dir(
     cell_h: u32,
     cfg: MatchConfig,
 ) -> Result<(GlyphLib, Vec<String>), String> {
-    let entries =
-        std::fs::read_dir(dir).map_err(|err| format!("读取样本目录 {} 失败：{err}", dir.display()))?;
+    let entries = std::fs::read_dir(dir)
+        .map_err(|err| format!("读取样本目录 {} 失败：{err}", dir.display()))?;
     let mut samples: Vec<(String, GrayImage)> = Vec::new();
     let mut warnings = Vec::new();
     for entry in entries {
@@ -683,33 +694,60 @@ pub fn build_from_dir(
     Ok((lib, warnings))
 }
 
+/// 测试夹具：用 5x7 点阵字合成“游戏截图”。
+///
+/// `coord_fix` 的测试也用它，所以 `pub(crate)` + `cfg(test)`，不进入发布二进制。
 #[cfg(test)]
-mod tests {
+pub(crate) mod fixture {
     use super::*;
     use image::Rgb;
 
     /// 5x7 点阵字，用来合成测试图；真实场景换成游戏字体截图即可。
-    fn pattern(ch: char) -> Option<[&'static str; 7]> {
+    pub fn pattern(ch: char) -> Option<[&'static str; 7]> {
         let lines = match ch {
-            '0' => ["01110", "10001", "10001", "10001", "10001", "10001", "01110"],
-            '1' => ["00100", "01100", "00100", "00100", "00100", "00100", "01110"],
-            '2' => ["01110", "10001", "00001", "00010", "00100", "01000", "11111"],
-            '3' => ["11111", "00010", "00100", "00010", "00001", "10001", "01110"],
-            '4' => ["00010", "00110", "01010", "10010", "11111", "00010", "00010"],
-            '5' => ["11111", "10000", "11110", "00001", "00001", "10001", "01110"],
-            '6' => ["00110", "01000", "10000", "11110", "10001", "10001", "01110"],
-            '7' => ["11111", "00001", "00010", "00100", "01000", "01000", "01000"],
-            '8' => ["01110", "10001", "10001", "01110", "10001", "10001", "01110"],
-            '9' => ["01110", "10001", "10001", "01111", "00001", "00010", "01100"],
-            ',' => ["00000", "00000", "00000", "00000", "00000", "00100", "01000"],
-            '.' => ["00000", "00000", "00000", "00000", "00000", "01100", "01100"],
+            '0' => [
+                "01110", "10001", "10001", "10001", "10001", "10001", "01110",
+            ],
+            '1' => [
+                "00100", "01100", "00100", "00100", "00100", "00100", "01110",
+            ],
+            '2' => [
+                "01110", "10001", "00001", "00010", "00100", "01000", "11111",
+            ],
+            '3' => [
+                "11111", "00010", "00100", "00010", "00001", "10001", "01110",
+            ],
+            '4' => [
+                "00010", "00110", "01010", "10010", "11111", "00010", "00010",
+            ],
+            '5' => [
+                "11111", "10000", "11110", "00001", "00001", "10001", "01110",
+            ],
+            '6' => [
+                "00110", "01000", "10000", "11110", "10001", "10001", "01110",
+            ],
+            '7' => [
+                "11111", "00001", "00010", "00100", "01000", "01000", "01000",
+            ],
+            '8' => [
+                "01110", "10001", "10001", "01110", "10001", "10001", "01110",
+            ],
+            '9' => [
+                "01110", "10001", "10001", "01111", "00001", "00010", "01100",
+            ],
+            ',' => [
+                "00000", "00000", "00000", "00000", "00000", "00100", "01000",
+            ],
+            '.' => [
+                "00000", "00000", "00000", "00000", "00000", "01100", "01100",
+            ],
             _ => return None,
         };
         Some(lines)
     }
 
     /// 把一行文字渲染成黑字白底的图（scale 模拟字号，gap 模拟字间距）。
-    fn render(text: &str, scale: u32, gap: u32) -> RgbImage {
+    pub fn render(text: &str, scale: u32, gap: u32) -> RgbImage {
         let chars: Vec<char> = text.chars().collect();
         let advance = 5 + gap;
         let width = chars.len() as u32 * advance * scale;
@@ -738,13 +776,36 @@ mod tests {
         image
     }
 
+    /// 把一行文字画到一张更大的白底画布的 (x, y) 处，用来模拟“面板里的一块区域”。
+    pub fn place(canvas: &mut RgbImage, line: &RgbImage, x: u32, y: u32) {
+        image::imageops::overlay(canvas, line, x as i64, y as i64);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fixture::render;
+    use super::*;
+    use image::Rgb;
+
     fn trained_lib() -> GlyphLib {
         // 同一行文字用两种字号各建一次库，验证缩放归一化是否有效。
         let samples = vec![
-            ("0123456789.,".to_string(), binarize(&render("0123456789.,", 4, 1))),
-            ("0123456789.,".to_string(), binarize(&render("0123456789.,", 6, 1))),
+            (
+                "0123456789.,".to_string(),
+                binarize(&render("0123456789.,", 4, 1)),
+            ),
+            (
+                "0123456789.,".to_string(),
+                binarize(&render("0123456789.,", 6, 1)),
+            ),
         ];
-        let (lib, warnings) = build_from_lines(DEFAULT_CELL_W, DEFAULT_CELL_H, &samples, MatchConfig::default());
+        let (lib, warnings) = build_from_lines(
+            DEFAULT_CELL_W,
+            DEFAULT_CELL_H,
+            &samples,
+            MatchConfig::default(),
+        );
         assert!(warnings.is_empty(), "建库警告：{warnings:?}");
         assert_eq!(lib.len(), 24, "12 个字 × 2 个字号");
         lib
@@ -788,8 +849,16 @@ mod tests {
     #[test]
     fn separates_comma_from_period() {
         let lib = trained_lib();
-        let comma = read_line_gray(&binarize(&render("1,2", 5, 1)), &lib, MatchConfig::default());
-        let period = read_line_gray(&binarize(&render("1.2", 5, 1)), &lib, MatchConfig::default());
+        let comma = read_line_gray(
+            &binarize(&render("1,2", 5, 1)),
+            &lib,
+            MatchConfig::default(),
+        );
+        let period = read_line_gray(
+            &binarize(&render("1.2", 5, 1)),
+            &lib,
+            MatchConfig::default(),
+        );
         assert_eq!(comma.text, "1,2");
         assert_eq!(period.text, "1.2");
     }
@@ -813,6 +882,19 @@ mod tests {
         let lines = read_lines(&panel, &lib, MatchConfig::default());
         let texts: Vec<&str> = lines.iter().map(|line| line.text.as_str()).collect();
         assert_eq!(texts, ["12,34", "56,78"]);
+    }
+
+    /// 预处理里勾了反色（白字黑底）时，字库也要能读：binarize 自动判极性。
+    #[test]
+    fn reads_inverted_text() {
+        let lib = trained_lib();
+        let normal = render("79,26", 5, 1);
+        let mut inverted = normal.clone();
+        for pixel in inverted.pixels_mut() {
+            pixel.0 = [255 - pixel.0[0], 255 - pixel.0[1], 255 - pixel.0[2]];
+        }
+        let read = read_line_gray(&binarize(&inverted), &lib, MatchConfig::default());
+        assert_eq!(read.text, "79,26");
     }
 
     #[test]

@@ -1278,6 +1278,8 @@ fn map_window_sizes_itself_to_the_map_image() {
     app.apply_ocr(&OcrText {
         text: "抓鬼 长寿村 12,34".into(),
         elapsed_secs: 0.1,
+        regions: Vec::new(),
+        notes: Vec::new(),
     });
     // 模拟旧版本存下来的固定 560×460 布局：升级后应自动贴合图片大小，
     // 但仍保留原来的位置。
@@ -1324,6 +1326,8 @@ fn map_window_builder_geometry_stays_frozen_after_manual_resize() {
     app.apply_ocr(&OcrText {
         text: "抓鬼 长寿村 12,34".into(),
         elapsed_secs: 0.1,
+        regions: Vec::new(),
+        notes: Vec::new(),
     });
     app.set_map_window(true);
     let mut output = ctx.run_ui(input(), |ui| app.ui(ui, &mut frame));
@@ -1435,6 +1439,8 @@ fn result(generation: u64) -> OcrEvent {
         result: Ok(OcrText {
             text: "抓鬼 长寿村 12,34 鬼王 天宫 56,78".into(),
             elapsed_secs: 0.25,
+            regions: Vec::new(),
+            notes: Vec::new(),
         }),
     }
 }
@@ -1446,6 +1452,8 @@ fn switching_windows_discards_inflight_results_and_previous_coordinates() {
     app.apply_ocr(&OcrText {
         text: "抓鬼 长寿村 12,34".into(),
         elapsed_secs: 0.1,
+        regions: Vec::new(),
+        notes: Vec::new(),
     });
     assert!(app.tasks["抓鬼"].location.is_some());
     app.busy = true;
@@ -1611,6 +1619,8 @@ fn panel_test_result_is_formatted_for_region_window() {
             result: Ok(OcrText {
                 text: "抓鬼 长寿村 12,34".into(),
                 elapsed_secs: 0.2,
+                regions: Vec::new(),
+                notes: Vec::new(),
             }),
         })
         .unwrap();
@@ -1851,6 +1861,8 @@ fn failed_recognition_keeps_previous_map_and_bounds() {
     let success = OcrText {
         text: "抓鬼 长寿村 12,34".into(),
         elapsed_secs: 0.1,
+        regions: Vec::new(),
+        notes: Vec::new(),
     };
     for width in [700.0, 320.0] {
         let mut expected = None;
@@ -1861,6 +1873,8 @@ fn failed_recognition_keeps_previous_map_and_bounds() {
                 app.apply_ocr(&OcrText {
                     text: String::new(),
                     elapsed_secs: 0.1,
+                    regions: Vec::new(),
+                    notes: Vec::new(),
                 });
             }
             let mut output = ctx.run_ui(
@@ -2159,6 +2173,8 @@ fn renders_local_remote_and_map_layouts_at_supported_sizes() {
             app.apply_ocr(&OcrText {
                 text: "抓鬼 长寿村 12,34 鬼王 天宫 56,78".into(),
                 elapsed_secs: 0.1,
+                regions: Vec::new(),
+                notes: Vec::new(),
             });
         }
         let mut output = ctx.run_ui(
@@ -2191,4 +2207,40 @@ fn renders_local_remote_and_map_layouts_at_supported_sizes() {
         output.textures_delta.clear();
     }
     assert_eq!(app.map_textures.len(), 2);
+}
+
+/// 点阵字库：加载失败要能报出来，关掉之后既不清空已有结果也不报错；
+/// 复核产生的说明要写进详细日志，方便事后核对「是不是字库改坏了」。
+#[test]
+fn font_lib_status_and_notes_are_reported() {
+    let mut app = app();
+    app.config.log_level = "detailed".into();
+    app.log_path =
+        std::env::temp_dir().join(format!("rust-mhxy-fontlib-log-{}.log", std::process::id()));
+    let _ = std::fs::remove_file(&app.log_path);
+
+    app.config.font_lib_enabled = true;
+    app.config.font_lib_path = "definitely-missing-fontlib.json".into();
+    app.reload_font_lib();
+    assert!(app.font_lib.is_none());
+    let error = app.font_lib_error.clone().unwrap_or_default();
+    assert!(error.contains("fontlib"), "错误信息要指出路径：{error:?}");
+
+    app.config.font_lib_enabled = false;
+    app.reload_font_lib();
+    assert!(app.font_lib.is_none());
+    assert!(app.font_lib_error.is_none(), "关掉后不该继续报错");
+
+    app.apply_ocr(&OcrText {
+        text: "抓鬼 长寿村 79,26".into(),
+        elapsed_secs: 0.1,
+        regions: Vec::new(),
+        notes: vec!["字库复核坐标 79,2G → 79,26".into()],
+    });
+    let text = std::fs::read_to_string(&app.log_path).unwrap_or_default();
+    assert!(
+        text.contains("字库复核坐标 79,2G → 79,26"),
+        "复核说明要写进详细日志：{text:?}"
+    );
+    let _ = std::fs::remove_file(&app.log_path);
 }
