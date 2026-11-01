@@ -783,6 +783,41 @@ impl Learner {
         }
         lib
     }
+
+    /// 用已有字库初始化（合并再采集）：每个字模当作「已有 1 票」的样本。
+    ///
+    /// 这样分几次采集（不同任务、不同字号的窗口）能逐步补全数字，
+    /// 而不是每次都从零开始、把上一次的成果覆盖掉。
+    pub fn seed(&mut self, lib: &GlyphLib) -> Result<(), String> {
+        if lib.cell_w != self.cell_w || lib.cell_h != self.cell_h {
+            return Err(format!(
+                "字库 cell 是 {}x{}，当前是 {}x{}，不能合并",
+                lib.cell_w, lib.cell_h, self.cell_w, self.cell_h
+            ));
+        }
+        for glyph in &lib.glyphs {
+            self.clusters
+                .push(Cluster::new(&glyph.label, glyph.pixels.clone()));
+        }
+        Ok(())
+    }
+}
+
+/// 坐标需要的字符集：0-9 加两个常用分隔符。采集后缺哪些可以直接报给用户。
+pub const COORDINATE_LABELS: [char; 12] =
+    ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', ',', '.'];
+
+/// 字库里还没有的坐标字符（按 `COORDINATE_LABELS` 的顺序）。
+pub fn missing_coordinate_labels(lib: &GlyphLib) -> Vec<char> {
+    COORDINATE_LABELS
+        .iter()
+        .copied()
+        .filter(|label| {
+            !lib.glyphs
+                .iter()
+                .any(|glyph| glyph.label == label.to_string())
+        })
+        .collect()
 }
 
 // -------------------------------------------------------------------- 建库

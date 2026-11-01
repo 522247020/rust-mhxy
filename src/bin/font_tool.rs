@@ -73,6 +73,7 @@ fn usage() {
   font-tool windows
   font-tool pick    [--window 梦幻西游] [--out <校验小图.png>] [--write-config]
   font-tool crop    --image <大图.png> --crop x,y,w,h --out <小图.png>
+  font-tool info    --lib <字库.json>
   font-tool region  --region 左,上,右,下 [--size 1218x994] [--config <config.json>]
                     [--window 梦幻西游] [--dry-run]
   font-tool snap    --out <面板.png> [--desktop] [--window 梦幻西游] [--region 左,上,右,下]
@@ -98,6 +99,8 @@ region ：不开界面直接写区域：更新 ocr/task_region 和该分辨率�
 capture：自动采集——截当前游戏窗口、OCR 拿标签、多帧聚类投票后直接写字库。
          默认只学数字和分隔符（坐标用），--all 连中文一起学。
          不给 --region/--preprocess 时，读 config.json 里的现有设置（含分辨率预设）。
+         目标写库已存在时默认合并（累积补全数字），--fresh 从零重建。
+info   ：体检字库：字符覆盖 / 每个字的字模数 / 还缺哪些坐标字符。
 build  ：目录下每个 xxx.png（一行文字的截图）+ 同名 xxx.txt（这行的准确文字）。
 read   ：默认按行切分整块面板；--line 表示整张图就是一行。"
     );
@@ -113,6 +116,7 @@ fn main() {
         Some("pick") => pick(&args[1..]),
         Some("crop") => crop_image(&args[1..]),
         Some("region") => region(&args[1..]),
+        Some("info") => info(&args[1..]),
         Some("snap") => snap(&args[1..]),
         Some("capture") => capture_frames(&args[1..]),
         Some("build") => build(&args[1..]),
@@ -1147,6 +1151,19 @@ fn capture_frames(args: &[String]) -> Result<(), String> {
             shift: 1,
         },
     );
+    // 默认合并已有字库：分几次采集能逐步补全数字，而不是把上次的成果覆盖掉。
+    if !flags.contains_key("fresh") && out.exists() {
+        match GlyphLib::load(&out) {
+            Ok(existing) => match learner.seed(&existing) {
+                Ok(()) => println!(
+                    "合并已有字库：{} 个字模（要重建加 --fresh）",
+                    existing.len()
+                ),
+                Err(err) => eprintln!("忽略已有字库：{err}"),
+            },
+            Err(err) => eprintln!("忽略已有字库：{err}"),
+        }
+    }
     let mut learned_frames = 0usize;
     let mut skipped = 0usize;
 
@@ -1242,12 +1259,45 @@ fn capture_frames(args: &[String]) -> Result<(), String> {
     if skipped > 0 {
         eprintln!("有 {skipped} 段文字的字数与切出的字模数对不上，已跳过");
     }
-    if lib.len() < 12 {
-        eprintln!(
-            "提醒：只有 {} 个字模，可能还没覆盖全部数字，建议多跑几帧",
-            lib.len()
-        );
+    report_coverage(&lib);
+    Ok(())
+}
+
+/// 报告坐标字符覆盖情况：缺哪个字直接列出来，比「只有 N 个字模」有用得多。
+fn report_coverage(lib: &GlyphLib) {
+    let missing = font_lib::missing_coordinate_labels(lib);
+    if missing.is_empty() {
+        println!("覆盖：0-9 和 , . 都有了");
+        return;
     }
+    let missing: String = missing.iter().collect();
+    eprintln!(
+        "提醒：还缺这些坐标字符：{missing}\n\
+         采集时任务栏里要有带坐标的任务（抓鬼/鬼王/降妖…），或者多跑几次；\
+         重复运行会自动合并到同一份字库（从零重建加 --fresh）。"
+    );
+}
+
+/// 体检已有字库：字符覆盖、每个字的字模数，以及缺哪些坐标字符。
+fn info(args: &[String]) -> Result<(), String> {
+    let flags = parse_flags(args);
+    let path: PathBuf = required(&flags, "lib")?.into();
+    let lib = GlyphLib::load(&path)?;
+    if lib.is_empty() {
+        return Err(format!("字库 {} 是空的", path.display()));
+    }
+    println!(
+        "{}：{}x{}，{} 个字模",
+        path.display(),
+        lib.cell_w,
+        lib.cell_h,
+        lib.len()
+    );
+    for (label, count) in lib.label_counts() {
+        print!("{label}×{count}  ");
+    }
+    println!();
+    report_coverage(&lib);
     Ok(())
 }
 
