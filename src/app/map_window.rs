@@ -25,6 +25,12 @@ pub(super) const MAP_WIDTH_PRESETS: [(&str, f32); 5] = [
     ("840 px", 840.0),
     ("1120 px", 1120.0),
 ];
+/// 浮窗最大不超过显示器的这个比例。
+///
+/// 地图宽高比差别很大（大唐境外 583×108 ≈ 5.4:1，碗子山 170×340 ≈ 0.5:1）。
+/// 切换地图时如果只保留宽度、按新比例重算高度，就会得到“贴满整屏高”或
+/// “被最小高度顶宽”的窗口：一半跑到屏幕外，边也抓不到。
+const MAP_WINDOW_SCREEN_FRACTION: f32 = 0.85;
 /// 多个浮窗首次出现时逐层错开的距离，避免完全叠在一起。
 const CASCADE_OFFSET: f32 = 28.0;
 
@@ -125,6 +131,7 @@ impl MhxyApp {
             });
         layout.width = size.x;
         layout.height = size.y;
+        clamp_layout_on_screen(layout, monitor);
         if let Some(runtime) = self.map_windows.get_mut(task) {
             runtime.spawn_layout = Some(*layout);
             runtime.last_size = Some(size);
@@ -337,7 +344,7 @@ impl MhxyApp {
                                 .unwrap_or_else(|| vec2(1920.0, 1080.0))
                         });
                         // 第一次拿到地图且窗口还是默认尺寸：直接用图片大小；
-                        // 否则保留用户已经调好的宽度，只把高度修正成等比。
+                        // 否则在当前窗口的盒子里按新比例重排，不放大。
                         let current_aspect = layout.width / layout.height.max(1.0);
                         if !runtime.sized_to_map && legacy_default {
                             let size = fit_window_size(size, monitor);
@@ -345,7 +352,11 @@ impl MhxyApp {
                             layout.height = size.y;
                             layout_changed = true;
                         } else if (current_aspect - aspect).abs() > 0.005 {
-                            let size = aspect_size(layout.width, aspect, monitor);
+                            let size = resize_for_aspect(
+                                vec2(layout.width, layout.height),
+                                aspect,
+                                monitor,
+                            );
                             layout.width = size.x;
                             layout.height = size.y;
                             layout_changed = true;
@@ -353,6 +364,10 @@ impl MhxyApp {
                         runtime.sized_to_map = true;
                         runtime.map_aspect = Some(aspect);
                         if layout_changed {
+                            // 换了比例以后窗口高度可能变化很大（例如 5.4:1 的
+                            // 大唐境外 ↔ 0.5:1 的碗子山），位置也得跟着拉回屏内，
+                            // 否则下半截 / 右边会落到屏幕外，边都抓不到。
+                            clamp_layout_on_screen(&mut layout, monitor);
                             runtime.spawn_layout = Some(layout);
                         }
                     }
@@ -895,17 +910,44 @@ fn fit_window_size(size: Vec2, monitor: Vec2) -> Vec2 {
     aspect_size(size.x.max(1.0), size.x / size.y.max(1.0), monitor)
 }
 
-/// 保持宽高比，把宽度限制在浮窗下限和当前显示器范围内。
-fn aspect_size(width: f32, aspect: f32, monitor: Vec2) -> Vec2 {
+/// 保持宽高比，把宽度限制在浮窗下限和「显示器的一部分」之间。
+///
+/// 上限同时受宽度和高度约束：`usable.y * aspect` 保证按比例算出的高度不会
+/// 超过屏幕，避免换到高瘦地图（如碗子山）时窗口突然变成满屏高。
+pub(super) fn aspect_size(width: f32, aspect: f32, monitor: Vec2) -> Vec2 {
     let aspect = aspect.max(0.05);
-    let min_width = MAP_WINDOW_MIN_SIZE.x.max(MAP_WINDOW_MIN_SIZE.y * aspect);
-    let max_width = monitor.x.min(monitor.y * aspect).max(min_width);
+    let usable = vec2(
+        (monitor.x * MAP_WINDOW_SCREEN_FRACTION).max(MAP_WINDOW_MIN_SIZE.x),
+        (monitor.y * MAP_WINDOW_SCREEN_FRACTION).max(MAP_WINDOW_MIN_SIZE.y),
+    );
+    // 下限只看宽度：不能拿「最小高度 × 比例」反推宽度，否则极宽地图会被抬到
+    // 900px 以上，用户一点缩放就突然变宽。
+    let min_width = MAP_WINDOW_MIN_SIZE.x;
+    let max_width = usable.x.min(usable.y * aspect).max(min_width);
     let width = if width.is_finite() {
         width.clamp(min_width, max_width)
     } else {
         min_width
     };
-    vec2(width, width / aspect)
+    vec2(width, (width / aspect).max(1.0))
+}
+
+/// 换地图时按新比例重排窗口：在「当前窗口的盒子」里等比缩放，不会比原来更大。
+///
+/// 直接保留宽度、按新比例算高度会出问题：1.33:1 的长寿村换成 5.4:1 的大唐境外，
+/// 高度只剩 100 多像素；换成 0.5:1 的碗子山，高度直接变成 1120，超过屏幕。
+/// 这里改成取盒子能容纳的最大等比尺寸（宽或高顶到盒子边），再夹到浮窗下限和
+/// 显示器范围内，换地图时窗口只会变窄或变矮，不会突然胀开。
+pub(super) fn resize_for_aspect(current: Vec2, aspect: f32, monitor: Vec2) -> Vec2 {
+    let aspect = aspect.max(0.05);
+    let fitted_width = current.x.min(current.y.max(1.0) * aspect);
+    aspect_size(fitted_width, aspect, monitor)
+}
+
+/// 换地图 / 改宽度后把浮窗拉回屏幕内，不留下半截在屏幕外面。
+pub(super) fn clamp_layout_on_screen(layout: &mut MapWindowLayout, monitor: Vec2) {
+    layout.x = layout.x.clamp(0.0, (monitor.x - layout.width).max(0.0));
+    layout.y = layout.y.clamp(0.0, (monitor.y - layout.height).max(0.0));
 }
 
 /// 非 Windows 手工等比缩放回退的数据；Windows 直接由原生 WM_SIZING 处理。

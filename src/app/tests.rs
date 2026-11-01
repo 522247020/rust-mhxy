@@ -1153,6 +1153,72 @@ fn native_resize_constraints_keep_aspect_and_fixed_anchor() {
 }
 
 #[test]
+fn switching_map_does_not_blow_up_the_window() {
+    let monitor = vec2(1920.0, 1080.0);
+    let current = vec2(560.0, 420.0);
+
+    // 碗子山 170×340（0.5:1）：直接保留宽度会算出 1120 高，比屏幕还高，
+    // 下半截跑到屏幕外、边也抓不到。现在只在原窗口盒子里重排。
+    let tall = map_window::resize_for_aspect(current, 170.0 / 340.0, monitor);
+    assert!(tall.y <= monitor.y, "不能超出显示器：{tall:?}");
+    assert!(tall.y <= 480.5, "换高瘦地图时窗口不该被拉高：{tall:?}");
+
+    // 大唐境外 583×108（≈5.4:1）：宽度不变，只是变矮；不能被「最小高度 × 比例」
+    // 反过来把宽度抬到 900px 以上。
+    let aspect = 583.0 / 108.0;
+    let wide = map_window::resize_for_aspect(current, aspect, monitor);
+    assert!(
+        (wide.x - 560.0).abs() < 0.5,
+        "换极宽地图时宽度不该突变：{wide:?}"
+    );
+    assert!((wide.y - 560.0 / aspect).abs() < 0.5, "{wide:?}");
+
+    // 普通比例（天宫 420×279）保持原宽度，只按比例调高度。
+    let normal = map_window::resize_for_aspect(current, 420.0 / 279.0, monitor);
+    assert!((normal.x - 560.0).abs() < 0.5, "{normal:?}");
+}
+
+#[test]
+fn map_width_limits_never_exceed_the_monitor() {
+    let monitor = vec2(1920.0, 1080.0);
+    // 高瘦地图按宽度开窗时，高度不能超过显示器。
+    let tall = map_window::aspect_size(1120.0, 0.5, monitor);
+    assert!(tall.y <= monitor.y, "{tall:?}");
+    // 极宽地图不因为最小高度被抬宽。
+    let wide = map_window::aspect_size(560.0, 583.0 / 108.0, monitor);
+    assert!((wide.x - 560.0).abs() < 0.5, "{wide:?}");
+}
+
+#[test]
+fn resized_map_window_is_pulled_back_on_screen() {
+    let monitor = vec2(1920.0, 1080.0);
+    let mut layout = crate::config::MapWindowLayout {
+        x: 300.0,
+        y: 320.0,
+        width: 459.0,
+        height: 918.0,
+    };
+    map_window::clamp_layout_on_screen(&mut layout, monitor);
+    assert_eq!(layout.x, 300.0);
+    assert_eq!(layout.y, 1080.0 - 918.0, "窗口底边不能超出屏幕");
+}
+
+#[test]
+fn native_resize_min_width_is_not_inflated_by_tall_min_height() {
+    // 极宽地图（大唐境外 ≈5.4:1）按 180 的最小高度反推会得到 970px 以上的
+    // 最小宽度，拖一下就突然变宽。
+    let rect = borderless::constrain_sizing(
+        2,
+        [0, 0, 500, 93],
+        583.0 / 108.0,
+        [240, 180],
+        [16384, 16384],
+        true,
+    );
+    assert_eq!(rect[2] - rect[0], 500, "极宽地图不该被最小高度顶宽");
+}
+
+#[test]
 fn map_window_yields_topmost_while_main_window_is_focused() {
     // 配置要置顶，且主窗口不在前台：浮窗压在其他窗口（游戏）上面。
     assert!(map_window::desired_on_top(true, false));

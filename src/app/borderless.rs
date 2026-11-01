@@ -30,7 +30,12 @@ pub(super) fn constrain_sizing(
     }
     let [left, top, right, bottom] = rect;
     let aspect = f64::from(aspect);
-    let min_width = f64::from(minimum[0]).max(f64::from(minimum[1]) * aspect);
+    // 最小高度只用来保证窗口还抓得住，不能反推抬高最小宽度：像大唐境外
+    // （≈5.4:1）这种极宽地图，按 180 高反推会把最小宽度抬到 970px 以上，
+    // 一拖就突然变宽。这里把反推值封在水平下限的 2 倍。
+    let min_width_from_height = f64::from(minimum[1]) * aspect;
+    let min_width =
+        f64::from(minimum[0]).max(min_width_from_height.min(f64::from(minimum[0]) * 2.0));
     let max_width = f64::from(maximum[0])
         .min(f64::from(maximum[1]) * aspect)
         .max(min_width);
