@@ -648,6 +648,9 @@ fn install_cjk(ctx: &egui::Context) {
     }
 }
 
+/// 选区：整屏像素矩形 `(x0, y0, x1, y1)`。
+type Selection = (f32, f32, f32, f32);
+
 struct PickerApp {
     image: std::sync::Arc<image::RgbImage>,
     texture: Option<egui::TextureHandle>,
@@ -655,7 +658,7 @@ struct PickerApp {
     /// 拖拽起点/终点：整屏像素坐标。
     start: Option<(f32, f32)>,
     current: Option<(f32, f32)>,
-    result: std::sync::Arc<std::sync::Mutex<Option<(f32, f32, f32, f32)>>>,
+    result: std::sync::Arc<std::sync::Mutex<Option<Selection>>>,
     cancelled: std::sync::Arc<std::sync::Mutex<bool>>,
 }
 
@@ -970,6 +973,22 @@ fn patch_preset(text: &str, size_key: &str, value: &str) -> String {
 
 /// 列一下截得到的窗口和它们的客户区坐标（排查「位置不对」时先看这个）。
 fn windows(_args: &[String]) -> Result<(), String> {
+    if let Some(dpi) = capture::dpi_info() {
+        println!(
+            "屏幕：{}x{}｜系统缩放 {}%｜本进程 DPI 感知：{}",
+            dpi.screen.0,
+            dpi.screen.1,
+            dpi.system_dpi * 100 / 96,
+            dpi.awareness
+        );
+        if dpi.system_dpi > 96 && dpi.awareness.starts_with("unaware") {
+            println!(
+                "注意：系统有缩放、本进程却「不感知 DPI」，窗口/屏幕坐标是逻辑像素，\
+                 和截图像素不是同一套。"
+            );
+        }
+        println!();
+    }
     let windows = capture::list_windows()?;
     if windows.is_empty() {
         println!("没有枚举到可截图的窗口");

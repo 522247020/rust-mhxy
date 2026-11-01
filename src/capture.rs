@@ -117,6 +117,22 @@ pub fn window_at(x: i32, y: i32) -> Option<(i64, String)> {
     imp::window_at(x, y)
 }
 
+/// DPI 信息。屏幕缩放会造成「逻辑像素 vs 物理像素」两套坐标；
+/// 区域百分比按比例算不受影响，但取点/截图混用两套值就会整体偏移。
+#[derive(Clone, Copy, Debug)]
+pub struct DpiInfo {
+    /// 系统 DPI（96 = 100%，120 = 125%，144 = 150%）。
+    pub system_dpi: u32,
+    /// 本进程的 DPI 感知级别。
+    pub awareness: &'static str,
+    /// 系统报告的屏幕尺寸；不感知 DPI 时这里是「虚拟（逻辑）像素」。
+    pub screen: (i32, i32),
+}
+
+pub fn dpi_info() -> Option<DpiInfo> {
+    imp::dpi_info()
+}
+
 /// 只截取客户区里的一小块（图色门控用），开销远小于整张客户区。
 pub fn capture_client_rect(
     handle: i64,
@@ -217,6 +233,10 @@ mod imp {
     }
 
     pub fn window_at(_x: i32, _y: i32) -> Option<(i64, String)> {
+        None
+    }
+
+    pub fn dpi_info() -> Option<super::DpiInfo> {
         None
     }
 }
@@ -436,6 +456,43 @@ mod imp {
                 .trim()
                 .to_string();
             Some((root.0 as i64, title))
+        }
+    }
+
+    pub fn dpi_info() -> Option<super::DpiInfo> {
+        use windows::Win32::UI::HiDpi::{
+            GetAwarenessFromDpiAwarenessContext, GetDpiForSystem, GetThreadDpiAwarenessContext,
+            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+            DPI_AWARENESS_CONTEXT_SYSTEM_AWARE, DPI_AWARENESS_CONTEXT_UNAWARE,
+            DPI_AWARENESS_CONTEXT_UNAWARE_GDISCALED,
+        };
+        unsafe {
+            let dpi = GetDpiForSystem();
+            let context = GetThreadDpiAwarenessContext();
+            let awareness = GetAwarenessFromDpiAwarenessContext(context);
+            let label = if context == DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 {
+                "per-monitor-v2"
+            } else if context == DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE {
+                "per-monitor"
+            } else if context == DPI_AWARENESS_CONTEXT_SYSTEM_AWARE {
+                "system"
+            } else if context == DPI_AWARENESS_CONTEXT_UNAWARE {
+                "unaware"
+            } else if context == DPI_AWARENESS_CONTEXT_UNAWARE_GDISCALED {
+                "unaware-gdiscaled"
+            } else {
+                // 枚举兜底：0=unaware 1=system 2=per-monitor
+                match awareness.0 {
+                    1 => "system",
+                    2 => "per-monitor",
+                    _ => "unaware",
+                }
+            };
+            Some(super::DpiInfo {
+                system_dpi: dpi.max(96),
+                awareness: label,
+                screen: (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)),
+            })
         }
     }
 
