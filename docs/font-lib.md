@@ -24,6 +24,33 @@ RGB → 灰度 → Otsu 二值化（黑字白底）
 
 ## 用法
 
+### 0. 先把识别区域对上（位置不对时）
+
+```bash
+# 看游戏窗口的客户区坐标
+cargo run --bin font-tool -- windows
+
+# 整屏截图 + 拖拽框选：自动算出相对客户区的百分比，并当场拍一张校验图
+cargo run --bin font-tool -- pick --write-config
+#   Enter 确认、Esc 取消；--write-config 会把结果写回 config.json
+#   （ocr/task_region + 当前分辨率的 region_presets）
+```
+
+`pick` 会做三件事：
+
+1. 从拖拽的屏幕坐标反算相对客户区的百分比（自动选「与选区重叠最多」的窗口，
+   不依赖窗口枚举顺序）；
+2. 检查选区中心是不是被别的窗口盖住（盖住了会提醒）；
+3. 按算出的区域真截一张图，和框选画面比平均像素差——一致才算调对。
+
+只需要单张截图（不跑 OCR）时用：
+
+```bash
+cargo run --bin font-tool -- snap --out target/panel.png            # 当前区域
+cargo run --bin font-tool -- snap --desktop --out target/desktop.png # 整屏
+cargo run --bin font-tool -- crop --image target/desktop.png --crop 931,739,812,663 --out x.png
+```
+
 ### 1. 自动采集（推荐）
 
 不用裁剪、不用手打标注：工具自己截当前游戏窗口、跑本地 PP-OCR 拿文字、

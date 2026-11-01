@@ -70,7 +70,10 @@ use std::time::Duration;
 fn usage() {
     eprintln!(
         "用法：
-  font-tool snap    --out <面板.png> [--window 梦幻西游] [--region 左,上,右,下]
+  font-tool windows
+  font-tool pick    [--window 梦幻西游] [--out <校验小图.png>] [--write-config]
+  font-tool crop    --image <大图.png> --crop x,y,w,h --out <小图.png>
+  font-tool snap    --out <面板.png> [--desktop] [--window 梦幻西游] [--region 左,上,右,下]
                     [--preprocess off|color,gray,binary,invert] [--color #eaff65]
                     [--tolerance 24] [--upscale 2]
   font-tool capture --out <字库.json> [--frames 12] [--interval 700]
@@ -83,6 +86,11 @@ fn usage() {
                     [--save-binary <二值化.png>]
 
 snap   ：只截一张面板存 PNG，不跑 OCR——调区域/预处理时秒出结果。
+windows：列出可截图的窗口和客户区坐标，排查位置不对时先看它。
+pick   ：整屏截图 + 拖拽框选，自动算出相对客户区的百分比区域；
+         默认只打印结果并拍一张校验图，--write-config 直接写回 config.json。
+crop   ：从图片里裁一块存出来。
+         （位置还不对就用 snap --region 0,0,1,1 截整块客户区看。）
 capture：自动采集——截当前游戏窗口、OCR 拿标签、多帧聚类投票后直接写字库。
          默认只学数字和分隔符（坐标用），--all 连中文一起学。
          不给 --region/--preprocess 时，读 config.json 里的现有设置（含分辨率预设）。
@@ -94,6 +102,9 @@ read   ：默认按行切分整块面板；--line 表示整张图就是一行。
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
+        Some("windows") => windows(&args[1..]),
+        Some("pick") => pick(&args[1..]),
+        Some("crop") => crop_image(&args[1..]),
         Some("snap") => snap(&args[1..]),
         Some("capture") => capture_frames(&args[1..]),
         Some("build") => build(&args[1..]),
@@ -386,10 +397,615 @@ impl CapturePlan {
     }
 }
 
+/// 从图片里裁一块存出来（排查坐标/区域时用）。
+fn crop_image(args: &[String]) -> Result<(), String> {
+    let flags = parse_flags(args);
+    let source: PathBuf = required(&flags, "image")?.into();
+    let out: PathBuf = required(&flags, "out")?.into();
+    let spec = required(&flags, "crop")?;
+    let parts: Vec<u32> = spec
+        .split(',')
+        .filter_map(|part| part.trim().parse().ok())
+        .collect();
+    if parts.len() != 4 {
+        return Err(format!("--crop 需要 x,y,w,h：{spec}"));
+    }
+    let image = load_rgb(&source)?;
+    let cropped = font_lib::crop(&image, parts[0], parts[1], parts[2], parts[3])?;
+    cropped
+        .save(&out)
+        .map_err(|err| format!("写入 {} 失败：{err}", out.display()))?;
+    println!(
+        "已保存 {}（{}x{}，取自 {}）",
+        out.display(),
+        cropped.width(),
+        cropped.height(),
+        source.display()
+    );
+    Ok(())
+}
+
+// ------------------------------------------------------------------ 框选取点
+
+/// 整屏截图 + 拖拽框选，算出相对客户区的百分比区域，并当场校验一次。
+/// 一个候选游戏窗口：客户区在屏幕上的位置。
+#[derive(Clone, Debug)]
+struct Candidate {
+    handle: i64,
+    title: String,
+    rect: (i32, i32, u32, u32),
+}
+
+impl Candidate {
+    fn area(&self) -> f32 {
+        self.rect.2 as f32 * self.rect.3 as f32
+    }
+}
+
+/// 选区和哪个窗口重叠最多——不依赖窗口枚举顺序（多开时顺序不可靠）。
+fn best_candidate(candidates: &[Candidate], selection: (f32, f32, f32, f32)) -> Option<&Candidate> {
+    let mut best: Option<(&Candidate, f32)> = None;
+    for candidate in candidates {
+        let (x, y, width, height) = candidate.rect;
+        let left = selection.0.max(x as f32);
+        let top = selection.1.max(y as f32);
+        let right = selection.2.min((x + width as i32) as f32);
+        let bottom = selection.3.min((y + height as i32) as f32);
+        let overlap = (right - left).max(0.0) * (bottom - top).max(0.0);
+        if best.is_none_or(|(_, best_overlap)| overlap > best_overlap) {
+            best = Some((candidate, overlap));
+        }
+    }
+    let selection_area = ((selection.2 - selection.0) * (selection.3 - selection.1)).max(1.0);
+    // 选区至少要有一半落在窗口里，否则说明选到的是别的程序。
+    best.filter(|(_, overlap)| *overlap >= selection_area * 0.5)
+        .map(|(candidate, _)| candidate)
+}
+
+/// 整屏截图 + 拖拽框选，算出相对客户区的百分比区域，并当场校验一次。
+fn pick(args: &[String]) -> Result<(), String> {
+    let flags = parse_flags(args);
+    let filter = flags.get("window").cloned();
+    let mut candidates: Vec<Candidate> = Vec::new();
+    for window in capture::list_windows()? {
+        if filter
+            .as_deref()
+            .is_some_and(|needle| !window.title.contains(needle))
+        {
+            continue;
+        }
+        if let Some(rect) = capture::client_rect(window.handle) {
+            candidates.push(Candidate {
+                handle: window.handle,
+                title: window.title,
+                rect,
+            });
+        }
+    }
+    candidates.sort_by(|a, b| b.area().total_cmp(&a.area()));
+    if candidates.is_empty() {
+        return Err("没有找到带客户区坐标的窗口（非 Windows 平台不支持）".into());
+    }
+    println!("候选窗口（按面积从大到小）：");
+    for candidate in &candidates {
+        let (x, y, width, height) = candidate.rect;
+        println!(
+            "  ({x:>5}, {y:>4})  {width:>4}x{height:<4}  {}",
+            candidate.title
+        );
+    }
+    println!("请在整屏截图上拖拽框住「任务栏文字」，Enter 确认、Esc 取消");
+
+    let desktop = capture::capture_desktop()?;
+    let Some(selection) = run_picker(desktop.clone(), candidates.clone()) else {
+        return Err("已取消".into());
+    };
+    let Some(candidate) = best_candidate(&candidates, selection).cloned() else {
+        return Err(
+            "选中的区域不在任何候选窗口的客户区里：先用 windows 命令确认窗口，或用 --window 缩小范围"
+                .into(),
+        );
+    };
+    let client = candidate.rect;
+    let region = region_from_selection(selection, client)?;
+    let text = format!(
+        "{:.4},{:.4},{:.4},{:.4}",
+        region.0, region.1, region.2, region.3
+    );
+    println!("匹配窗口：{}", candidate.title);
+    println!("区域（相对客户区）：{text}");
+
+    // 被其他窗口盖住时截到的是别人的画面，先提醒一句。
+    let center_x = (selection.0 + selection.2) / 2.0;
+    let center_y = (selection.1 + selection.3) / 2.0;
+    if let Some((handle, title)) = capture::window_at(center_x as i32, center_y as i32) {
+        if handle != candidate.handle {
+            println!(
+                "警告：选中区域现在被「{title}」盖住了，截图会拿到它的画面。\
+                 请先把游戏窗口切到前台，重跑一次 pick。"
+            );
+        }
+    }
+
+    // 当场校验：按这个区域截一张，和整屏截图里选中的那块比一下。
+    let check = capture::capture_client(candidate.handle, region)?;
+    let out: PathBuf = flags
+        .get("out")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("target/region-check.png"));
+    check
+        .save(&out)
+        .map_err(|err| format!("写入 {} 失败：{err}", out.display()))?;
+    println!(
+        "已按该区域截图：{}（{}x{}）",
+        out.display(),
+        check.width(),
+        check.height()
+    );
+    let expected = font_lib::crop(
+        &desktop,
+        selection.0 as u32,
+        selection.1 as u32,
+        (selection.2 - selection.0) as u32,
+        (selection.3 - selection.1) as u32,
+    )
+    .ok();
+    match expected.map(|expected| mean_abs_diff(&check, &expected)) {
+        Some(Some(diff)) if diff <= 12.0 => {
+            println!("校验：与框选画面一致（平均像素差 {diff:.1}）")
+        }
+        Some(Some(diff)) => {
+            println!("校验：与框选画面差很多（平均像素差 {diff:.1}），可能被遮挡或窗口位置变了")
+        }
+        _ => println!("校验：尺寸不一致，没法对比（窗口大小变了吗）"),
+    }
+
+    if flags.contains_key("write-config") {
+        let path = config_path();
+        write_config_region(&path, &text, &format!("{}x{}", client.2, client.3))?;
+        println!("已写入 {}", path.display());
+    } else {
+        println!("要直接写进配置加 --write-config；或手动填 config.json 的 \"ocr/task_region\"");
+    }
+    Ok(())
+}
+
+fn region_from_selection(
+    selection: (f32, f32, f32, f32),
+    client: (i32, i32, u32, u32),
+) -> Result<core::TaskRegion, String> {
+    let (client_x, client_y) = (client.0 as f32, client.1 as f32);
+    let (client_w, client_h) = (client.2 as f32, client.3 as f32);
+    if client_w <= 0.0 || client_h <= 0.0 {
+        return Err("客户区尺寸为 0".into());
+    }
+    let left = ((selection.0 - client_x) / client_w).clamp(0.0, 1.0);
+    let top = ((selection.1 - client_y) / client_h).clamp(0.0, 1.0);
+    let right = ((selection.2 - client_x) / client_w).clamp(0.0, 1.0);
+    let bottom = ((selection.3 - client_y) / client_h).clamp(0.0, 1.0);
+    if right - left < 0.01 || bottom - top < 0.01 {
+        return Err("框太小了：请在图上拖一个大一点的矩形".into());
+    }
+    Ok((left, top, right, bottom))
+}
+
+/// 两张同尺寸图的平均像素差；尺寸差太多就没法比。
+fn mean_abs_diff(a: &image::RgbImage, b: &image::RgbImage) -> Option<f32> {
+    let width = a.width().min(b.width());
+    let height = a.height().min(b.height());
+    if width == 0 || height == 0 {
+        return None;
+    }
+    if a.width().abs_diff(b.width()) > 8 || a.height().abs_diff(b.height()) > 8 {
+        return None;
+    }
+    let mut total = 0f64;
+    let mut count = 0f64;
+    for y in 0..height {
+        for x in 0..width {
+            let pa = a.get_pixel(x, y);
+            let pb = b.get_pixel(x, y);
+            for channel in 0..3 {
+                total += (pa[channel] as f64 - pb[channel] as f64).abs();
+                count += 1.0;
+            }
+        }
+    }
+    (count > 0.0).then(|| (total / count) as f32)
+}
+
+/// 中文字体，让框选窗口的提示不显示成方块。
+fn install_cjk(ctx: &egui::Context) {
+    const CANDIDATES: &[&str] = &[
+        "C:/Windows/Fonts/msyh.ttc",
+        "C:/Windows/Fonts/msyh.ttf",
+        "C:/Windows/Fonts/simhei.ttf",
+        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+    ];
+    for path in CANDIDATES {
+        let Ok(bytes) = std::fs::read(path) else {
+            continue;
+        };
+        let bytes: &'static [u8] = Box::leak(bytes.into_boxed_slice());
+        let mut fonts = egui::FontDefinitions::default();
+        fonts.font_data.insert(
+            "cjk".to_owned(),
+            std::sync::Arc::new(egui::FontData::from_static(bytes)),
+        );
+        fonts
+            .families
+            .entry(egui::FontFamily::Proportional)
+            .or_default()
+            .insert(0, "cjk".to_owned());
+        fonts
+            .families
+            .entry(egui::FontFamily::Monospace)
+            .or_default()
+            .push("cjk".to_owned());
+        ctx.set_fonts(fonts);
+        return;
+    }
+}
+
+struct PickerApp {
+    image: std::sync::Arc<image::RgbImage>,
+    texture: Option<egui::TextureHandle>,
+    candidates: Vec<Candidate>,
+    /// 拖拽起点/终点：整屏像素坐标。
+    start: Option<(f32, f32)>,
+    current: Option<(f32, f32)>,
+    result: std::sync::Arc<std::sync::Mutex<Option<(f32, f32, f32, f32)>>>,
+    cancelled: std::sync::Arc<std::sync::Mutex<bool>>,
+}
+
+impl PickerApp {
+    fn selection(&self) -> Option<(f32, f32, f32, f32)> {
+        let (start_x, start_y) = self.start?;
+        let (current_x, current_y) = self.current?;
+        let rect = (
+            start_x.min(current_x),
+            start_y.min(current_y),
+            start_x.max(current_x),
+            start_y.max(current_y),
+        );
+        (rect.2 - rect.0 >= 4.0 && rect.3 - rect.1 >= 4.0).then_some(rect)
+    }
+
+    /// 当前选区落在哪个窗口里、对应的百分比区域是多少。
+    fn verdict(&self) -> Option<(&Candidate, core::TaskRegion)> {
+        let selection = self.selection()?;
+        let candidate = best_candidate(&self.candidates, selection)?;
+        let region = region_from_selection(selection, candidate.rect).ok()?;
+        Some((candidate, region))
+    }
+
+    fn confirm(&self, ctx: &egui::Context) {
+        let Some(rect) = self.selection() else {
+            return;
+        };
+        if self.verdict().is_none() {
+            return;
+        }
+        *self.result.lock().unwrap() = Some(rect);
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+
+    fn cancel(&self, ctx: &egui::Context) {
+        *self.cancelled.lock().unwrap() = true;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+
+    fn texture(&mut self, ctx: &egui::Context) -> egui::TextureHandle {
+        if let Some(texture) = &self.texture {
+            return texture.clone();
+        }
+        let image = self.image.clone();
+        let mut rgba = Vec::with_capacity((image.width() * image.height() * 4) as usize);
+        for pixel in image.pixels() {
+            rgba.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 255]);
+        }
+        let color = egui::ColorImage::from_rgba_unmultiplied(
+            [image.width() as usize, image.height() as usize],
+            &rgba,
+        );
+        let texture = ctx.load_texture("desktop", color, egui::TextureOptions::LINEAR);
+        self.texture = Some(texture.clone());
+        texture
+    }
+}
+
+impl eframe::App for PickerApp {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [0.0, 0.0, 0.0, 1.0]
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        let texture = self.texture(&ctx);
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::new()
+                    .fill(egui::Color32::from_rgb(22, 22, 26))
+                    .inner_margin(8),
+            )
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("拖拽框住「任务栏文字」");
+                    ui.separator();
+                    match self.verdict() {
+                        Some((candidate, region)) => ui.label(format!(
+                            "区域 {:.4},{:.4},{:.4},{:.4}（窗口：{}）",
+                            region.0, region.1, region.2, region.3, candidate.title
+                        )),
+                        None => ui.label("（还没框选到窗口内）"),
+                    };
+                    ui.separator();
+                    let ready = self.verdict().is_some();
+                    if ui
+                        .add_enabled(ready, egui::Button::new("确认 (Enter)"))
+                        .clicked()
+                    {
+                        self.confirm(&ctx);
+                    }
+                    if ui.button("取消 (Esc)").clicked() {
+                        self.cancel(&ctx);
+                    }
+                });
+                ui.separator();
+
+                let (image_w, image_h) = (self.image.width() as f32, self.image.height() as f32);
+                let available = ui.available_size();
+                let scale = (available.x / image_w).min(available.y / image_h).min(1.0);
+                let size = egui::vec2(image_w * scale, image_h * scale);
+                let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
+                let to_desktop =
+                    |pos: egui::Pos2| ((pos.x - rect.min.x) / scale, (pos.y - rect.min.y) / scale);
+                if response.drag_started() {
+                    self.start = response.interact_pointer_pos().map(to_desktop);
+                    self.current = self.start;
+                } else if response.dragged() {
+                    self.current = response.interact_pointer_pos().map(to_desktop);
+                }
+                ui.painter().image(
+                    texture.id(),
+                    rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+                if let Some((x0, y0, x1, y1)) = self.selection() {
+                    let selected = egui::Rect::from_min_max(
+                        rect.min + egui::vec2(x0 * scale, y0 * scale),
+                        rect.min + egui::vec2(x1 * scale, y1 * scale),
+                    );
+                    // 选区外压暗，避免误看相邻区域。
+                    let shade = egui::Color32::from_black_alpha(120);
+                    let full = rect;
+                    ui.painter().rect_filled(
+                        egui::Rect::from_min_max(full.min, egui::pos2(full.max.x, selected.min.y)),
+                        0.0,
+                        shade,
+                    );
+                    ui.painter().rect_filled(
+                        egui::Rect::from_min_max(egui::pos2(full.min.x, selected.max.y), full.max),
+                        0.0,
+                        shade,
+                    );
+                    ui.painter().rect_filled(
+                        egui::Rect::from_min_max(
+                            egui::pos2(full.min.x, selected.min.y),
+                            egui::pos2(selected.min.x, selected.max.y),
+                        ),
+                        0.0,
+                        shade,
+                    );
+                    ui.painter().rect_filled(
+                        egui::Rect::from_min_max(
+                            egui::pos2(selected.max.x, selected.min.y),
+                            egui::pos2(full.max.x, selected.max.y),
+                        ),
+                        0.0,
+                        shade,
+                    );
+                    ui.painter().rect_stroke(
+                        selected,
+                        0.0,
+                        egui::Stroke::new(2.0, egui::Color32::from_rgb(0x4c, 0xd9, 0x8a)),
+                        egui::StrokeKind::Outside,
+                    );
+                }
+            });
+
+        if ctx.input(|input| input.key_pressed(egui::Key::Enter)) {
+            self.confirm(&ctx);
+        }
+        if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+            self.cancel(&ctx);
+        }
+    }
+}
+
+fn run_picker(
+    desktop: image::RgbImage,
+    candidates: Vec<Candidate>,
+) -> Option<(f32, f32, f32, f32)> {
+    let result = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let cancelled = std::sync::Arc::new(std::sync::Mutex::new(false));
+    let app = PickerApp {
+        image: std::sync::Arc::new(desktop),
+        texture: None,
+        candidates,
+        start: None,
+        current: None,
+        result: result.clone(),
+        cancelled: cancelled.clone(),
+    };
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title("font-tool · 框选任务区域")
+            .with_inner_size([1280.0, 820.0])
+            .with_min_inner_size([640.0, 400.0]),
+        ..Default::default()
+    };
+    let started = eframe::run_native(
+        "font-tool-pick",
+        options,
+        Box::new(move |cc| {
+            install_cjk(&cc.egui_ctx);
+            Ok(Box::new(app))
+        }),
+    );
+    if let Err(err) = started {
+        eprintln!("打开框选窗口失败：{err}");
+        return None;
+    }
+    let picked = {
+        let guard = result.lock().unwrap();
+        *guard
+    };
+    picked
+}
+// -------------------------------------------------------------- 写回 config.json
+
+/// 把区域写回 `config.json`：更新 `ocr/task_region`，并补上当前分辨率的预设。
+/// 改写后会先解析一遍，解析不过就放弃（不碰原文件）。
+fn write_config_region(path: &Path, region: &str, size_key: &str) -> Result<(), String> {
+    let original = std::fs::read_to_string(path)
+        .map_err(|err| format!("读取 {} 失败：{err}", path.display()))?;
+    let mut text = replace_key_value(&original, "ocr/task_region", region);
+    text = patch_preset(&text, size_key, region);
+    if json5::from_str::<serde_json::Value>(&text).is_err() {
+        return Err(format!(
+            "改写后会破坏 {} 的格式，已放弃写入（原文件未动）——请手动把区域填进去",
+            path.display()
+        ));
+    }
+    std::fs::write(path, text).map_err(|err| format!("写入 {} 失败：{err}", path.display()))
+}
+
+/// 把某一行的 `"key": "..."` 值替换掉，保留缩进、注释和行尾逗号。
+fn replace_key_value(text: &str, key: &str, value: &str) -> String {
+    let needle = format!("\"{key}\"");
+    let mut out = String::with_capacity(text.len() + 32);
+    let mut done = false;
+    for line in text.lines() {
+        if !done {
+            if let Some(colon) = line.find(':') {
+                let (head, _) = line.split_at(colon);
+                if head.contains(&needle) {
+                    let indent: String = line.chars().take_while(|ch| ch.is_whitespace()).collect();
+                    let comma = if line.trim_end().ends_with(',') {
+                        ","
+                    } else {
+                        ""
+                    };
+                    out.push_str(&format!("{indent}{needle}: \"{value}\"{comma}\n"));
+                    done = true;
+                    continue;
+                }
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    if !done {
+        // 配置里还没有这个键：插到最后一个 '}' 前面。
+        if let Some(pos) = out.rfind('}') {
+            out.insert_str(pos, &format!("  \"{key}\": \"{value}\",\n"));
+        }
+    }
+    out
+}
+
+/// 在 `ocr/region_presets` 里更新/插入当前分辨率的区域。
+fn patch_preset(text: &str, size_key: &str, value: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let Some(header) = lines
+        .iter()
+        .position(|line| line.contains("\"ocr/region_presets\""))
+    else {
+        return text.to_string();
+    };
+    let size_needle = format!("\"{size_key}\"");
+    let mut out: Vec<String> = Vec::with_capacity(lines.len() + 2);
+    let mut finished = false;
+    for (index, line) in lines.iter().enumerate() {
+        if finished {
+            out.push((*line).to_string());
+            continue;
+        }
+        let indent: String = line.chars().take_while(|ch| ch.is_whitespace()).collect();
+        if index == header {
+            // 单行写法 `"ocr/region_presets": {}`：直接在花括号里塞一项。
+            if line.contains("{}") {
+                let filled = format!("{{\n{indent}  {size_needle}: \"{value}\",\n{indent}}}");
+                out.push(line.replacen("{}", &filled, 1));
+                finished = true;
+                continue;
+            }
+            out.push((*line).to_string());
+            continue;
+        }
+        if index > header {
+            // 键已存在：改值。
+            if line.contains(&size_needle) && line.contains(':') {
+                out.push(format!("{indent}{size_needle}: \"{value}\","));
+                finished = true;
+                continue;
+            }
+            // 到了对象结尾还没有这个键：插在它前面。
+            if line.trim_start().starts_with('}') {
+                out.push(format!("{indent}  {size_needle}: \"{value}\","));
+                out.push((*line).to_string());
+                finished = true;
+                continue;
+            }
+        }
+        out.push((*line).to_string());
+    }
+    let mut result = out.join("\n");
+    result.push('\n');
+    result
+}
+
+/// 列一下截得到的窗口和它们的客户区坐标（排查「位置不对」时先看这个）。
+fn windows(_args: &[String]) -> Result<(), String> {
+    let windows = capture::list_windows()?;
+    if windows.is_empty() {
+        println!("没有枚举到可截图的窗口");
+        return Ok(());
+    }
+    for window in &windows {
+        match capture::client_rect(window.handle) {
+            Some((x, y, width, height)) => println!(
+                "客户区 ({x:>5}, {y:>4})  {width:>4}x{height:<4}  {}",
+                window.title
+            ),
+            None => println!("客户区 未知                  {}", window.title),
+        }
+    }
+    println!("\n提示：用 snap --region 0,0,1,1 可以截整块客户区，看区域该往哪切。");
+    Ok(())
+}
+
 /// 只截一张面板存成 PNG（不跑 OCR）：调区域 / 预处理时用，秒出结果。
+/// 加 `--desktop` 则截整个屏幕（看游戏窗口在屏幕上到底长什么样）。
 fn snap(args: &[String]) -> Result<(), String> {
     let flags = parse_flags(args);
     let out: PathBuf = required(&flags, "out")?.into();
+    if flags.contains_key("desktop") {
+        let screen = capture::capture_desktop()?;
+        screen
+            .save(&out)
+            .map_err(|err| format!("写入 {} 失败：{err}", out.display()))?;
+        println!(
+            "已保存整屏 {}（{}x{}）",
+            out.display(),
+            screen.width(),
+            screen.height()
+        );
+        return Ok(());
+    }
     let plan = CapturePlan::prepare(&flags)?;
     println!("{}", plan.describe());
     let panel = plan.grab()?;
@@ -749,5 +1365,74 @@ mod tests {
     fn labels_reject_count_mismatch() {
         assert!(labels_for("79,26", 4, false).is_none());
         assert!(labels_for("没有数字也没有坐标", 3, false).is_none());
+    }
+
+    #[test]
+    fn maps_screen_selection_to_client_percent() {
+        let client = (900, 700, 800, 600);
+        // 客户区内 80..400 像素 → 10%..50%
+        let region = region_from_selection((980.0, 760.0, 1300.0, 1000.0), client).unwrap();
+        assert!((region.0 - 0.10).abs() < 1e-6, "{region:?}");
+        assert!((region.1 - 0.10).abs() < 1e-6, "{region:?}");
+        assert!((region.2 - 0.50).abs() < 1e-6, "{region:?}");
+        assert!((region.3 - 0.50).abs() < 1e-6, "{region:?}");
+        // 框太小要报错，避免写出一个没法用的区域。
+        assert!(region_from_selection((980.0, 760.0, 982.0, 762.0), client).is_err());
+    }
+
+    #[test]
+    fn replaces_task_region_line_keeping_comments() {
+        let text = "{\n  // 注释要留着\n  \"ocr/task_region\": \"0.1,0.2,0.3,0.4\",\n  \"ocr/upscale\": 2,\n}\n";
+        let patched = replace_key_value(text, "ocr/task_region", "0.5,0.6,0.7,0.8");
+        assert!(patched.contains("// 注释要留着"), "{patched}");
+        assert!(
+            patched.contains("\"ocr/task_region\": \"0.5,0.6,0.7,0.8\","),
+            "{patched}"
+        );
+        assert!(patched.contains("\"ocr/upscale\": 2,"), "{patched}");
+        assert!(json5::from_str::<serde_json::Value>(&patched).is_ok());
+    }
+
+    #[test]
+    fn patches_region_presets_both_ways() {
+        let existing =
+            "{\n  \"ocr/region_presets\": {\n    \"1920x1080\": \"0.1,0.2,0.3,0.4\",\n  },\n}\n";
+        let patched = patch_preset(existing, "1920x1080", "0.5,0.6,0.7,0.8");
+        assert!(
+            patched.contains("\"1920x1080\": \"0.5,0.6,0.7,0.8\""),
+            "{patched}"
+        );
+        let value: serde_json::Value = json5::from_str(&patched).unwrap();
+        assert_eq!(value["ocr/region_presets"]["1920x1080"], "0.5,0.6,0.7,0.8");
+
+        let empty = "{\n  \"ocr/region_presets\": {},\n}\n";
+        let patched = patch_preset(empty, "812x663", "0.5,0.6,0.7,0.8");
+        let value: serde_json::Value = json5::from_str(&patched).unwrap();
+        assert_eq!(value["ocr/region_presets"]["812x663"], "0.5,0.6,0.7,0.8");
+    }
+
+    #[test]
+    fn writes_config_region_only_when_still_valid() {
+        let path =
+            std::env::temp_dir().join(format!("font-tool-config-{}.json", std::process::id()));
+        std::fs::write(
+            &path,
+            "{\n  \"ocr/task_region\": \"0.1,0.2,0.3,0.4\",\n  \"ocr/region_presets\": {},\n}\n",
+        )
+        .unwrap();
+        write_config_region(&path, "0.5,0.6,0.7,0.8", "812x663").unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let value: serde_json::Value = json5::from_str(&text).unwrap();
+        assert_eq!(value["ocr/task_region"], "0.5,0.6,0.7,0.8");
+        assert_eq!(value["ocr/region_presets"]["812x663"], "0.5,0.6,0.7,0.8");
+
+        // 原文件本来就坏了：宁可报错也不能写坏。
+        std::fs::write(&path, "{ 这不是合法 json5").unwrap();
+        assert!(write_config_region(&path, "0.9,0.9,0.9,0.95", "812x663").is_err());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{ 这不是合法 json5"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }

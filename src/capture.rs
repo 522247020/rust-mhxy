@@ -98,7 +98,23 @@ pub fn list_windows() -> Result<Vec<WindowInfo>, String> {
 
 /// 查询窗口客户区尺寸（逻辑像素），用于按分辨率选择识别区域预设。
 pub fn client_size(handle: i64) -> Option<(u32, u32)> {
-    imp::client_size(handle)
+    client_rect(handle).map(|(_, _, width, height)| (width, height))
+}
+
+/// 客户区在屏幕上的位置和大小：`(x, y, width, height)`，像素。
+/// 调识别区域（取点）时靠它把屏幕坐标换回相对客户区的百分比。
+pub fn client_rect(handle: i64) -> Option<(i32, i32, u32, u32)> {
+    imp::client_rect(handle)
+}
+
+/// 整个屏幕（主屏，像素）。取点 / 调识别区域时用，看到的就是用户看到的。
+pub fn capture_desktop() -> Result<RgbImage, String> {
+    imp::capture_desktop()
+}
+
+/// 屏幕上这个点最上层的窗口句柄和标题。用来判断「选中的区域是不是被别的窗口盖住了」。
+pub fn window_at(x: i32, y: i32) -> Option<(i64, String)> {
+    imp::window_at(x, y)
 }
 
 /// 只截取客户区里的一小块（图色门控用），开销远小于整张客户区。
@@ -190,6 +206,19 @@ mod imp {
         let height = height.clamp(1, full_h as i32 - y as i32) as u32;
         Ok(image::imageops::crop_imm(&full, x, y, width, height).to_image())
     }
+
+    pub fn client_rect(_handle: i64) -> Option<(i32, i32, u32, u32)> {
+        // 非 Windows 开发环境下拿不到客户区原点，只能给窗口位置。
+        None
+    }
+
+    pub fn capture_desktop() -> Result<RgbImage, String> {
+        Err("当前平台暂不支持整屏截图".into())
+    }
+
+    pub fn window_at(_x: i32, _y: i32) -> Option<(i64, String)> {
+        None
+    }
 }
 
 #[cfg(windows)]
@@ -206,9 +235,10 @@ mod imp {
         DIB_RGB_COLORS, HGDIOBJ, SRCCOPY,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetAncestor, GetClientRect, GetWindowRect, GetWindowTextW,
+        EnumWindows, GetAncestor, GetClientRect, GetSystemMetrics, GetWindowRect, GetWindowTextW,
         GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, WindowFromPoint, GA_ROOT,
     };
+    use windows::Win32::UI::WindowsAndMessaging::{SM_CXSCREEN, SM_CYSCREEN};
 
     unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
         let windows = &mut *(lparam.0 as *mut Vec<WindowInfo>);
@@ -358,6 +388,54 @@ mod imp {
             let mut rect = RECT::default();
             GetClientRect(hwnd, &mut rect).ok()?;
             Some((rect.right.max(0) as u32, rect.bottom.max(0) as u32))
+        }
+    }
+
+    pub fn client_rect(handle: i64) -> Option<(i32, i32, u32, u32)> {
+        unsafe {
+            let hwnd = HWND(handle as *mut core::ffi::c_void);
+            if !IsWindow(Some(hwnd)).as_bool() {
+                return None;
+            }
+            let mut origin = POINT { x: 0, y: 0 };
+            if !ClientToScreen(hwnd, &mut origin).as_bool() {
+                return None;
+            }
+            let mut client = RECT::default();
+            GetClientRect(hwnd, &mut client).ok()?;
+            Some((
+                origin.x,
+                origin.y,
+                client.right.max(0) as u32,
+                client.bottom.max(0) as u32,
+            ))
+        }
+    }
+
+    pub fn capture_desktop() -> Result<RgbImage, String> {
+        unsafe {
+            let width = GetSystemMetrics(SM_CXSCREEN);
+            let height = GetSystemMetrics(SM_CYSCREEN);
+            if width <= 0 || height <= 0 {
+                return Err("读取屏幕尺寸失败".into());
+            }
+            capture_screen(0, 0, width, height)
+        }
+    }
+
+    pub fn window_at(x: i32, y: i32) -> Option<(i64, String)> {
+        unsafe {
+            let hwnd = WindowFromPoint(POINT { x, y });
+            if hwnd.0.is_null() {
+                return None;
+            }
+            let root = GetAncestor(hwnd, GA_ROOT);
+            let mut buffer = [0u16; 512];
+            let length = GetWindowTextW(root, &mut buffer);
+            let title = String::from_utf16_lossy(&buffer[..length.max(0) as usize])
+                .trim()
+                .to_string();
+            Some((root.0 as i64, title))
         }
     }
 
