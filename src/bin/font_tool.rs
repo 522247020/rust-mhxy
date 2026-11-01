@@ -73,6 +73,8 @@ fn usage() {
   font-tool windows
   font-tool pick    [--window 梦幻西游] [--out <校验小图.png>] [--write-config]
   font-tool crop    --image <大图.png> --crop x,y,w,h --out <小图.png>
+  font-tool region  --region 左,上,右,下 [--size 1218x994] [--config <config.json>]
+                    [--window 梦幻西游] [--dry-run]
   font-tool snap    --out <面板.png> [--desktop] [--window 梦幻西游] [--region 左,上,右,下]
                     [--preprocess off|color,gray,binary,invert] [--color #eaff65]
                     [--tolerance 24] [--upscale 2]
@@ -90,6 +92,8 @@ windows：列出可截图的窗口和客户区坐标，排查位置不对时先�
 pick   ：整屏截图 + 拖拽框选，自动算出相对客户区的百分比区域；
          默认只打印结果并拍一张校验图，--write-config 直接写回 config.json。
 crop   ：从图片里裁一块存出来。
+region ：不开界面直接写区域：更新 ocr/task_region 和该分辨率的预设；
+         --dry-run 只打印改完的配置，不落盘。
          （位置还不对就用 snap --region 0,0,1,1 截整块客户区看。）
 capture：自动采集——截当前游戏窗口、OCR 拿标签、多帧聚类投票后直接写字库。
          默认只学数字和分隔符（坐标用），--all 连中文一起学。
@@ -100,11 +104,15 @@ read   ：默认按行切分整块面板；--line 表示整张图就是一行。
 }
 
 fn main() {
+    // 必须在任何窗口/截图之前：系统开了缩放时，不感知 DPI 的进程拿到的是「逻辑像素」，
+    // 而主程序（egui/winit）是感知 DPI 的，两边的客户区尺寸/坐标会差一个缩放倍数。
+    enable_dpi_awareness();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
         Some("windows") => windows(&args[1..]),
         Some("pick") => pick(&args[1..]),
         Some("crop") => crop_image(&args[1..]),
+        Some("region") => region(&args[1..]),
         Some("snap") => snap(&args[1..]),
         Some("capture") => capture_frames(&args[1..]),
         Some("build") => build(&args[1..]),
@@ -124,6 +132,21 @@ fn main() {
         std::process::exit(1);
     }
 }
+
+/// 把本进程设成 per-monitor-v2 DPI 感知，和主程序一致。
+/// 失败（已经被框架设置过、旧系统不支持）就当没这回事，不能因为一个提示失败就不干活。
+#[cfg(windows)]
+fn enable_dpi_awareness() {
+    use windows::Win32::UI::HiDpi::{
+        SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    };
+    unsafe {
+        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
+}
+
+#[cfg(not(windows))]
+fn enable_dpi_awareness() {}
 
 // ------------------------------------------------------------------ 参数解析
 
@@ -958,6 +981,13 @@ fn patch_preset(text: &str, size_key: &str, value: &str) -> String {
             }
             // 到了对象结尾还没有这个键：插在它前面。
             if line.trim_start().starts_with('}') {
+                // 原文件最后一项可能没有逗号，不补就会写出非法 JSON5。
+                if let Some(last) = out.iter_mut().rev().find(|line| !line.trim().is_empty()) {
+                    let trimmed = last.trim_end();
+                    if !trimmed.ends_with(',') && !trimmed.ends_with('{') {
+                        last.push(',');
+                    }
+                }
                 out.push(format!("{indent}  {size_needle}: \"{value}\","));
                 out.push((*line).to_string());
                 finished = true;
@@ -1004,6 +1034,48 @@ fn windows(_args: &[String]) -> Result<(), String> {
         }
     }
     println!("\n提示：用 snap --region 0,0,1,1 可以截整块客户区，看区域该往哪切。");
+    Ok(())
+}
+
+/// 不开 GUI 直接写区域（脚本/手动调参用）：`region --region 0.7,0.24,0.99,0.7`。
+fn region(args: &[String]) -> Result<(), String> {
+    let flags = parse_flags(args);
+    let spec = required(&flags, "region")?;
+    let region = core::parse_region(&spec)
+        .ok_or_else(|| format!("--region 需要 0~1 之间、左<右、上<下的四个百分比：{spec}"))?;
+    let text = format!(
+        "{:.4},{:.4},{:.4},{:.4}",
+        region.0, region.1, region.2, region.3
+    );
+    let size_key = match flags.get("size") {
+        Some(size) => size.clone(),
+        None => {
+            let windows = capture::list_windows()?;
+            let window = pick_window(&windows, flags.get("window"))?;
+            match capture::client_size(window.handle) {
+                Some((width, height)) => format!("{width}x{height}"),
+                None => return Err("读不到窗口客户区尺寸，用 --size 指定（例如 1218x994）".into()),
+            }
+        }
+    };
+    println!("区域：{text}（分辨率键 {size_key}）");
+    let path = flags
+        .get("config")
+        .map(PathBuf::from)
+        .unwrap_or_else(config_path);
+    if flags.contains_key("dry-run") {
+        let original = std::fs::read_to_string(&path)
+            .map_err(|err| format!("读取 {} 失败：{err}", path.display()))?;
+        let patched = patch_preset(
+            &replace_key_value(&original, "ocr/task_region", &text),
+            &size_key,
+            &text,
+        );
+        print!("{patched}");
+        return Ok(());
+    }
+    write_config_region(&path, &text, &size_key)?;
+    println!("已写入 {}", path.display());
     Ok(())
 }
 
@@ -1453,5 +1525,21 @@ mod tests {
             "{ 这不是合法 json5"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// 真实配置的写法：多行 presets，**最后一项没有逗号**。
+    /// 之前直接插一行会写出非法 JSON5（上一行缺逗号），这条就是回归用例。
+    #[test]
+    fn patches_preset_when_last_entry_has_no_trailing_comma() {
+        let existing = "{\n  \"ocr/region_presets\": {\n    \"1218x994\": \"0.795,0.292,0.985,0.538\",\n    \"978x814\": \"0.742,0.35,0.987,0.645\"\n  },\n  \"ocr/task_region\": \"0.795,0.292,0.985,0.538\",\n}\n";
+        let patched = patch_preset(existing, "1628x1326", "0.5,0.6,0.7,0.8");
+        let value: serde_json::Value = json5::from_str(&patched)
+            .unwrap_or_else(|err| panic!("写出非法 JSON5：{err}\n{patched}"));
+        assert_eq!(value["ocr/region_presets"]["1628x1326"], "0.5,0.6,0.7,0.8");
+        assert_eq!(
+            value["ocr/region_presets"]["978x814"],
+            "0.742,0.35,0.987,0.645"
+        );
+        assert_eq!(value["ocr/task_region"], "0.795,0.292,0.985,0.538");
     }
 }

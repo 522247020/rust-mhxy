@@ -43,6 +43,18 @@ cargo run --bin font-tool -- pick --write-config
 2. 检查选区中心是不是被别的窗口盖住（盖住了会提醒）；
 3. 按算出的区域真截一张图，和框选画面比平均像素差——一致才算调对。
 
+> **屏幕缩放**：`font-tool` 启动时会把自己设成 per-monitor-v2 DPI 感知，
+> 和主程序（egui/winit）一致。否则系统开 125%/150% 时两边的客户区尺寸会差一个
+> 缩放倍数（比如 809x632 对 1213x948），区域和 `region_presets` 全对不上。
+> `windows` 命令首行会打印 `屏幕 / 系统缩放 / DPI 感知`，先看它。
+
+不开界面直接写区域：
+
+```bash
+cargo run --bin font-tool -- region --region 0.795,0.292,0.985,0.538 --size 1218x994
+cargo run --bin font-tool -- region --region 0.795,0.292,0.985,0.538 --dry-run  # 只打印
+```
+
 只需要单张截图（不跑 OCR）时用：
 
 ```bash
