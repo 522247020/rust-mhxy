@@ -108,17 +108,21 @@ pub fn client_rect(handle: i64) -> Option<(i32, i32, u32, u32)> {
 }
 
 /// 整个屏幕（主屏，像素）。取点 / 调识别区域时用，看到的就是用户看到的。
+/// 目前只有 `font-tool` 用，主程序不开这条路径。
+#[allow(dead_code)]
 pub fn capture_desktop() -> Result<RgbImage, String> {
     imp::capture_desktop()
 }
 
 /// 屏幕上这个点最上层的窗口句柄和标题。用来判断「选中的区域是不是被别的窗口盖住了」。
+#[allow(dead_code)]
 pub fn window_at(x: i32, y: i32) -> Option<(i64, String)> {
     imp::window_at(x, y)
 }
 
 /// DPI 信息。屏幕缩放会造成「逻辑像素 vs 物理像素」两套坐标；
 /// 区域百分比按比例算不受影响，但取点/截图混用两套值就会整体偏移。
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 pub struct DpiInfo {
     /// 系统 DPI（96 = 100%，120 = 125%，144 = 150%）。
@@ -129,6 +133,7 @@ pub struct DpiInfo {
     pub screen: (i32, i32),
 }
 
+#[allow(dead_code)]
 pub fn dpi_info() -> Option<DpiInfo> {
     imp::dpi_info()
 }
@@ -174,12 +179,17 @@ mod imp {
         Ok(items)
     }
 
-    pub fn client_size(handle: i64) -> Option<(u32, u32)> {
+    pub fn client_rect(handle: i64) -> Option<(i32, i32, u32, u32)> {
         let windows = xcap::Window::all().ok()?;
         let found = windows
             .into_iter()
             .find(|window| window.id().map(|id| id as i64).unwrap_or(-1) == handle)?;
-        Some((found.width().ok()?, found.height().ok()?))
+        Some((
+            found.x().ok()?,
+            found.y().ok()?,
+            found.width().ok()?,
+            found.height().ok()?,
+        ))
     }
 
     pub fn capture_client(
@@ -396,18 +406,6 @@ mod imp {
                 }
             }
             capture_screen(origin.x, origin.y, width, height)
-        }
-    }
-
-    pub fn client_size(handle: i64) -> Option<(u32, u32)> {
-        unsafe {
-            let hwnd = HWND(handle as *mut core::ffi::c_void);
-            if !IsWindow(Some(hwnd)).as_bool() {
-                return None;
-            }
-            let mut rect = RECT::default();
-            GetClientRect(hwnd, &mut rect).ok()?;
-            Some((rect.right.max(0) as u32, rect.bottom.max(0) as u32))
         }
     }
 

@@ -268,17 +268,18 @@ pub fn recognize_panel(image: &RgbImage, high_recall: bool) -> Result<OcrText, S
 /// 用检测框重新排一次，后续解析拿到的就是「从左到右、从上到下」的文本。
 ///
 /// 同时返回每个检测框的坐标和在文本中的字符区间，供点阵字库复核使用。
-fn regions_to_text(result: &oar_ocr::oarocr::OAROCRResult) -> (String, Vec<OcrRegion>) {
-    struct Item {
-        top: f32,
-        bottom: f32,
-        left: f32,
-        right: f32,
-        score: f32,
-        text: String,
-    }
+/// 一个检测框的文本和位置（组装成文本行时的中间结构）。
+struct OcrItem {
+    text: String,
+    score: f32,
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+}
 
-    let mut items: Vec<Item> = result
+fn regions_to_text(result: &oar_ocr::oarocr::OAROCRResult) -> (String, Vec<OcrRegion>) {
+    let items: Vec<OcrItem> = result
         .text_regions
         .iter()
         .filter_map(|region| {
@@ -296,20 +297,26 @@ fn regions_to_text(result: &oar_ocr::oarocr::OAROCRResult) -> (String, Vec<OcrRe
                 left = left.min(point.x);
                 right = right.max(point.x);
             }
-            top.is_finite().then_some(Item {
-                top,
-                bottom,
-                left,
-                right,
-                score: region.confidence.unwrap_or(0.0),
+            top.is_finite().then_some(OcrItem {
                 text,
+                score: region.confidence.unwrap_or(0.0),
+                left,
+                top,
+                right,
+                bottom,
             })
         })
         .collect();
+    assemble(items)
+}
 
+/// 排序 + 分行 + 拼文本，同时记录每个检测框在文本里的字符区间。
+///
+/// 拆出来是为了能单独测：拼文本的规则变了会直接影响 `parse_tasks` 能不能认出任务。
+fn assemble(mut items: Vec<OcrItem>) -> (String, Vec<OcrRegion>) {
     items.sort_by(|a, b| a.top.total_cmp(&b.top).then(a.left.total_cmp(&b.left)));
 
-    let mut lines: Vec<Vec<Item>> = Vec::new();
+    let mut lines: Vec<Vec<OcrItem>> = Vec::new();
     for item in items {
         let join = lines.last().is_some_and(|line| {
             let first = &line[0];
@@ -588,6 +595,43 @@ mod tests {
             "hello"
         );
         assert_eq!(extract_ocr_text(b"plain text"), "plain text");
+    }
+
+    /// 组装规则：同一行按 x 排序用空格连，换行用 \n，并记录每个框的字符区间。
+    /// 这条规则变了会直接影响 `parse_tasks` 的解析结果，所以单独测。
+    #[test]
+    fn assembles_regions_into_lines_with_ranges() {
+        let item = |text: &str, left: f32, top: f32| OcrItem {
+            text: text.to_string(),
+            score: 0.9,
+            left,
+            top,
+            right: left + 80.0,
+            bottom: top + 24.0,
+        };
+        // 故意乱序传入：右边那块先给。
+        let (text, regions) = assemble(vec![
+            item("79,26", 300.0, 100.0),
+            item("抓鬼", 10.0, 100.0),
+            item("鬼王 天宫", 10.0, 200.0),
+        ]);
+        assert_eq!(text, "抓鬼 79,26\n鬼王 天宫");
+        assert_eq!(regions.len(), 3);
+        // 区间要能直接从文本里切回来。
+        let slice = |range: std::ops::Range<usize>| -> String {
+            text.chars().skip(range.start).take(range.len()).collect()
+        };
+        assert_eq!(slice(regions[0].range.clone()), "抓鬼");
+        assert_eq!(slice(regions[1].range.clone()), "79,26");
+        assert_eq!(slice(regions[2].range.clone()), "鬼王 天宫");
+        assert!((regions[1].left - 300.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn assemble_of_nothing_is_empty() {
+        let (text, regions) = assemble(Vec::new());
+        assert!(text.is_empty());
+        assert!(regions.is_empty());
     }
 
     #[test]

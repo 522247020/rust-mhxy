@@ -343,7 +343,7 @@ struct CapturePlan {
 impl CapturePlan {
     fn prepare(flags: &HashMap<String, String>) -> Result<Self, String> {
         let defaults = read_capture_defaults();
-        let windows = capture::list_windows()?;
+        let windows = game_windows()?;
         let window = pick_window(&windows, flags.get("window"))?;
         let client_size = capture::client_size(window.handle);
         let (region, region_source) = match flags.get("region") {
@@ -494,7 +494,7 @@ fn pick(args: &[String]) -> Result<(), String> {
     let flags = parse_flags(args);
     let filter = flags.get("window").cloned();
     let mut candidates: Vec<Candidate> = Vec::new();
-    for window in capture::list_windows()? {
+    for window in game_windows()? {
         if filter
             .as_deref()
             .is_some_and(|needle| !window.title.contains(needle))
@@ -1054,7 +1054,7 @@ fn region(args: &[String]) -> Result<(), String> {
     let size_key = match flags.get("size") {
         Some(size) => size.clone(),
         None => {
-            let windows = capture::list_windows()?;
+            let windows = game_windows()?;
             let window = pick_window(&windows, flags.get("window"))?;
             match capture::client_size(window.handle) {
                 Some((width, height)) => format!("{width}x{height}"),
@@ -1301,6 +1301,36 @@ fn info(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn is_game_title(title: &str) -> bool {
+    if title.contains("梦幻西游") {
+        return true;
+    }
+    // 英文客户端/多开工具可能写 MHXY，但本项目自己的终端窗口叫 rust-mhxy，得排掉。
+    let lower = title.to_lowercase();
+    lower.contains("mhxy") && !lower.contains("rust-mhxy")
+}
+
+/// 枚举真正可用的游戏窗口。
+///
+/// 不「猜一个」：游戏最小化时 `list_windows` 会返回所有窗口，
+/// 随手取第一个只会截到终端 / 输入法。找不到就报错并列出可选项。
+fn game_windows() -> Result<Vec<capture::WindowInfo>, String> {
+    let all = capture::list_windows()?;
+    let matched: Vec<capture::WindowInfo> = all
+        .iter()
+        .filter(|window| is_game_title(&window.title))
+        .cloned()
+        .collect();
+    if !matched.is_empty() {
+        return Ok(matched);
+    }
+    Err(format!(
+        "没找到标题含「梦幻西游」的窗口：游戏可能最小化了。\n\
+         当前可见窗口：{}\n可以用 --window <标题片段> 指定。",
+        window_titles(&all)
+    ))
+}
+
 fn pick_window<'a>(
     windows: &'a [capture::WindowInfo],
     filter: Option<&String>,
@@ -1319,7 +1349,11 @@ fn pick_window<'a>(
                 )
             });
     }
-    Ok(&windows[0])
+    // 默认优先游戏窗口，而不是枚举结果里的第一个（可能是个 IME 全屏窗口）。
+    Ok(windows
+        .iter()
+        .find(|window| is_game_title(&window.title))
+        .unwrap_or(&windows[0]))
 }
 
 fn window_titles(windows: &[capture::WindowInfo]) -> String {
