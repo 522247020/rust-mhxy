@@ -24,7 +24,55 @@ RGB → 灰度 → Otsu 二值化（黑字白底）
 
 ## 用法
 
-### 1. 准备样本
+### 1. 自动采集（推荐）
+
+不用裁剪、不用手打标注：工具自己截当前游戏窗口、跑本地 PP-OCR 拿文字、
+按检测框切成字模、把 OCR 文字当标签，多帧**聚类 + 投票**后直接写字库。
+
+```bash
+# 先看一眼区域对不对（只截图，不跑 OCR）
+cargo run --bin font-tool -- snap --out target/panel.png
+
+# 采集 20 帧，直接产出字库
+cargo run --bin font-tool -- capture --out assets/fontlib.json --frames 20 --interval 800
+```
+
+窗口、区域、预处理、放大倍数默认取 `config.json` 里的现有设置（包括按分辨率
+保存的 `ocr/region_presets`），也可以用参数覆盖：
+
+```bash
+cargo run --bin font-tool -- capture --out assets/fontlib.json \
+  --window 梦幻西游 --region 0.70,0.24,0.99,0.70 \
+  --preprocess color,binary --color #eaff65 --tolerance 24 --upscale 2
+```
+
+采集时每个字模样本都会投票：
+
+- 按外观聚类（相似度 ≥ `--min-similarity`，默认 0.9）——同字体同抗锯齿的字模几乎一样；
+- 同一个簇内对标签投票，平票保持原判，只有**严格多数**才改判；
+- OCR 认错的单帧会被压掉；如果一整个簇多数票都是错的，说明 OCR 在这一段系统性
+  认错，会用「提醒」打出来，让你判断要不要重建。
+
+默认只学数字和分隔符（`0-9`、`,，、.．。`），避免把界面上的中文和噪声塞进坐标字库；
+`--all` 连中文一起学（做地图名字库时才需要）。
+
+参数：`--frames` 帧数、`--interval` 间隔毫秒、`--cell 16x24`、`--dump <目录>`
+（把每帧面板和各检测框的裁剪图存下来，方便排查采错）、`--min-similarity`、
+`--padding`（裁剪框外扩像素，默认 2，和运行时复核一致）。
+
+输出示例：
+
+```
+窗口：梦幻西游（客户区 Some((812, 663))）｜区域 (0.795, 0.292, 0.985, 0.538)（来自 config.json 的 ocr/task_region）｜预处理 关闭｜放大 2x｜20 帧，间隔 800 ms
+第 1/20 帧：面板 308x326，采到 12 个字模｜OCR 抓鬼 长寿村 79,26 附近 / 鬼王 天宫 12,45
+...
+已写入 assets/fontlib.json（16x24，12 个字模，164 个样本，来自 18/20 帧）
+,×1（12 票）  .×1（6 票）  0×1（14 票）  ...
+```
+
+### 2. 手动准备样本（可选）
+
+如果自动采集的标签不可信，也可以给准确标注：
 
 ```
 samples/
@@ -33,11 +81,6 @@ samples/
   line2.png
   line2.txt
 ```
-
-建议多准备几行、不同数字组合、不同字号/DPI 各一版；同一个字有多个样本时会
-全部保留，匹配时取分数最高的那个。
-
-### 2. 建库
 
 ```bash
 cargo run --bin font-tool -- build --samples samples --out fontlib.json

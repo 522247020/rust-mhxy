@@ -615,6 +615,176 @@ pub fn read_lines(panel: &RgbImage, lib: &GlyphLib, cfg: MatchConfig) -> Vec<Lin
     out
 }
 
+// ---------------------------------------------------------------- 自动建库
+
+/// 自动建库参数。
+#[derive(Clone, Copy, Debug)]
+pub struct LearnConfig {
+    /// 和已有字模相似到这个程度就当作同一个「字模形态」。
+    pub min_similarity: f32,
+    /// 聚类时允许的平移像素。
+    pub shift: i32,
+}
+
+impl Default for LearnConfig {
+    fn default() -> Self {
+        Self {
+            min_similarity: 0.9,
+            shift: 1,
+        }
+    }
+}
+
+struct Cluster {
+    label: String,
+    pixels: Vec<u8>,
+    votes: std::collections::BTreeMap<String, usize>,
+}
+
+impl Cluster {
+    fn new(label: &str, pixels: Vec<u8>) -> Self {
+        let mut votes = std::collections::BTreeMap::new();
+        votes.insert(label.to_string(), 1usize);
+        Self {
+            label: label.to_string(),
+            pixels,
+            votes,
+        }
+    }
+
+    /// 再投一票。只有**严格多于**当前标签票数才改判，平票保持原判，
+    /// 否则两帧错认就能把正确的标签翻掉。
+    fn vote(&mut self, label: &str) {
+        *self.votes.entry(label.to_string()).or_insert(0) += 1;
+        let current = *self.votes.get(&self.label).unwrap_or(&0);
+        if *self.votes.get(label).unwrap_or(&0) > current {
+            self.label = label.to_string();
+        }
+    }
+}
+
+/// 每个字的统计，建完后打印用。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LabelSummary {
+    pub label: String,
+    pub clusters: usize,
+    pub votes: usize,
+    /// 被投票否决掉的错标次数。
+    pub rejected: usize,
+}
+
+/// 自动建库器：把「切出来的字模 + 那一刻 OCR 给的标签」累积成字库。
+///
+/// OCR 会偶尔认错，但同一个字模形态（同字体、同抗锯齿、同字号）每次切出来几乎一样，
+/// 所以先按外观聚类，再对每个簇做标签投票：多数帧说得对，单帧错认就被压掉。
+pub struct Learner {
+    cell_w: u32,
+    cell_h: u32,
+    cfg: LearnConfig,
+    clusters: Vec<Cluster>,
+}
+
+impl Learner {
+    pub fn new(cell_w: u32, cell_h: u32, cfg: LearnConfig) -> Self {
+        Self {
+            cell_w: cell_w.max(1),
+            cell_h: cell_h.max(1),
+            cfg,
+            clusters: Vec::new(),
+        }
+    }
+
+    /// 记录一个字模样本（已归一化到 cell 的点阵）。
+    pub fn observe(&mut self, pixels: Vec<u8>, label: &str) {
+        assert_eq!(
+            pixels.len(),
+            (self.cell_w * self.cell_h) as usize,
+            "字模尺寸必须是 {}x{}",
+            self.cell_w,
+            self.cell_h
+        );
+        let label = label.trim();
+        if label.is_empty() {
+            return;
+        }
+        let (cell_w, cell_h) = (self.cell_w as usize, self.cell_h as usize);
+        let mut best: Option<(usize, f32)> = None;
+        for (index, cluster) in self.clusters.iter().enumerate() {
+            let score = score_shifted(&cluster.pixels, &pixels, cell_w, cell_h, self.cfg.shift);
+            if best.is_none_or(|(_, best_score)| score > best_score) {
+                best = Some((index, score));
+            }
+        }
+        match best {
+            Some((index, score)) if score >= self.cfg.min_similarity => {
+                self.clusters[index].vote(label);
+            }
+            _ => self.clusters.push(Cluster::new(label, pixels)),
+        }
+    }
+
+    pub fn cluster_count(&self) -> usize {
+        self.clusters.len()
+    }
+
+    pub fn sample_count(&self) -> usize {
+        self.clusters
+            .iter()
+            .map(|cluster| cluster.votes.values().sum::<usize>())
+            .sum()
+    }
+
+    /// 每个字的簇数 / 票数 / 被否决次数，按字排序。
+    pub fn summary(&self) -> Vec<LabelSummary> {
+        let mut out: Vec<LabelSummary> = Vec::new();
+        for cluster in &self.clusters {
+            let votes: usize = cluster.votes.values().sum();
+            let kept = *cluster.votes.get(&cluster.label).unwrap_or(&0);
+            match out.iter_mut().find(|item| item.label == cluster.label) {
+                Some(item) => {
+                    item.clusters += 1;
+                    item.votes += votes;
+                    item.rejected += votes - kept;
+                }
+                None => out.push(LabelSummary {
+                    label: cluster.label.clone(),
+                    clusters: 1,
+                    votes,
+                    rejected: votes - kept,
+                }),
+            }
+        }
+        out.sort_by(|a, b| a.label.cmp(&b.label));
+        out
+    }
+
+    /// 值得人看一醒的冲突：同一簇里另一个标签也拿到了 `min_votes` 以上的票。
+    pub fn conflicts(&self, min_votes: usize) -> Vec<String> {
+        let mut out = Vec::new();
+        for cluster in &self.clusters {
+            let kept = *cluster.votes.get(&cluster.label).unwrap_or(&0);
+            for (label, count) in &cluster.votes {
+                if label != &cluster.label && *count >= min_votes {
+                    out.push(format!(
+                        "同一字模「{label}」{count} 票、「{}」{kept} 票，取「{}」",
+                        cluster.label, cluster.label
+                    ));
+                }
+            }
+        }
+        out
+    }
+
+    /// 建成的字库：每个簇一个字模，标签取投票结果。
+    pub fn finish(&self) -> GlyphLib {
+        let mut lib = GlyphLib::new(self.cell_w, self.cell_h);
+        for cluster in &self.clusters {
+            lib.add_pixels(cluster.label.clone(), cluster.pixels.clone());
+        }
+        lib
+    }
+}
+
 // -------------------------------------------------------------------- 建库
 
 /// 从「一行截图 + 这行的准确文字」建库。
@@ -1023,5 +1193,105 @@ mod tests {
             );
         }
         println!("耗时 {:.1} ms", started.elapsed().as_secs_f64() * 1000.0);
+    }
+}
+
+#[cfg(test)]
+mod learner_tests {
+    use super::fixture::render;
+    use super::*;
+
+    /// 从一行合成图里切出字模和标签，模拟真实采集流程。
+    fn learn_line(learner: &mut Learner, text: &str, scale: u32) {
+        let gray = binarize(&render(text, scale, 1));
+        let boxes = analyze(&gray, MatchConfig::default());
+        let chars: Vec<char> = text.chars().collect();
+        assert_eq!(boxes.len(), chars.len(), "切字数量要和文字一致");
+        for (b, ch) in boxes.iter().zip(&chars) {
+            learner.observe(
+                cell_of(&gray, b, learner.cell_w, learner.cell_h),
+                &ch.to_string(),
+            );
+        }
+    }
+
+    fn cell_of_char(text: &str, scale: u32, index: usize) -> Vec<u8> {
+        let gray = binarize(&render(text, scale, 1));
+        let boxes = analyze(&gray, MatchConfig::default());
+        cell_of(&gray, &boxes[index], DEFAULT_CELL_W, DEFAULT_CELL_H)
+    }
+
+    #[test]
+    fn merges_same_glyph_into_one_cluster() {
+        let mut learner = Learner::new(DEFAULT_CELL_W, DEFAULT_CELL_H, LearnConfig::default());
+        for _ in 0..3 {
+            learn_line(&mut learner, "7", 5);
+        }
+        assert_eq!(learner.cluster_count(), 1);
+        assert_eq!(learner.sample_count(), 3);
+        assert_eq!(learner.summary()[0].label, "7");
+    }
+
+    #[test]
+    fn single_misread_is_outvoted() {
+        let cell = cell_of_char("7", 5, 0);
+        let mut learner = Learner::new(DEFAULT_CELL_W, DEFAULT_CELL_H, LearnConfig::default());
+        for _ in 0..3 {
+            learner.observe(cell.clone(), "7");
+        }
+        // OCR 偶尔把 7 认成 1：一票翻不了盘。
+        learner.observe(cell.clone(), "1");
+        assert_eq!(learner.summary()[0].label, "7");
+        assert_eq!(learner.summary()[0].rejected, 1);
+
+        // 但如果多数帧都说 1，就该改判（不信任单一标签）。
+        for _ in 0..3 {
+            learner.observe(cell.clone(), "1");
+        }
+        assert_eq!(learner.summary()[0].label, "1");
+    }
+
+    #[test]
+    fn separates_different_glyphs() {
+        let mut learner = Learner::new(DEFAULT_CELL_W, DEFAULT_CELL_H, LearnConfig::default());
+        learn_line(&mut learner, "0123456789.,", 5);
+        assert_eq!(learner.cluster_count(), 12);
+        let labels: Vec<String> = learner.summary().into_iter().map(|s| s.label).collect();
+        assert_eq!(
+            labels,
+            [",", ".", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
+        );
+    }
+
+    #[test]
+    fn learned_library_can_read_new_line() {
+        let mut learner = Learner::new(DEFAULT_CELL_W, DEFAULT_CELL_H, LearnConfig::default());
+        learn_line(&mut learner, "0123456789.,", 4);
+        learn_line(&mut learner, "0123456789.,", 6);
+        let lib = learner.finish();
+        let read = read_line_gray(
+            &binarize(&render("79,26", 5, 1)),
+            &lib,
+            MatchConfig::default(),
+        );
+        assert_eq!(read.text, "79,26");
+        assert!(read.confident);
+    }
+
+    #[test]
+    fn reports_conflicts_between_close_labels() {
+        let cell = cell_of_char("8", 5, 0);
+        let mut learner = Learner::new(DEFAULT_CELL_W, DEFAULT_CELL_H, LearnConfig::default());
+        for _ in 0..2 {
+            learner.observe(cell.clone(), "8");
+        }
+        for _ in 0..2 {
+            learner.observe(cell.clone(), "3");
+        }
+        // 2:2 平票保持原判，但要能报出来给人看。
+        assert_eq!(learner.summary()[0].label, "8");
+        let conflicts = learner.conflicts(2);
+        assert_eq!(conflicts.len(), 1, "{conflicts:?}");
+        assert!(conflicts[0].contains("3"), "{conflicts:?}");
     }
 }

@@ -151,7 +151,13 @@ pub fn correct(
 }
 
 /// 检测框向外扩 `padding` 后夹到图片范围内。空框返回 None。
-fn padded_box(region: &OcrRegion, padding: u32, panel: &RgbImage) -> Option<(u32, u32, u32, u32)> {
+///
+/// 运行时复核和建库采样都走这里：裁剪方式一致，训练出来的字模和识别时的输入同分布。
+pub fn padded_box(
+    region: &OcrRegion,
+    padding: u32,
+    panel: &RgbImage,
+) -> Option<(u32, u32, u32, u32)> {
     let pad = padding as f32;
     let left = (region.left - pad).max(0.0);
     let top = (region.top - pad).max(0.0);

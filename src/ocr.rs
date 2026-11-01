@@ -255,6 +255,13 @@ impl LocalEngine {
     }
 }
 
+/// 一次性本地识别（不经过后台线程）。
+/// 给命令行工具（`font-tool capture` 自动建库）和测试用；主程序走后台线程，用不到。
+#[allow(dead_code)]
+pub fn recognize_panel(image: &RgbImage, high_recall: bool) -> Result<OcrText, String> {
+    LocalEngine::new(high_recall)?.recognize(image)
+}
+
 /// 把检测框按位置整理成文本行：同一行的文字按 x 排序，行与行按 y 排序。
 ///
 /// `all_text()` 按检测顺序返回，遇到两个任务条目、或者倾斜/换行时顺序可能乱掉。
