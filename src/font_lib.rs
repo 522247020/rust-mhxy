@@ -723,6 +723,11 @@ impl Learner {
         }
     }
 
+    /// 字模尺寸（建库时就固定了）。
+    pub fn cell(&self) -> (u32, u32) {
+        (self.cell_w, self.cell_h)
+    }
+
     pub fn cluster_count(&self) -> usize {
         self.clusters.len()
     }

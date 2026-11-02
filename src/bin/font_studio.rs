@@ -102,12 +102,45 @@ enum JobMsg {
         skipped: usize,
     },
     Failed(String),
+    /// 后台积累：每轮一报。`error` 是这一轮的错误（窗口被关/最小化），不影响继续跑。
+    Progress {
+        attempts: u32,
+        frames_used: u32,
+        samples: usize,
+        learned: usize,
+        ocr: String,
+        panel: Option<image::RgbImage>,
+        lib: GlyphLib,
+        summary: Vec<font_lib::LabelSummary>,
+        complete: bool,
+        error: Option<String>,
+        unchanged: bool,
+    },
+    /// 后台积累被停掉（或出错退出），带上当前成果。
+    AccStopped {
+        lib: GlyphLib,
+        summary: Vec<font_lib::LabelSummary>,
+        samples: usize,
+        frames_used: u32,
+        attempts: u32,
+    },
 }
 
 struct Job {
     rx: Receiver<JobMsg>,
     total: u32,
     done: u32,
+    started: Instant,
+}
+
+/// 后台积累模式的 UI 句柄。
+struct AccState {
+    rx: Receiver<JobMsg>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    attempts: u32,
+    frames_used: u32,
+    samples: usize,
+    complete: bool,
     started: Instant,
 }
 
@@ -133,7 +166,6 @@ struct JobPlan {
 fn spawn_job(plan: JobPlan, ctx: egui::Context) -> Receiver<JobMsg> {
     let (tx, rx) = channel();
     std::thread::spawn(move || {
-        let cfg = MatchConfig::default();
         let mut learner = Learner::new(
             plan.cell_w,
             plan.cell_h,
@@ -178,31 +210,7 @@ fn spawn_job(plan: JobPlan, ctx: egui::Context) -> Receiver<JobMsg> {
                     return;
                 }
             };
-            let mut learned = 0usize;
-            for region in &ocr.regions {
-                let Some((x, y, width, height)) = coord_fix::padded_box(region, 2, &panel) else {
-                    continue;
-                };
-                let Ok(crop) = font_lib::crop(&panel, x, y, width, height) else {
-                    continue;
-                };
-                let gray = font_lib::binarize(&crop);
-                let cells = font_lib::analyze(&gray, cfg);
-                let Some(labels) = labels_for(&region.text, cells.len(), plan.learn_all) else {
-                    skipped += 1;
-                    continue;
-                };
-                for (b, label) in cells.iter().zip(labels) {
-                    let Some(label) = label else {
-                        continue;
-                    };
-                    learner.observe(
-                        font_lib::cell_of(&gray, b, plan.cell_w, plan.cell_h),
-                        &label.to_string(),
-                    );
-                    learned += 1;
-                }
-            }
+            let learned = learn_panel(&mut learner, &panel, &ocr, plan.learn_all, &mut skipped);
             if learned > 0 {
                 frames_used += 1;
             }
@@ -228,6 +236,228 @@ fn spawn_job(plan: JobPlan, ctx: egui::Context) -> Receiver<JobMsg> {
     rx
 }
 
+/// 从一帧面板里学一批字模，返回学到的数量。
+///
+/// 固定帧数采集和后台积累共用这一段：OCR 定位 → 按框裁图 → 切字 →
+/// 把 OCR 文字当标签打上去 → 交给 Learner 聚类投票。
+fn learn_panel(
+    learner: &mut Learner,
+    panel: &image::RgbImage,
+    ocr: &ocr::OcrText,
+    learn_all: bool,
+    skipped: &mut usize,
+) -> usize {
+    let (cell_w, cell_h) = learner.cell();
+    let mut learned = 0usize;
+    for region in &ocr.regions {
+        let Some((x, y, width, height)) = coord_fix::padded_box(region, 2, panel) else {
+            continue;
+        };
+        let Ok(crop) = font_lib::crop(panel, x, y, width, height) else {
+            continue;
+        };
+        let gray = font_lib::binarize(&crop);
+        let cells = font_lib::analyze(&gray, MatchConfig::default());
+        let Some(labels) = labels_for(&region.text, cells.len(), learn_all) else {
+            *skipped += 1;
+            continue;
+        };
+        for (b, label) in cells.iter().zip(labels) {
+            let Some(label) = label else {
+                continue;
+            };
+            learner.observe(
+                font_lib::cell_of(&gray, b, cell_w, cell_h),
+                &label.to_string(),
+            );
+            learned += 1;
+        }
+    }
+    learned
+}
+
+/// 面板指纹：画面没变就不重复识别/学习（后台积累时游戏可能一直停在同一个界面）。
+fn panel_hash(panel: &image::RgbImage) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    let step_x = (panel.width() / 64).max(1) as usize;
+    for y in (0..panel.height()).step_by(3) {
+        for x in (0..panel.width()).step_by(step_x) {
+            let pixel = panel.get_pixel(x, y);
+            for channel in 0..3 {
+                hash ^= pixel[channel] as u64;
+                hash = hash.wrapping_mul(0x100_0000_01b3);
+            }
+        }
+    }
+    hash
+}
+
+/// 可被 `stop` 打断的等待：不要一觉睡到间隔结束才响应停止。
+fn sleep_while(stop: &std::sync::atomic::AtomicBool, total_ms: u64) {
+    let chunk = 200u64;
+    let mut left = total_ms;
+    while left > 0 {
+        if stop.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        let step = left.min(chunk);
+        std::thread::sleep(Duration::from_millis(step));
+        left -= step;
+    }
+}
+
+/// 后台积累：一直跑，识别到带坐标的任务就学；覆盖齐了就通知一次。
+///
+/// 和固定帧数采集的区别：不设终点，出错（窗口最小化/被关）不会退出，
+/// 画面没变化会跳过，成果每轮回传，UI 随时可以停止。
+fn spawn_accumulate(
+    plan: JobPlan,
+    ctx: egui::Context,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Receiver<JobMsg> {
+    let (tx, rx) = channel();
+    std::thread::spawn(move || {
+        let mut learner = Learner::new(
+            plan.cell_w,
+            plan.cell_h,
+            LearnConfig {
+                min_similarity: plan.min_similarity,
+                shift: 1,
+            },
+        );
+        if let Some(seed) = &plan.seed {
+            let _ = learner.seed(seed);
+        }
+        let mut attempts = 0u32;
+        let mut frames_used = 0u32;
+        let mut last_hash = 0u64;
+        let mut complete_notified = false;
+        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            attempts += 1;
+            let captured = (|| -> Result<image::RgbImage, String> {
+                let full = capture::capture_client(plan.handle, plan.region)?;
+                let mut panel = preprocess::apply(
+                    capture::crop_task_region(&full, plan.region),
+                    plan.pipeline,
+                    plan.color,
+                    plan.tolerance,
+                );
+                if plan.upscale > 1 {
+                    panel = preprocess::upscale(&panel, plan.upscale);
+                }
+                Ok(panel)
+            })();
+
+            let panel = match captured {
+                Ok(panel) => panel,
+                Err(err) => {
+                    let _ = tx.send(JobMsg::Progress {
+                        attempts,
+                        frames_used,
+                        samples: learner.sample_count(),
+                        learned: 0,
+                        ocr: String::new(),
+                        panel: None,
+                        lib: learner.finish(),
+                        summary: learner.summary(),
+                        complete: false,
+                        error: Some(err),
+                        unchanged: false,
+                    });
+                    ctx.request_repaint();
+                    sleep_while(&stop, plan.interval_ms);
+                    continue;
+                }
+            };
+
+            let hash = panel_hash(&panel);
+            if hash == last_hash {
+                let _ = tx.send(JobMsg::Progress {
+                    attempts,
+                    frames_used,
+                    samples: learner.sample_count(),
+                    learned: 0,
+                    ocr: String::new(),
+                    panel: None,
+                    lib: learner.finish(),
+                    summary: learner.summary(),
+                    complete: false,
+                    error: None,
+                    unchanged: true,
+                });
+                ctx.request_repaint();
+                sleep_while(&stop, plan.interval_ms);
+                continue;
+            }
+            last_hash = hash;
+
+            let ocr = match ocr::recognize_panel(&panel, plan.high_recall) {
+                Ok(ocr) => ocr,
+                Err(err) => {
+                    let _ = tx.send(JobMsg::Progress {
+                        attempts,
+                        frames_used,
+                        samples: learner.sample_count(),
+                        learned: 0,
+                        ocr: String::new(),
+                        panel: Some(panel),
+                        lib: learner.finish(),
+                        summary: learner.summary(),
+                        complete: false,
+                        error: Some(err),
+                        unchanged: false,
+                    });
+                    ctx.request_repaint();
+                    sleep_while(&stop, plan.interval_ms);
+                    continue;
+                }
+            };
+
+            let mut skipped_regions = 0usize;
+            let learned = learn_panel(
+                &mut learner,
+                &panel,
+                &ocr,
+                plan.learn_all,
+                &mut skipped_regions,
+            );
+            if learned > 0 {
+                frames_used += 1;
+            }
+            let lib = learner.finish();
+            let complete = font_lib::missing_coordinate_labels(&lib).is_empty();
+            let _ = tx.send(JobMsg::Progress {
+                attempts,
+                frames_used,
+                samples: learner.sample_count(),
+                learned,
+                ocr: ocr.text.trim().replace('\n', " / "),
+                panel: Some(panel),
+                lib,
+                summary: learner.summary(),
+                complete,
+                error: None,
+                unchanged: false,
+            });
+            ctx.request_repaint();
+            if complete && !complete_notified {
+                complete_notified = true;
+            }
+            sleep_while(&stop, plan.interval_ms);
+        }
+        let _ = tx.send(JobMsg::AccStopped {
+            lib: learner.finish(),
+            summary: learner.summary(),
+            samples: learner.sample_count(),
+            frames_used,
+            attempts,
+        });
+        ctx.request_repaint();
+    });
+    rx
+}
+
+// ---------------------------------------------------------------- 界面状态
 // ---------------------------------------------------------------- 界面状态
 
 struct Preview {
@@ -278,6 +508,8 @@ struct Studio {
     relabel: String,
 
     job: Option<Job>,
+    /// 后台积累模式（一直跑，直到手动停止）。
+    acc: Option<AccState>,
     preview: Option<Preview>,
     picker: Option<Picker>,
     logs: VecDeque<String>,
@@ -314,6 +546,7 @@ impl Studio {
             selected_glyph: None,
             relabel: String::new(),
             job: None,
+            acc: None,
             preview: None,
             picker: None,
             logs: VecDeque::new(),
@@ -608,6 +841,8 @@ impl Studio {
                     finished = true;
                     self.log(format!("采集中断：{err}"));
                 }
+                // 后台积累的消息在 poll_acc 里处理。
+                JobMsg::Progress { .. } | JobMsg::AccStopped { .. } => {}
             }
         }
         if finished {
@@ -616,9 +851,171 @@ impl Studio {
     }
 
     fn busy(&self) -> bool {
-        self.job.is_some()
+        self.job.is_some() || self.acc.is_some()
     }
 
+    /// 开始后台积累：一直跑，直到点停止。
+    fn start_accumulate(&mut self, ctx: &egui::Context) {
+        let Some(window) = self.current_window().cloned() else {
+            self.log("还没有选中窗口，点「刷新窗口」");
+            return;
+        };
+        if self.job.is_some() {
+            self.log("先等当前采集跑完");
+            return;
+        }
+        let seed = if !self.lib.is_empty() {
+            Some(self.lib.clone())
+        } else {
+            None
+        };
+        let plan = JobPlan {
+            handle: window.handle,
+            region: self.region,
+            pipeline: self.pipeline(),
+            color: self.color,
+            tolerance: self.tolerance,
+            upscale: self.upscale,
+            high_recall: self.high_recall,
+            frames: 0,
+            interval_ms: self.interval_ms,
+            min_similarity: self.min_similarity,
+            learn_all: self.learn_all,
+            cell_w: font_lib::DEFAULT_CELL_W,
+            cell_h: font_lib::DEFAULT_CELL_H,
+            seed,
+        };
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.log(format!(
+            "开始后台积累：每 {} ms 抓一帧，识别到带坐标的任务就学；覆盖齐了会提示",
+            plan.interval_ms
+        ));
+        self.acc = Some(AccState {
+            rx: spawn_accumulate(plan, ctx.clone(), stop.clone()),
+            stop,
+            attempts: 0,
+            frames_used: 0,
+            samples: 0,
+            complete: false,
+            started: Instant::now(),
+        });
+    }
+
+    fn stop_accumulate(&mut self) {
+        if let Some(acc) = &self.acc {
+            acc.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.log("正在停止后台积累…");
+        }
+    }
+
+    /// 处理后台积累的回传：更新字库、覆盖状态和预览。
+    fn poll_acc(&mut self, ctx: &egui::Context) {
+        let Some(acc) = &self.acc else {
+            return;
+        };
+        let mut messages = Vec::new();
+        while let Ok(message) = acc.rx.try_recv() {
+            messages.push(message);
+        }
+        if messages.is_empty() {
+            return;
+        }
+        let mut stopped = false;
+        for message in messages {
+            match message {
+                JobMsg::Progress {
+                    attempts,
+                    frames_used,
+                    samples,
+                    learned,
+                    ocr,
+                    panel,
+                    lib,
+                    summary,
+                    complete,
+                    error,
+                    unchanged,
+                } => {
+                    if let Some(acc) = &mut self.acc {
+                        acc.attempts = attempts;
+                        acc.frames_used = frames_used;
+                        acc.samples = samples;
+                    }
+                    let was_complete = self.acc.as_ref().is_some_and(|acc| acc.complete);
+                    if let Some(acc) = &mut self.acc {
+                        acc.complete = complete;
+                    }
+                    self.lib = lib;
+                    self.lib_dirty = true;
+                    self.summary = summary;
+                    if complete && !was_complete {
+                        self.log(
+                            "覆盖齐了：0-9 和 , . 都有了 —— 可以点「保存」写盘，然后去主程序勾上复核",
+                        );
+                    }
+                    if let Some(err) = error {
+                        self.log(format!("这一轮跳过：{err}"));
+                    } else if unchanged {
+                        self.log("画面没变化，跳过");
+                    } else if learned > 0 {
+                        self.log(format!(
+                            "第 {attempts} 轮：采到 {learned} 个字模（累计 {frames_used} 帧有收获、{samples} 个样本）｜OCR {}",
+                            if ocr.is_empty() { "无文字" } else { &ocr }
+                        ));
+                    } else {
+                        self.log(format!(
+                            "第 {attempts} 轮：没采到字模｜OCR {}",
+                            if ocr.is_empty() { "无文字" } else { &ocr }
+                        ));
+                    }
+                    if let Some(panel) = panel {
+                        let cells = cells_of(&font_lib::binarize(&panel));
+                        match &mut self.preview {
+                            Some(preview) => {
+                                preview.texture = texture_of(ctx, "preview", &panel);
+                                preview.size =
+                                    egui::vec2(panel.width() as f32, panel.height() as f32);
+                                preview.cells = cells;
+                                preview.ocr = ocr;
+                            }
+                            None => {
+                                self.preview = Some(Preview {
+                                    texture: texture_of(ctx, "preview", &panel),
+                                    size: egui::vec2(panel.width() as f32, panel.height() as f32),
+                                    cells,
+                                    ocr,
+                                });
+                            }
+                        }
+                    }
+                }
+                JobMsg::AccStopped {
+                    lib,
+                    summary,
+                    samples,
+                    frames_used,
+                    attempts,
+                } => {
+                    stopped = true;
+                    self.lib = lib;
+                    self.lib_dirty = true;
+                    self.summary = summary;
+                    let elapsed = self
+                        .acc
+                        .as_ref()
+                        .map(|acc| acc.started.elapsed().as_secs())
+                        .unwrap_or(0);
+                    self.log(format!(
+                        "已停止后台积累：{attempts} 轮（{elapsed}s）、{frames_used} 帧有收获、{samples} 个样本；记得保存"
+                    ));
+                }
+                _ => {}
+            }
+        }
+        if stopped {
+            self.acc = None;
+        }
+    }
     fn glyph_texture(
         &self,
         ctx: &egui::Context,
@@ -672,6 +1069,7 @@ impl eframe::App for Studio {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll_job(&ctx);
+        self.poll_acc(&ctx);
         // 采集中要持续刷新进度。
         if self.busy() {
             ctx.request_repaint_after(Duration::from_millis(200));
@@ -873,6 +1271,46 @@ impl Studio {
             .weak(),
         );
 
+        ui.add_space(6.0);
+        ui.separator();
+        ui.horizontal(|ui| {
+            if self.acc.is_none() {
+                if ui
+                    .add_enabled(self.job.is_none(), egui::Button::new("后台积累"))
+                    .on_hover_text("不设终点一直跑：识别到带坐标的任务就学，画面没变化自动跳过")
+                    .clicked()
+                {
+                    self.start_accumulate(ctx);
+                }
+            } else if ui.button("停止积累").clicked() {
+                self.stop_accumulate();
+            }
+            if let Some(acc) = &self.acc {
+                ui.spinner();
+                ui.label(format!(
+                    "{} 轮 / 有收获 {} 帧 / {} 样本（{}s）",
+                    acc.attempts,
+                    acc.frames_used,
+                    acc.samples,
+                    acc.started.elapsed().as_secs()
+                ));
+            }
+        });
+        if self.acc.as_ref().is_some_and(|acc| acc.complete) {
+            ui.label(
+                egui::RichText::new("覆盖齐了：记得点「保存」写盘")
+                    .color(OK_GREEN)
+                    .strong(),
+            );
+        }
+        ui.label(
+            egui::RichText::new(
+                "后台积累适合边做任务边攒：窗口最小化/被盖住只会跳过那一轮，不会退出。",
+            )
+            .small()
+            .weak(),
+        );
+
         ui.add_space(8.0);
         ui.label(egui::RichText::new("字库").strong());
         ui.horizontal(|ui| {
@@ -990,16 +1428,18 @@ impl Studio {
         ui.separator();
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("字库字模").strong());
-            ui.label(
-                egui::RichText::new("点一个字模可改标签或删除，错的样本千万别留着")
-                    .small()
-                    .weak(),
-            );
+            let note = if self.acc.is_some() {
+                "积累中：每轮会回传最新字库，停止后才能改标签/删除"
+            } else {
+                "点一个字模可改标签或删除，错的样本千万别留着"
+            };
+            ui.label(egui::RichText::new(note).small().weak());
         });
         if self.lib.is_empty() {
             ui.label("空字库：采集后这里会显示每个学到的字模。");
             return;
         }
+        let locked = self.acc.is_some();
         let mut delete: Option<usize> = None;
         let mut relabel: Option<(usize, String)> = None;
         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -1031,7 +1471,10 @@ impl Studio {
                     }
                     ui.vertical(|ui| {
                         ui.label(egui::RichText::new(&glyph.label).strong());
-                        if ui.small_button("删").clicked() {
+                        if ui
+                            .add_enabled(!locked, egui::Button::new("删").small())
+                            .clicked()
+                        {
                             delete = Some(index);
                         }
                     });
@@ -1040,18 +1483,20 @@ impl Studio {
         });
         if let Some(index) = self.selected_glyph {
             ui.separator();
-            ui.horizontal(|ui| {
-                ui.label(format!("选中第 {index} 个字模，标签："));
-                ui.add(egui::TextEdit::singleline(&mut self.relabel).desired_width(40.0));
-                if ui.button("改标签").clicked() {
-                    let label: String = self.relabel.trim().chars().take(1).collect();
-                    if !label.is_empty() {
-                        relabel = Some((index, label));
+            ui.add_enabled_ui(!locked, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(format!("选中第 {index} 个字模，标签："));
+                    ui.add(egui::TextEdit::singleline(&mut self.relabel).desired_width(40.0));
+                    if ui.button("改标签").clicked() {
+                        let label: String = self.relabel.trim().chars().take(1).collect();
+                        if !label.is_empty() {
+                            relabel = Some((index, label));
+                        }
                     }
-                }
-                if ui.button("删除选中").clicked() {
-                    delete = Some(index);
-                }
+                    if ui.button("删除选中").clicked() {
+                        delete = Some(index);
+                    }
+                });
             });
         }
         if let Some((index, label)) = relabel {
@@ -1189,3 +1634,100 @@ fn selection_of(picker: &Picker) -> Option<Selection> {
 const OK_GREEN: egui::Color32 = egui::Color32::from_rgb(0x4c, 0xd9, 0x8a);
 const WARN: egui::Color32 = egui::Color32::from_rgb(0xf0, 0xb4, 0x4c);
 const EARLY: egui::Color32 = egui::Color32::from_rgb(0x8a, 0xb4, 0xf8);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use font_lib::fixture;
+
+    /// 合成一块面板 + 一份“OCR 结果”，验证采集核心：裁图→切字→打标签→学习。
+    #[test]
+    fn learns_glyphs_from_one_panel() {
+        let line = fixture::render("79,26", 5, 1);
+        let mut panel = image::RgbImage::from_pixel(220, 60, image::Rgb([255, 255, 255]));
+        image::imageops::overlay(&mut panel, &line, 20, 10);
+        let region = ocr::OcrRegion {
+            text: "79,26".into(),
+            score: 0.95,
+            left: 20.0,
+            top: 10.0,
+            right: 20.0 + line.width() as f32,
+            bottom: 10.0 + line.height() as f32,
+            range: 0..5,
+        };
+        let ocr = ocr::OcrText {
+            text: "79,26".into(),
+            elapsed_secs: 0.0,
+            regions: vec![region],
+            notes: Vec::new(),
+        };
+        let mut learner = Learner::new(
+            font_lib::DEFAULT_CELL_W,
+            font_lib::DEFAULT_CELL_H,
+            LearnConfig::default(),
+        );
+        let mut skipped = 0usize;
+        let learned = learn_panel(&mut learner, &panel, &ocr, false, &mut skipped);
+        assert_eq!(learned, 5, "应当学到 5 个字模");
+        assert_eq!(skipped, 0);
+        let labels: Vec<String> = learner.summary().into_iter().map(|s| s.label).collect();
+        assert_eq!(labels, [",", "2", "6", "7", "9"]);
+    }
+
+    /// OCR 只认出一半、切字数对不上时，宁可跳过，也不打错标签。
+    #[test]
+    fn skips_regions_whose_cell_count_disagrees() {
+        let line = fixture::render("79,26", 5, 1);
+        let mut panel = image::RgbImage::from_pixel(220, 60, image::Rgb([255, 255, 255]));
+        image::imageops::overlay(&mut panel, &line, 20, 10);
+        let region = ocr::OcrRegion {
+            text: "79".into(),
+            score: 0.9,
+            left: 20.0,
+            top: 10.0,
+            right: 20.0 + line.width() as f32,
+            bottom: 10.0 + line.height() as f32,
+            range: 0..2,
+        };
+        let ocr = ocr::OcrText {
+            text: "79".into(),
+            elapsed_secs: 0.0,
+            regions: vec![region],
+            notes: Vec::new(),
+        };
+        let mut learner = Learner::new(
+            font_lib::DEFAULT_CELL_W,
+            font_lib::DEFAULT_CELL_H,
+            LearnConfig::default(),
+        );
+        let mut skipped = 0usize;
+        assert_eq!(
+            learn_panel(&mut learner, &panel, &ocr, false, &mut skipped),
+            0
+        );
+        assert_eq!(skipped, 1);
+        assert_eq!(learner.cluster_count(), 0);
+    }
+
+    #[test]
+    fn panel_hash_is_stable_and_sensitive() {
+        let a = image::RgbImage::from_pixel(120, 40, image::Rgb([255, 255, 255]));
+        let mut b = a.clone();
+        assert_eq!(panel_hash(&a), panel_hash(&b));
+        // 改一个会被采样到的像素（y 每 3 行采一次）。
+        b.put_pixel(60, 21, image::Rgb([0, 0, 0]));
+        assert_ne!(panel_hash(&a), panel_hash(&b), "画面变了指纹就得变");
+    }
+
+    #[test]
+    fn sleep_while_returns_immediately_when_stopped() {
+        use std::sync::atomic::AtomicBool;
+        let stop = AtomicBool::new(true);
+        let started = Instant::now();
+        sleep_while(&stop, 5_000);
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "停止要立即生效"
+        );
+    }
+}
