@@ -2113,8 +2113,21 @@ impl Studio {
         preview.ocr_regions = regions;
         preview.ocr_upscale = ocr_upscale.max(1);
         preview.reprocess(ctx, pipeline, color, tolerance, upscale);
+        let (panel_w, panel_h) = (preview.panel.width(), preview.panel.height());
+        let (rows, cells) = (
+            preview.rows.len(),
+            preview
+                .rows
+                .iter()
+                .map(|row| row.cells.len())
+                .sum::<usize>(),
+        );
         self.preview = Some(preview);
         self.refresh_narrow_runs(ctx);
+        self.dump_preview_debug();
+        self.log(format!(
+            "预览面板 {panel_w}x{panel_h}（OCR 时 {ocr_upscale}x，当前 {upscale}x）｜{rows} 行、{cells} 个格子",
+        ));
     }
 
     /// 预处理参数变了：拿同一张原图重算，不用回游戏重截。
@@ -2398,5 +2411,72 @@ impl Studio {
         if !self.busy() {
             self.refresh_preview(ctx);
         }
+    }
+}
+
+impl Studio {
+    /// 把这次预览的「实际像素数据」落盘，排查框错位用。
+    ///
+    /// 导出 `target/studio-preview.png`（送 OCR 的那张图）和 `.json`
+    /// （图尺寸、设置、每个 OCR 框、每行切出来的格子），拿这两个就能判断
+    /// 是「框的坐标系不对」还是「切字规则不对」。
+    fn dump_preview_debug(&self) {
+        let Some(preview) = &self.preview else {
+            return;
+        };
+        let dir = std::path::Path::new("target");
+        let _ = std::fs::create_dir_all(dir);
+        let _ = preview.panel.save(dir.join("studio-preview.png"));
+        let rows: Vec<String> = preview
+            .rows
+            .iter()
+            .map(|row| {
+                let cells: Vec<String> = row
+                    .cells
+                    .iter()
+                    .map(|(cell, ch)| {
+                        format!(
+                            "{{\"ch\":\"{ch}\",\"x\":{},\"w\":{}}}",
+                            cell.span.x0,
+                            cell.span.width()
+                        )
+                    })
+                    .collect();
+                format!(
+                    "{{\"text\":\"{}\",\"band\":[{},{},{},{}],\"cells\":[{}]}}",
+                    row.text.replace('"', "'"),
+                    row.band.span.x0,
+                    row.band.top,
+                    row.band.span.x1,
+                    row.band.bottom,
+                    cells.join(",")
+                )
+            })
+            .collect();
+        let regions: Vec<String> = preview
+            .ocr_regions
+            .iter()
+            .map(|region| {
+                format!(
+                    "{{\"text\":\"{}\",\"rect\":[{:.1},{:.1},{:.1},{:.1}]}}",
+                    region.text.replace('"', "'"),
+                    region.left,
+                    region.top,
+                    region.right,
+                    region.bottom
+                )
+            })
+            .collect();
+        let json = format!(
+            "{{\n  \"panel\":[{},{}],\n  \"upscale\":{},\n  \"ocr_upscale\":{},\n  \"show_binary\":{},\n  \"regions\":[{}],\n  \"rows\":[{}]\n}}\n",
+            preview.panel.width(),
+            preview.panel.height(),
+            self.upscale,
+            preview.ocr_upscale,
+            self.show_binary,
+            regions.join(","),
+            rows.join(",")
+        );
+        let _ = std::fs::write(dir.join("studio-preview.json"), json);
     }
 }

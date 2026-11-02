@@ -126,6 +126,7 @@ fn main() {
         Some("region") => region(&args[1..]),
         Some("info") => info(&args[1..]),
         Some("verify") => verify(&args[1..]),
+        Some("debug-rows") => debug_rows(&args[1..]),
         Some("sheet") => sheet(&args[1..]),
         Some("align") => align(&args[1..]),
         Some("snap") => snap(&args[1..]),
@@ -995,6 +996,94 @@ fn align(args: &[String]) -> Result<(), String> {
         }
         None => println!("对齐不上：「{text}」"),
     }
+    Ok(())
+}
+
+/// 复现 font-studio 的预览：截图 → 预处理 → OCR → 按行切字，把结果落盘。
+///
+/// ```bash
+/// cargo run --bin font-tool -- debug-rows --out target/dbg
+/// ```
+/// 输出 `dbg/panel.png` 和 `dbg/rows.json`，用来排查「框和文字对不上」。
+fn debug_rows(args: &[String]) -> Result<(), String> {
+    let flags = parse_flags(args);
+    let out: PathBuf = flags
+        .get("out")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("target/dbg"));
+    std::fs::create_dir_all(&out).map_err(|err| format!("创建 {} 失败：{err}", out.display()))?;
+    let plan = CapturePlan::prepare(&flags)?;
+    println!("{}", plan.describe());
+    let panel = plan.grab()?;
+    panel
+        .save(out.join("panel.png"))
+        .map_err(|err| format!("写 panel.png 失败：{err}"))?;
+    let gray = font_lib::binarize(&panel);
+    let ocr = ocr::recognize_panel(&panel, plan.high_recall)?;
+    println!(
+        "面板 {}x{}，OCR 文本：{}",
+        panel.width(),
+        panel.height(),
+        ocr.text.trim().replace('\n', " / ")
+    );
+    let mut lines: Vec<String> = Vec::new();
+    for region in &ocr.regions {
+        let raw_band = (region.left, region.top, region.right, region.bottom);
+        let trimmed = font_lib::trim_to_ink(
+            &gray,
+            (
+                raw_band.0.max(0.0) as u32,
+                raw_band.1.max(0.0) as u32,
+                (raw_band.2 as u32).min(gray.width()),
+                (raw_band.3 as u32).min(gray.height()),
+            ),
+        );
+        let cells = trimmed
+            .map(|band| font_lib::split_row_by_text(&gray, band, &region.text))
+            .unwrap_or_default();
+        let cell_text: String = cells.iter().map(|(_, ch)| *ch).collect();
+        let cell_desc: Vec<String> = cells
+            .iter()
+            .map(|(b, _)| format!("{}@{}w{}", "", b.span.x0, b.span.width()))
+            .collect();
+        println!(
+            "  区域「{}」rect=({:.0},{:.0},{:.0},{:.0}) 墨迹={:?} 切出 {} 格（{}）",
+            region.text,
+            region.left,
+            region.top,
+            region.right,
+            region.bottom,
+            trimmed,
+            cells.len(),
+            cell_text
+        );
+        let _ = cell_desc;
+        // 把每个字的框画到图上，直观对比。
+        lines.push(format!(
+            "{{\"text\":\"{}\",\"rect\":[{:.1},{:.1},{:.1},{:.1}],\"ink\":{:?},\"cells\":{}}}",
+            region.text.replace('"', "'"),
+            region.left,
+            region.top,
+            region.right,
+            region.bottom,
+            trimmed,
+            cells.len()
+        ));
+    }
+    let json = format!(
+        "{{\n  \"panel\": [{}, {}],\n  \"upscale\": {},\n  \"rows\": [\n    {}\n  ]\n}}\n",
+        panel.width(),
+        panel.height(),
+        plan.upscale,
+        lines.join(",\n    ")
+    );
+    std::fs::write(out.join("rows.json"), json)
+        .map_err(|err| format!("写 rows.json 失败：{err}"))?;
+    println!(
+        "已写入 {}/panel.png 和 {}/rows.json",
+        out.display(),
+        out.display()
+    );
     Ok(())
 }
 
