@@ -504,7 +504,7 @@ impl Preview {
         let panel = process_panel(&self.image, pipeline, color, tolerance, upscale);
         self.texture = texture_of(ctx, "preview", &panel);
         self.size = egui::vec2(panel.width() as f32, panel.height() as f32);
-        let gray = font_lib::binarize(&panel);
+        let gray = font_lib::binarize_text(&panel);
         self.binary_texture = texture_of_gray(ctx, "preview-binary", &gray);
         self.cells = cells_of(&gray);
         self.panel = panel;
@@ -2265,7 +2265,7 @@ impl Studio {
             self.tolerance,
             self.upscale,
         );
-        let gray = font_lib::binarize(&panel);
+        let gray = font_lib::binarize_text(&panel);
         let runs: Vec<String> =
             font_lib::read_narrow_runs(&gray, &self.lib, MatchConfig::default())
                 .into_iter()
@@ -2350,24 +2350,39 @@ struct PreviewRow {
 }
 
 impl Preview {
-    /// 按「行」重建切字：行框来自 OCR 检测框（先裁到墨迹），行内用
-    /// 「2 个数字 = 1 个汉字宽」的规律等比例切开。
+    /// 按「行」重建切字：
+    /// 1. 检测框上下会重叠、还可能是一行被拆成左右两段 → 先按竖直重叠聚成行；
+    /// 2. 行带在相邻行中心的中点处分界，保证行与行不重叠；
+    /// 3. 行内按「2 个数字 = 1 个汉字宽」等比例切格子。
     fn rebuild_rows(&mut self, upscale: u32) {
         self.rows.clear();
         if self.ocr_regions.is_empty() || self.gray.width() < 2 {
             return;
         }
-        // OCR 是在它自己那次放大倍数下跑的；换倍数时把矩形等比换算。
         let ratio = upscale.max(1) as f32 / self.ocr_upscale.max(1) as f32;
-        for region in &self.ocr_regions {
-            let band = (
-                (region.left * ratio).round().max(0.0) as u32,
-                (region.top * ratio).round().max(0.0) as u32,
-                ((region.right * ratio).round() as u32).min(self.gray.width()),
-                ((region.bottom * ratio).round() as u32).min(self.gray.height()),
-            );
-            // OCR 框常比文字宽一圈：先裁到墨迹，框才贴着字。
-            let Some(band) = font_lib::trim_to_ink(&self.gray, band) else {
+        let bands: Vec<(u32, u32, u32, u32)> = self
+            .ocr_regions
+            .iter()
+            .map(|region| {
+                (
+                    (region.left * ratio).round().max(0.0) as u32,
+                    (region.top * ratio).round().max(0.0) as u32,
+                    ((region.right * ratio).round() as u32).min(self.gray.width()),
+                    ((region.bottom * ratio).round() as u32).min(self.gray.height()),
+                )
+            })
+            .collect();
+        let row_of = font_lib::cluster_rows(&bands);
+        let row_bands = font_lib::row_bands(&bands, &row_of);
+        for (index, region) in self.ocr_regions.iter().enumerate() {
+            let (bx0, _, bx1, _) = bands[index];
+            let (row_top, row_bottom) = row_bands[row_of[index]];
+            if bx1 <= bx0 || row_bottom <= row_top {
+                continue;
+            }
+            // x 来自检测框、y 来自真实行，再一起裁到墨迹。
+            let Some(band) = font_lib::trim_to_ink(&self.gray, (bx0, row_top, bx1, row_bottom))
+            else {
                 continue;
             };
             let cells = font_lib::split_row_by_text(&self.gray, band, &region.text);

@@ -955,7 +955,7 @@ fn align(args: &[String]) -> Result<(), String> {
             .map_err(|err| format!("写入 {path} 失败：{err}"))?;
         println!("预处理结果已写到 {path}");
     }
-    let gray = font_lib::binarize(&processed);
+    let gray = font_lib::binarize_text(&processed);
     let image = processed;
     let mut cfg = MatchConfig::default();
     cfg.gap_merge = number(&flags, "gap", cfg.gap_merge)?;
@@ -999,12 +999,14 @@ fn align(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// 复现 font-studio 的预览：截图 → 预处理 → OCR → 按行切字，把结果落盘。
+/// 复现 font-studio 的预览：截图（或用 --image 指定现成的图）→ 预处理 → OCR
+/// → 按真实文字行切字，把结果打印/落盘。
 ///
 /// ```bash
 /// cargo run --bin font-tool -- debug-rows --out target/dbg
+/// cargo run --bin font-tool -- debug-rows --image target/studio-preview.png --raw
 /// ```
-/// 输出 `dbg/panel.png` 和 `dbg/rows.json`，用来排查「框和文字对不上」。
+/// `--raw` 表示图片已经是预处理后的（不再重复预处理）。
 fn debug_rows(args: &[String]) -> Result<(), String> {
     let flags = parse_flags(args);
     let out: PathBuf = flags
@@ -1012,69 +1014,121 @@ fn debug_rows(args: &[String]) -> Result<(), String> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("target/dbg"));
     std::fs::create_dir_all(&out).map_err(|err| format!("创建 {} 失败：{err}", out.display()))?;
-    let plan = CapturePlan::prepare(&flags)?;
-    println!("{}", plan.describe());
-    let panel = plan.grab()?;
+
+    let (panel, upscale) = match flags.get("image") {
+        Some(path) => {
+            let image = load_rgb(std::path::Path::new(path))?;
+            let panel = if flags.contains_key("raw") {
+                image
+            } else {
+                let plan = CapturePlan::prepare(&flags)?;
+                process_panel_for_tool(
+                    &image,
+                    plan.pipeline,
+                    plan.color,
+                    plan.tolerance,
+                    plan.upscale,
+                )
+            };
+            let upscale: u32 = number(&flags, "upscale", 1)?;
+            (panel, upscale)
+        }
+        None => {
+            let plan = CapturePlan::prepare(&flags)?;
+            println!("{}", plan.describe());
+            (plan.grab()?, plan.upscale)
+        }
+    };
     panel
         .save(out.join("panel.png"))
         .map_err(|err| format!("写 panel.png 失败：{err}"))?;
-    let gray = font_lib::binarize(&panel);
-    let ocr = ocr::recognize_panel(&panel, plan.high_recall)?;
+    // 彩色背景用自适应阈值：白字红字都能取出来，行间才会有空隙。
+    let gray = font_lib::binarize_text(&panel);
+    gray.save(out.join("binary.png"))
+        .map_err(|err| format!("写 binary.png 失败：{err}"))?;
+    let ocr = ocr::recognize_panel(&panel, true)?;
     println!(
         "面板 {}x{}，OCR 文本：{}",
         panel.width(),
         panel.height(),
         ocr.text.trim().replace('\n', " / ")
     );
-    let mut lines: Vec<String> = Vec::new();
-    for region in &ocr.regions {
-        let raw_band = (region.left, region.top, region.right, region.bottom);
-        let trimmed = font_lib::trim_to_ink(
-            &gray,
+
+    // 关键：先按整块面板切出干净的文字行，再把检测框归到行上。
+    let rows = font_lib::text_rows(&gray, 1);
+    println!("真实文字行（top..bottom）：{rows:?}");
+    let bands: Vec<(u32, u32, u32, u32)> = ocr
+        .regions
+        .iter()
+        .map(|region| {
             (
-                raw_band.0.max(0.0) as u32,
-                raw_band.1.max(0.0) as u32,
-                (raw_band.2 as u32).min(gray.width()),
-                (raw_band.3 as u32).min(gray.height()),
-            ),
-        );
+                region.left.max(0.0) as u32,
+                region.top.max(0.0) as u32,
+                (region.right as u32).min(gray.width()),
+                (region.bottom as u32).min(gray.height()),
+            )
+        })
+        .collect();
+    // 检测框上下重叠、还可能是同一行被拆成两段：先按竖直重叠聚成行。
+    let row_of = font_lib::cluster_rows(&bands);
+    let row_bands = font_lib::row_bands(&bands, &row_of);
+    println!("聚类后行带：{row_bands:?}（每框行号 {row_of:?}）");
+    let assigned: Vec<(u32, u32)> = row_of.iter().map(|row| row_bands[*row]).collect();
+
+    let mut lines: Vec<String> = Vec::new();
+    let mut overlay_rows: Vec<(font_lib::GlyphBox, Vec<(font_lib::GlyphBox, char)>)> = Vec::new();
+    for (region, (band, row)) in ocr.regions.iter().zip(bands.iter().zip(assigned)) {
+        let trimmed = font_lib::trim_to_ink(&gray, (band.0, row.0, band.2, row.1));
         let cells = trimmed
             .map(|band| font_lib::split_row_by_text(&gray, band, &region.text))
             .unwrap_or_default();
-        let cell_text: String = cells.iter().map(|(_, ch)| *ch).collect();
-        let cell_desc: Vec<String> = cells
-            .iter()
-            .map(|(b, _)| format!("{}@{}w{}", "", b.span.x0, b.span.width()))
-            .collect();
+        let text: String = cells.iter().map(|(_, ch)| *ch).collect();
         println!(
-            "  区域「{}」rect=({:.0},{:.0},{:.0},{:.0}) 墨迹={:?} 切出 {} 格（{}）",
+            "  「{}」框=({},{},{},{}) → 行 {}..{}｜墨迹={:?}｜切 {} 格：{}",
             region.text,
-            region.left,
-            region.top,
-            region.right,
-            region.bottom,
+            band.0,
+            band.1,
+            band.2,
+            band.3,
+            row.0,
+            row.1,
             trimmed,
             cells.len(),
-            cell_text
+            text
         );
-        let _ = cell_desc;
-        // 把每个字的框画到图上，直观对比。
         lines.push(format!(
-            "{{\"text\":\"{}\",\"rect\":[{:.1},{:.1},{:.1},{:.1}],\"ink\":{:?},\"cells\":{}}}",
+            "{{\"text\":\"{}\",\"band\":[{},{},{},{}],\"cells\":{}}}",
             region.text.replace('"', "'"),
-            region.left,
-            region.top,
-            region.right,
-            region.bottom,
-            trimmed,
+            band.0,
+            row.0,
+            band.2,
+            row.1,
             cells.len()
         ));
+        if let Some((tx, ty, bx, by)) = trimmed {
+            overlay_rows.push((
+                font_lib::GlyphBox {
+                    span: font_lib::Span { x0: tx, x1: bx },
+                    top: ty,
+                    bottom: by,
+                },
+                cells.clone(),
+            ));
+        }
     }
+    let overlay = draw_overlay(&panel, &overlay_rows);
+    overlay
+        .save(out.join("overlay.png"))
+        .map_err(|err| format!("写 overlay.png 失败：{err}"))?;
     let json = format!(
-        "{{\n  \"panel\": [{}, {}],\n  \"upscale\": {},\n  \"rows\": [\n    {}\n  ]\n}}\n",
+        "{{\n  \"panel\": [{}, {}],\n  \"upscale\": {},\n  \"rows\": [{}],\n  \"regions\": [\n    {}\n  ]\n}}\n",
         panel.width(),
         panel.height(),
-        plan.upscale,
+        upscale,
+        rows.iter()
+            .map(|(top, bottom)| format!("[{top},{bottom}]"))
+            .collect::<Vec<_>>()
+            .join(","),
         lines.join(",\n    ")
     );
     std::fs::write(out.join("rows.json"), json)
@@ -1087,6 +1141,41 @@ fn debug_rows(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// 打印每一行的墨迹像素数（排查行切分用）。
+fn row_profile(gray: &image::GrayImage) {
+    let mut counts = Vec::with_capacity(gray.height() as usize);
+    for y in 0..gray.height() {
+        let count = (0..gray.width())
+            .filter(|x| gray.get_pixel(*x, y)[0] < 128)
+            .count();
+        counts.push(count);
+    }
+    let empty: Vec<usize> = counts
+        .iter()
+        .enumerate()
+        .filter(|(_, count)| **count == 0)
+        .map(|(y, _)| y)
+        .collect();
+    println!("空行（y）：{empty:?}");
+    for gap in [1u32, 2, 3] {
+        println!("gap={gap} → {:?}", font_lib::text_rows(gray, gap));
+    }
+}
+
+/// 只给这个调试命令用的预处理（CapturePlan 的方法在 font_studio 里）。
+fn process_panel_for_tool(
+    raw: &image::RgbImage,
+    pipeline: preprocess::Pipeline,
+    color: [u8; 3],
+    tolerance: u8,
+    upscale: u32,
+) -> image::RgbImage {
+    let mut panel = preprocess::apply(raw.clone(), pipeline, color, tolerance);
+    if upscale > 1 {
+        panel = preprocess::upscale(&panel, upscale);
+    }
+    panel
+}
 /// 字库自测：按当前区域抓 N 帧，对比「字库读出的坐标」和「OCR 认出的坐标」。
 ///
 /// 这是判断字库到底有没有用的唯一可靠办法：一致率高就说明它认的数字是对的，
@@ -1129,7 +1218,7 @@ fn verify(args: &[String]) -> Result<(), String> {
             let Ok(crop) = font_lib::crop(&panel, x, y, width, height) else {
                 continue;
             };
-            let gray = font_lib::binarize(&crop);
+            let gray = font_lib::binarize_text(&crop);
             let runs = font_lib::read_narrow_runs(&gray, &lib, cfg);
             let lib_coord = runs
                 .iter()
@@ -1347,7 +1436,7 @@ fn read(args: &[String]) -> Result<(), String> {
         image = font_lib::crop(&image, parts[0], parts[1], parts[2], parts[3])?;
     }
     if let Some(path) = flags.get("save-binary") {
-        let gray = font_lib::binarize(&image);
+        let gray = font_lib::binarize_text(&image);
         gray.save(path)
             .map_err(|err| format!("写入二值化图 {path} 失败：{err}"))?;
         eprintln!("二值化结果已写到 {path}");
@@ -1355,7 +1444,7 @@ fn read(args: &[String]) -> Result<(), String> {
     let single_line = flags.contains_key("line");
     let started = std::time::Instant::now();
     if single_line {
-        let gray = font_lib::binarize(&image);
+        let gray = font_lib::binarize_text(&image);
         let line = font_lib::read_line_gray(&gray, &lib, MatchConfig::default());
         print_line(&line);
     } else {
@@ -1392,4 +1481,53 @@ fn load_rgb(path: &Path) -> Result<image::RgbImage, String> {
     let image =
         image::open(path).map_err(|err| format!("读取图片 {} 失败：{err}", path.display()))?;
     Ok(image.to_rgb8())
+}
+
+#[allow(dead_code)]
+fn adaptive_demo(image: &image::RgbImage, radius: u32, bias: u8) -> image::GrayImage {
+    font_lib::binarize_adaptive(image, radius, bias)
+}
+
+/// 把行带和格子画到面板上，用来肉眼确认框对不对。
+fn draw_overlay(
+    panel: &image::RgbImage,
+    rows: &[(font_lib::GlyphBox, Vec<(font_lib::GlyphBox, char)>)],
+) -> image::RgbImage {
+    let mut image = panel.clone();
+    let mut put = |x: u32, y: u32, color: image::Rgb<u8>| {
+        if let Some(pixel) = image.get_pixel_mut_checked(x, y) {
+            *pixel = color;
+        }
+    };
+    for (band, cells) in rows {
+        // 行带：蓝色
+        for x in band.span.x0..band.span.x1 {
+            put(x, band.top, image::Rgb([80, 140, 255]));
+            put(x, band.bottom.saturating_sub(1), image::Rgb([80, 140, 255]));
+        }
+        for y in band.top..band.bottom {
+            put(band.span.x0, y, image::Rgb([80, 140, 255]));
+            put(
+                band.span.x1.saturating_sub(1),
+                y,
+                image::Rgb([80, 140, 255]),
+            );
+        }
+        // 格子：绿色
+        for (cell, _) in cells {
+            for x in cell.span.x0..cell.span.x1 {
+                put(x, cell.top, image::Rgb([60, 220, 120]));
+                put(x, cell.bottom.saturating_sub(1), image::Rgb([60, 220, 120]));
+            }
+            for y in cell.top..cell.bottom {
+                put(cell.span.x0, y, image::Rgb([60, 220, 120]));
+                put(
+                    cell.span.x1.saturating_sub(1),
+                    y,
+                    image::Rgb([60, 220, 120]),
+                );
+            }
+        }
+    }
+    image
 }

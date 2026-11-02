@@ -689,7 +689,7 @@ pub fn learn_panel(
         let Ok(crop) = font_lib::crop(panel, x, y, width, height) else {
             continue;
         };
-        let gray = font_lib::binarize(&crop);
+        let gray = font_lib::binarize_text(&crop);
         if font_lib::row_spans(&gray, cfg.row_gap).len() != 1 {
             *skipped += 1;
             continue;

@@ -1873,6 +1873,21 @@ fn column_has_ink(gray: &GrayImage, y0: u32, y1: u32, x: u32) -> bool {
     (y0..y1.min(gray.height())).any(|y| x < gray.width() && gray.get_pixel(x, y)[0] < 128)
 }
 
+/// 某一段竖条里的墨迹上下范围（没有墨迹返回 None）。
+fn vertical_ink(gray: &GrayImage, x0: u32, x1: u32, y0: u32, y1: u32) -> Option<(u32, u32)> {
+    let mut top = u32::MAX;
+    let mut bottom = 0u32;
+    for x in x0..x1.min(gray.width()) {
+        for y in y0..y1.min(gray.height()) {
+            if gray.get_pixel(x, y)[0] < 128 {
+                top = top.min(y);
+                bottom = bottom.max(y + 1);
+            }
+        }
+    }
+    (bottom > top).then_some((top, bottom))
+}
+
 /// 把一行按「字宽规律」切成一格一格。
 ///
 /// 这是按游戏字体的实际排版推的：**2 个数字 = 1 个汉字宽，全角符号 = 1 个汉字宽**。
@@ -1950,14 +1965,17 @@ pub fn split_row_by_text(
             }
         }
         let boundary = boundary.clamp(previous + 1, x1);
+        // 每格用自己的墨迹上下范围：跟运行时 analyze_components 的归一化保持一致，
+        // 否则学出来的模板和用的时候不是同一种缩放。
+        let (top, bottom) = vertical_ink(gray, previous, boundary, by0, by1).unwrap_or((by0, by1));
         cells.push((
             GlyphBox {
                 span: Span {
                     x0: previous,
                     x1: boundary,
                 },
-                top: by0,
-                bottom: by1,
+                top,
+                bottom,
             },
             *ch,
         ));
@@ -2070,4 +2088,276 @@ mod trim_tests {
         // 空框返回 None。
         assert!(trim_to_ink(&gray, (60, 0, 100, 40)).is_none());
     }
+}
+
+// ------------------------------------------------- 检测框 → 真实文字行
+
+/// 按整块面板的水平投影切出「干净的文字行」。
+///
+/// 行与行之间的空隙比行内字间距大，所以 gap 给大一点（默认 3）就能切开；
+/// 这是后面把 OCR 检测框归行的依据。
+pub fn text_rows(gray: &GrayImage, gap: u32) -> Vec<(u32, u32)> {
+    row_spans(gray, gap.max(1))
+}
+
+/// 把每个检测框归到「重叠最多」的真实文字行，返回每框对应的 `(top, bottom)`。
+///
+/// PP-OCR 的检测框经常上下重叠（一行 60px、框高 61px、相邻框差 45px），
+/// 直接按框取像素会把两行的字混在一起，切出来的格子既高又宽。
+pub fn assign_rows(bands: &[(u32, u32, u32, u32)], rows: &[(u32, u32)]) -> Vec<(u32, u32)> {
+    bands
+        .iter()
+        .map(|(_, y0, _, y1)| {
+            let mut best: Option<(u32, u32)> = None;
+            let mut best_overlap = 0u32;
+            for (top, bottom) in rows {
+                let overlap = (*bottom).min(*y1).saturating_sub((*top).max(*y0));
+                if overlap > best_overlap {
+                    best_overlap = overlap;
+                    best = Some((*top, *bottom));
+                }
+            }
+            // 兜底：一行都没重叠（框落在空行上）就用框自己的高度。
+            best.unwrap_or((*y0, *y1))
+        })
+        .collect()
+}
+
+/// 自适应二值化：按「局部对比度」取笔画，不依赖文字颜色。
+///
+/// 游戏任务栏是**彩色渐变背景 + 白字/红字混排**，全局 Otsu 会把背景纹理也当成笔画，
+/// 行与行之间就没有空隙了（实测整块面板被切成"一行"）。
+/// 这里用局部均值比较：笔画（细、与周围反差大）会被留下，平滑背景被抹掉。
+pub fn binarize_adaptive(image: &RgbImage, radius: u32, bias: u8) -> GrayImage {
+    let gray = to_gray(image);
+    let (width, height) = (gray.width() as usize, gray.height() as usize);
+    if width == 0 || height == 0 {
+        return gray;
+    }
+    // 积分图：(width+1)x(height+1)，u32 够用（255 * 4M 像素 ≈ 1e9）。
+    let mut integral = vec![0u64; (width + 1) * (height + 1)];
+    for y in 0..height {
+        let mut row_sum = 0u64;
+        for x in 0..width {
+            row_sum += gray.get_pixel(x as u32, y as u32)[0] as u64;
+            integral[(y + 1) * (width + 1) + (x + 1)] =
+                integral[y * (width + 1) + (x + 1)] + row_sum;
+        }
+    }
+    let radius = radius.max(1) as i64;
+    let bias = bias as i64;
+    let mut out = GrayImage::new(width as u32, height as u32);
+    for y in 0..height {
+        for x in 0..width {
+            let x0 = (x as i64 - radius).max(0) as usize;
+            let y0 = (y as i64 - radius).max(0) as usize;
+            let x1 = ((x as i64 + radius + 1) as usize).min(width);
+            let y1 = ((y as i64 + radius + 1) as usize).min(height);
+            let area = ((x1 - x0) * (y1 - y0)).max(1) as u64;
+            let sum = integral[y1 * (width + 1) + x1] + integral[y0 * (width + 1) + x0]
+                - integral[y0 * (width + 1) + x1]
+                - integral[y1 * (width + 1) + x0];
+            let mean = (sum / area) as i64;
+            let value = gray.get_pixel(x as u32, y as u32)[0] as i64;
+            // 比局部均值亮或暗超过 bias 的像素算笔画。
+            let ink = (value - mean).abs() > bias;
+            out.put_pixel(x as u32, y as u32, Luma([if ink { 0 } else { 255 }]));
+        }
+    }
+    out
+}
+
+/// 用检测框的**中心线**把重叠的框切成互不重叠的行带。
+///
+/// 任务栏的行距很小（甚至没有空行），整块水平投影切不开；但 OCR 每个框大致
+/// 对一行，所以按框中心排序、在相邻中心的中点处下刀，就能得到干净的行带。
+/// 返回与输入同序的 `(top, bottom)`。
+pub fn bands_by_center(bands: &[(u32, u32, u32, u32)]) -> Vec<(u32, u32)> {
+    if bands.is_empty() {
+        return Vec::new();
+    }
+    let mut order: Vec<usize> = (0..bands.len()).collect();
+    order.sort_by_key(|index| (bands[*index].1 + bands[*index].3) / 2);
+    let centers: Vec<u32> = order
+        .iter()
+        .map(|index| (bands[*index].1 + bands[*index].3) / 2)
+        .collect();
+    let mut out = vec![(0u32, 0u32); bands.len()];
+    for (position, index) in order.iter().enumerate() {
+        let (_, y0, _, y1) = bands[*index];
+        let top = if position == 0 {
+            y0
+        } else {
+            ((centers[position - 1] + centers[position]) / 2).max(y0)
+        };
+        let bottom = if position + 1 == order.len() {
+            y1
+        } else {
+            ((centers[position] + centers[position + 1]) / 2).min(y1)
+        };
+        out[*index] = (top, bottom.max(top + 1));
+    }
+    out
+}
+
+/// 把检测框按「竖直重叠」聚成视觉行。
+///
+/// 一行文字可能被 OCR 拆成左右两个框（比如「：丟」+「麒麟山的，30附近」），
+/// 而上下相邻两行的框又会轻微重叠。判据：两个框的竖直重叠超过较矮那个的一半，
+/// 就算同一行。返回每个框的行号（从 0 开始，按 y 排序）。
+pub fn cluster_rows(bands: &[(u32, u32, u32, u32)]) -> Vec<usize> {
+    let count = bands.len();
+    let mut row_of = vec![usize::MAX; count];
+    let mut order: Vec<usize> = (0..count).collect();
+    order.sort_by_key(|index| (bands[*index].1 + bands[*index].3) / 2);
+    let mut row = 0usize;
+    let mut previous: Option<usize> = None;
+    for index in order {
+        let (_, y0, _, y1) = bands[index];
+        let merged = previous.is_some_and(|previous| {
+            let (_, py0, _, py1) = bands[previous];
+            let overlap = y1.min(py1).saturating_sub(y0.max(py0));
+            let smaller = (y1 - y0).min(py1 - py0).max(1);
+            overlap * 2 >= smaller
+        });
+        if !merged {
+            if previous.is_some() {
+                row += 1;
+            }
+            previous = Some(index);
+        }
+        row_of[index] = row;
+    }
+    row_of
+}
+
+/// 每个框所在行的竖直范围（该行所有框的并集），并**在相邻行中心的中点处分界**，
+/// 保证行与行不重叠（任务栏行距很小，框本身会互相压住）。
+pub fn row_bands(bands: &[(u32, u32, u32, u32)], row_of: &[usize]) -> Vec<(u32, u32)> {
+    let rows = row_of.iter().copied().max().map(|max| max + 1).unwrap_or(0);
+    let mut raw = vec![(u32::MAX, 0u32); rows];
+    for (index, band) in bands.iter().enumerate() {
+        let row = row_of[index];
+        if row >= rows {
+            continue;
+        }
+        raw[row].0 = raw[row].0.min(band.1);
+        raw[row].1 = raw[row].1.max(band.3);
+    }
+    let centers: Vec<u32> = raw
+        .iter()
+        .map(|(top, bottom)| {
+            if *top == u32::MAX {
+                0
+            } else {
+                (top + bottom) / 2
+            }
+        })
+        .collect();
+    let mut out = Vec::with_capacity(rows);
+    for (row, (top, bottom)) in raw.into_iter().enumerate() {
+        if top == u32::MAX {
+            out.push((0, 1));
+            continue;
+        }
+        let top = if row == 0 {
+            top
+        } else {
+            ((centers[row - 1] + centers[row]) / 2).max(top)
+        };
+        let bottom = if row + 1 >= rows {
+            bottom
+        } else {
+            ((centers[row] + centers[row + 1]) / 2).min(bottom)
+        };
+        out.push((top, bottom.max(top + 1)));
+    }
+    out
+}
+
+/// 取文字用的统一二值化（建库、复核、预览全都用这一个）。
+///
+/// 关键点：**用「通道最大值」当亮度，而不是 luma**。
+/// 游戏任务栏是深色渐变背景 + 白字/红字混排：白字和红字的 max 通道都是 255，
+/// 背景只有 40~80，于是全局 Otsu 一刀就能分开；而 luma 会把红字（≈76）算成背景，
+/// 背景纹理反而被当成笔画（实测整块面板被切成"一行"）。
+pub fn binarize_text(image: &RgbImage) -> GrayImage {
+    let gray = to_gray_max(image);
+    let threshold = otsu(&gray);
+    let total = (gray.width() * gray.height()).max(1);
+    let mut bright = 0u32;
+    for pixel in gray.pixels() {
+        if pixel[0] > threshold {
+            bright += 1;
+        }
+    }
+    // 亮像素是少数 → 文字是亮的（深色背景）；否则文字是暗的（浅色背景）。
+    let ink_is_bright = bright * 2 <= total;
+    GrayImage::from_fn(gray.width(), gray.height(), |x, y| {
+        let value = gray.get_pixel(x, y)[0];
+        let ink = if ink_is_bright {
+            value > threshold
+        } else {
+            value <= threshold
+        };
+        Luma([if ink { 0 } else { 255 }])
+    })
+}
+
+#[cfg(test)]
+mod binarize_text_tests {
+    use super::fixture::render;
+    use super::*;
+
+    /// 黑字白底：笔画必须实心（不能只剩描边）。
+    #[test]
+    fn keeps_solid_strokes_on_white_background() {
+        let image = render("88", 6, 1);
+        let gray = binarize_text(&image);
+        // 数字「8」的竖笔画内部应当有墨迹。
+        let cells = analyze(&gray, MatchConfig::default());
+        assert_eq!(cells.len(), 2, "应当切出两个数字");
+        let cell = cell_of(&gray, &cells[0], DEFAULT_CELL_W, DEFAULT_CELL_H);
+        let ink = cell.iter().filter(|value| **value < 128).count();
+        assert!(ink > 40, "笔画不能被掏空：{ink} 个墨点");
+    }
+
+    /// 彩色背景上的亮字：全局 Otsu 会把背景纹理当笔画，这里只留文字。
+    #[test]
+    fn keeps_bright_text_on_textured_background() {
+        let mut image = RgbImage::from_pixel(160, 40, image::Rgb([24, 40, 24]));
+        // 假背景纹理：低频噪点
+        for y in 0..40 {
+            for x in 0..160 {
+                if (x / 3 + y / 3) % 2 == 0 {
+                    image.put_pixel(x, y, image::Rgb([40, 60, 40]));
+                }
+            }
+        }
+        // 亮黄「文字」块
+        for y in 12..26 {
+            for x in 20..40 {
+                image.put_pixel(x, y, image::Rgb([0xea, 0xff, 0x65]));
+            }
+        }
+        let gray = binarize_text(&image);
+        let mut ink = 0;
+        for y in 0..40 {
+            for x in 0..160 {
+                if gray.get_pixel(x, y)[0] < 128 {
+                    ink += 1;
+                }
+            }
+        }
+        // 文字块面积 14x20=280；背景纹理不应该被大面积算成墨迹。
+        assert!(ink >= 200 && ink <= 900, "墨迹数异常：{ink}");
+    }
+}
+
+/// 通道最大值灰度：彩色文字（红字/黄字）和亮字都会被算成「亮」。
+fn to_gray_max(image: &RgbImage) -> GrayImage {
+    GrayImage::from_fn(image.width(), image.height(), |x, y| {
+        let pixel = image.get_pixel(x, y);
+        Luma([pixel[0].max(pixel[1]).max(pixel[2])])
+    })
 }
