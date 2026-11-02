@@ -79,6 +79,7 @@ fn usage() {
   font-tool pick    [--window 梦幻西游] [--out <校验小图.png>] [--write-config]
   font-tool crop    --image <大图.png> --crop x,y,w,h --out <小图.png>
   font-tool info    --lib <字库.json>
+  font-tool sheet   --lib <字库.json> --out <对照图.png> [--scale 3]
   font-tool region  --region 左,上,右,下 [--size 1218x994] [--config <config.json>]
                     [--window 梦幻西游] [--dry-run]
   font-tool snap    --out <面板.png> [--desktop] [--window 梦幻西游] [--region 左,上,右,下]
@@ -106,6 +107,7 @@ capture：自动采集——截当前游戏窗口、OCR 拿标签、多帧聚类
          不给 --region/--preprocess 时，读 config.json 里的现有设置（含分辨率预设）。
          目标写库已存在时默认合并（累积补全数字），--fresh 从零重建。
 info   ：体检字库：字符覆盖 / 每个字的字模数 / 还缺哪些坐标字符。
+sheet  ：把字库渲染成对照图（一行一个标签），肉眼检查标签对不对。
 build  ：目录下每个 xxx.png（一行文字的截图）+ 同名 xxx.txt（这行的准确文字）。
 read   ：默认按行切分整块面板；--line 表示整张图就是一行。"
     );
@@ -122,6 +124,7 @@ fn main() {
         Some("crop") => crop_image(&args[1..]),
         Some("region") => region(&args[1..]),
         Some("info") => info(&args[1..]),
+        Some("sheet") => sheet(&args[1..]),
         Some("snap") => snap(&args[1..]),
         Some("capture") => capture_frames(&args[1..]),
         Some("build") => build(&args[1..]),
@@ -843,36 +846,15 @@ fn capture_frames(args: &[String]) -> Result<(), String> {
             let _ = panel.save(dir.join(format!("f{frame:02}-panel.png")));
         }
         let ocr = ocr::recognize_panel(&panel, plan.high_recall)?;
-        let mut used = 0usize;
-        for (index, region) in ocr.regions.iter().enumerate() {
-            let Some((x, y, width, height)) = coord_fix::padded_box(region, padding, &panel) else {
-                continue;
-            };
-            let Ok(crop) = font_lib::crop(&panel, x, y, width, height) else {
-                continue;
-            };
-            let gray = font_lib::binarize(&crop);
-            let cells = font_lib::analyze(&gray, MatchConfig::default());
-            let Some(labels) = labels_for(&region.text, cells.len(), learn_all) else {
-                skipped += 1;
-                continue;
-            };
-            if let Some(dir) = &dump {
-                let stem = dir.join(format!("f{frame:02}-{index:02}"));
-                let _ = crop.save(stem.with_extension("png"));
-                let _ = std::fs::write(stem.with_extension("txt"), &region.text);
-            }
-            for (b, label) in cells.iter().zip(labels) {
-                let Some(label) = label else {
-                    continue;
-                };
-                learner.observe(
-                    font_lib::cell_of(&gray, b, cell_w, cell_h),
-                    &label.to_string(),
-                );
-                used += 1;
-            }
-        }
+        let used = learn_panel(
+            &mut learner,
+            &panel,
+            &ocr,
+            learn_all,
+            &mut skipped,
+            padding,
+            dump.as_deref().map(|dir| (dir, frame)),
+        );
         let text = ocr.text.trim().replace('\n', " / ");
         println!(
             "第 {}/{} 帧：面板 {}x{}，采到 {} 个字模｜OCR {}",
@@ -939,6 +921,73 @@ fn report_coverage(lib: &GlyphLib) {
              重复运行会自动合并到同一份字库（从零重建加 --fresh）。"
         ),
     }
+}
+
+/// 把字库渲染成对照图：**一行一个标签**，同一标签的多个字模并排。
+/// 肉眼就能看出「标签对不对」——OCR 标错的样本在图上很明显。
+fn sheet(args: &[String]) -> Result<(), String> {
+    let flags = parse_flags(args);
+    let lib_path: PathBuf = required(&flags, "lib")?.into();
+    let out: PathBuf = required(&flags, "out")?.into();
+    let scale = number(&flags, "scale", 3u32)?.clamp(1, 8);
+    let lib = GlyphLib::load(&lib_path)?;
+    if lib.is_empty() {
+        return Err(format!("字库 {} 是空的", lib_path.display()));
+    }
+
+    // 分组：按标签排序，标签内部保持入库顺序。
+    let mut groups: Vec<(String, Vec<Vec<u8>>)> = Vec::new();
+    for glyph in &lib.glyphs {
+        match groups.iter_mut().find(|(label, _)| *label == glyph.label) {
+            Some((_, cells)) => cells.push(glyph.pixels.clone()),
+            None => groups.push((glyph.label.clone(), vec![glyph.pixels.clone()])),
+        }
+    }
+    groups.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let cell_w = lib.cell_w * scale;
+    let cell_h = lib.cell_h * scale;
+    let gap = 4u32;
+    let row_gap = 6u32;
+    let widest = groups
+        .iter()
+        .map(|(_, cells)| cells.len() as u32 * (cell_w + gap))
+        .max()
+        .unwrap_or(cell_w);
+    let height = groups.len() as u32 * (cell_h + gap + row_gap);
+    let mut sheet =
+        image::RgbImage::from_pixel(widest.max(1), height.max(1), image::Rgb([32, 32, 36]));
+
+    for (row, (_label, cells)) in groups.iter().enumerate() {
+        let y0 = row as u32 * (cell_h + gap + row_gap);
+        for (column, pixels) in cells.iter().enumerate() {
+            let x0 = column as u32 * (cell_w + gap);
+            for y in 0..lib.cell_h * scale {
+                for x in 0..lib.cell_w * scale {
+                    let sx = x / scale;
+                    let sy = y / scale;
+                    let value = pixels[(sy * lib.cell_w + sx) as usize];
+                    if let Some(pixel) = sheet.get_pixel_mut_checked(x0 + x, y0 + y) {
+                        *pixel = image::Rgb([value, value, value]);
+                    }
+                }
+            }
+        }
+    }
+    sheet
+        .save(&out)
+        .map_err(|err| format!("写入 {} 失败：{err}", out.display()))?;
+    println!(
+        "已写入 {}（{}x{}，{} 个标签）。每行一个标签，顺序如下：",
+        out.display(),
+        sheet.width(),
+        sheet.height(),
+        groups.len()
+    );
+    for (row, (label, cells)) in groups.iter().enumerate() {
+        println!("  第 {:>2} 行：{label} ×{}", row + 1, cells.len());
+    }
+    Ok(())
 }
 
 /// 体检已有字库：字符覆盖、每个字的字模数，以及缺哪些坐标字符。

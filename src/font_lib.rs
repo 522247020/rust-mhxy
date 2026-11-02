@@ -294,10 +294,19 @@ pub fn row_spans(gray: &GrayImage, gap_merge: u32) -> Vec<(u32, u32)> {
 
 /// 单行切字：竖直投影得到 x 跨度，再统一成整行的竖直区间。
 pub fn analyze(gray: &GrayImage, cfg: MatchConfig) -> Vec<GlyphBox> {
+    analyze_with_advance(gray, cfg, None)
+}
+
+/// 同 [`analyze`]，但可以给一个「每字宽度」的先验。
+///
+/// 中文是紧贴排版的，列投影会把相邻两个字并成一个跨度。建库时有 OCR 的文字，
+/// 字数是已知的，用它算出平均字宽，把过宽的跨度按这个宽度等分，字数就能对上。
+pub fn analyze_with_advance(
+    gray: &GrayImage,
+    cfg: MatchConfig,
+    advance: Option<f32>,
+) -> Vec<GlyphBox> {
     let (width, height) = (gray.width() as usize, gray.height() as usize);
-    if width == 0 || height == 0 {
-        return Vec::new();
-    }
     let ink: Vec<bool> = gray.pixels().map(|pixel| pixel[0] < 128).collect();
 
     // 1) 列投影 → 粗跨度。空隙超过 gap_merge 才断开，避免抗锯齿把同一个字撕成两半。
@@ -370,15 +379,35 @@ pub fn analyze(gray: &GrayImage, cfg: MatchConfig) -> Vec<GlyphBox> {
         .max()
         .unwrap_or(gray.height());
 
-    // 4) 统一使用行高区间：逗号/句点靠「在 cell 里的高低位置」区分，不能被拉到同一高度。
-    boxes
-        .into_iter()
-        .map(|b| GlyphBox {
-            span: b.span,
-            top: line_top,
-            bottom: line_bottom,
-        })
-        .collect()
+    // 4) 有字宽先验时，把「明显太宽」的跨度按先验等分：中文紧贴排版会把相邻的字并在一起。
+    let mut out: Vec<GlyphBox> = Vec::with_capacity(boxes.len());
+    for b in boxes {
+        let width = b.span.width() as f32;
+        let parts = match advance {
+            Some(advance) if advance > 2.0 && width > advance * 1.35 => {
+                ((width / advance).round() as u32).max(2)
+            }
+            _ => 1,
+        };
+        if parts <= 1 {
+            out.push(GlyphBox {
+                span: b.span,
+                top: line_top,
+                bottom: line_bottom,
+            });
+            continue;
+        }
+        for index in 0..parts {
+            let x0 = b.span.x0 + b.span.width() * index / parts;
+            let x1 = b.span.x0 + b.span.width() * (index + 1) / parts;
+            out.push(GlyphBox {
+                span: Span { x0, x1 },
+                top: line_top,
+                bottom: line_bottom,
+            });
+        }
+    }
+    out
 }
 
 /// 把一个字框裁出来缩放到固定 cell。
@@ -812,17 +841,21 @@ impl Learner {
 pub const COORDINATE_LABELS: [char; 12] =
     ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', ',', '.'];
 
-/// 字库里还没有的坐标字符（按 `COORDINATE_LABELS` 的顺序）。
+/// 坐标分隔符的等价写法：OCR 经常把逗号认成全角。
+pub const COORDINATE_SEPARATORS: [char; 6] = [',', '，', '、', '.', '．', '。'];
+
+/// 字库里还没有的坐标字符。
+///
+/// 分隔符按「等价类」算：库里只要有 `，` 就不算缺 `,`，
+/// 否则会把已经能用的字库报成残缺。
 pub fn missing_coordinate_labels(lib: &GlyphLib) -> Vec<char> {
-    COORDINATE_LABELS
-        .iter()
-        .copied()
-        .filter(|label| {
-            !lib.glyphs
-                .iter()
-                .any(|glyph| glyph.label == label.to_string())
-        })
-        .collect()
+    let single = |ch: char| lib.glyphs.iter().any(|glyph| glyph.label == ch.to_string());
+    let mut missing: Vec<char> = ('0'..='9').filter(|digit| !single(*digit)).collect();
+    if !COORDINATE_SEPARATORS.iter().any(|ch| single(*ch)) {
+        // 用 ASCII ',' 代表「缺分隔符」这个语义。
+        missing.push(',');
+    }
+    missing
 }
 
 // -------------------------------------------------------------------- 建库
@@ -1074,6 +1107,23 @@ mod tests {
     }
 
     #[test]
+    /// 中文紧贴排版时列投影会把相邻字并起来；用 OCR 的字数反推字宽就能按字数切开。
+    #[test]
+    fn advance_hint_splits_merged_glyphs() {
+        let gray = binarize(&render("79,26", 5, 0));
+        let plain = analyze(&gray, MatchConfig::default());
+        assert!(plain.len() < 5, "gap=0 应当被并得更少：{}", plain.len());
+
+        let advance = gray.width() as f32 / 5.0;
+        let hinted = analyze_with_advance(&gray, MatchConfig::default(), Some(advance));
+        assert_eq!(hinted.len(), 5, "按字宽先验应当恰好切成 5 个");
+
+        // 切开之后用同一套字库读回来，应该还是原文。
+        let lib = trained_lib();
+        let read = read_line_gray(&gray, &lib, MatchConfig::default());
+        assert_eq!(read.text, "79,26");
+    }
+
     fn splits_touching_glyphs() {
         let lib = trained_lib();
         // gap=0 让两个字粘在一起；靠「劈开后两半都明显更像单字」判定拆分。

@@ -210,7 +210,15 @@ fn spawn_job(plan: JobPlan, ctx: egui::Context) -> Receiver<JobMsg> {
                     return;
                 }
             };
-            let learned = learn_panel(&mut learner, &panel, &ocr, plan.learn_all, &mut skipped);
+            let learned = learn_panel(
+                &mut learner,
+                &panel,
+                &ocr,
+                plan.learn_all,
+                &mut skipped,
+                coord_fix::DEFAULT_PADDING,
+                None,
+            );
             if learned > 0 {
                 frames_used += 1;
             }
@@ -234,46 +242,6 @@ fn spawn_job(plan: JobPlan, ctx: egui::Context) -> Receiver<JobMsg> {
         ctx.request_repaint();
     });
     rx
-}
-
-/// 从一帧面板里学一批字模，返回学到的数量。
-///
-/// 固定帧数采集和后台积累共用这一段：OCR 定位 → 按框裁图 → 切字 →
-/// 把 OCR 文字当标签打上去 → 交给 Learner 聚类投票。
-fn learn_panel(
-    learner: &mut Learner,
-    panel: &image::RgbImage,
-    ocr: &ocr::OcrText,
-    learn_all: bool,
-    skipped: &mut usize,
-) -> usize {
-    let (cell_w, cell_h) = learner.cell();
-    let mut learned = 0usize;
-    for region in &ocr.regions {
-        let Some((x, y, width, height)) = coord_fix::padded_box(region, 2, panel) else {
-            continue;
-        };
-        let Ok(crop) = font_lib::crop(panel, x, y, width, height) else {
-            continue;
-        };
-        let gray = font_lib::binarize(&crop);
-        let cells = font_lib::analyze(&gray, MatchConfig::default());
-        let Some(labels) = labels_for(&region.text, cells.len(), learn_all) else {
-            *skipped += 1;
-            continue;
-        };
-        for (b, label) in cells.iter().zip(labels) {
-            let Some(label) = label else {
-                continue;
-            };
-            learner.observe(
-                font_lib::cell_of(&gray, b, cell_w, cell_h),
-                &label.to_string(),
-            );
-            learned += 1;
-        }
-    }
-    learned
 }
 
 /// 面板指纹：画面没变就不重复识别/学习（后台积累时游戏可能一直停在同一个界面）。
@@ -420,6 +388,8 @@ fn spawn_accumulate(
                 &ocr,
                 plan.learn_all,
                 &mut skipped_regions,
+                coord_fix::DEFAULT_PADDING,
+                None,
             );
             if learned > 0 {
                 frames_used += 1;
@@ -1667,7 +1637,15 @@ mod tests {
             LearnConfig::default(),
         );
         let mut skipped = 0usize;
-        let learned = learn_panel(&mut learner, &panel, &ocr, false, &mut skipped);
+        let learned = learn_panel(
+            &mut learner,
+            &panel,
+            &ocr,
+            false,
+            &mut skipped,
+            coord_fix::DEFAULT_PADDING,
+            None,
+        );
         assert_eq!(learned, 5, "应当学到 5 个字模");
         assert_eq!(skipped, 0);
         let labels: Vec<String> = learner.summary().into_iter().map(|s| s.label).collect();
@@ -1702,7 +1680,15 @@ mod tests {
         );
         let mut skipped = 0usize;
         assert_eq!(
-            learn_panel(&mut learner, &panel, &ocr, false, &mut skipped),
+            learn_panel(
+                &mut learner,
+                &panel,
+                &ocr,
+                false,
+                &mut skipped,
+                coord_fix::DEFAULT_PADDING,
+                None
+            ),
             0
         );
         assert_eq!(skipped, 1);

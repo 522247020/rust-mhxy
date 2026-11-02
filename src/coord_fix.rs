@@ -120,7 +120,12 @@ pub fn correct(
         let Ok(crop) = font_lib::crop(panel, x, y, width, height) else {
             continue;
         };
-        let read = font_lib::read_line_gray(&font_lib::binarize(&crop), lib, cfg);
+        let gray = font_lib::binarize(&crop);
+        // 跨行框：两行的字交错，读出来一定不是坐标。
+        if font_lib::row_spans(&gray, cfg.row_gap).len() != 1 {
+            continue;
+        }
+        let read = font_lib::read_line_gray(&gray, lib, cfg);
         if !read.confident {
             continue;
         }

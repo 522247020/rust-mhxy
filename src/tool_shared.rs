@@ -643,7 +643,7 @@ mod tests {
 
     #[test]
     fn labels_skip_chinese_unless_learning_everything() {
-        // 字数对得上但混着中文：默认只学数字和分隔符。
+        // 混着中文时只学数字那几位（前提：调用方已确认是单行且字数对得上）。
         let labels = labels_for("长寿村79,26", 8, false).expect("应当对齐");
         let kept: String = labels.into_iter().flatten().collect();
         assert_eq!(kept, "79,26");
@@ -657,4 +657,66 @@ mod tests {
         assert!(labels_for("79,26", 4, false).is_none());
         assert!(labels_for("没有数字也没有坐标", 3, false).is_none());
     }
+}
+
+/// 从一帧面板里学一批字模，返回学到的数量。
+///
+/// `font-tool capture` 和 `font-studio`（固定帧数 / 后台积累）共用这一段：
+/// OCR 定位 → 按框裁图 → 切字 → 用 OCR 文字当标签 → 交给 `Learner` 聚类投票。
+///
+/// 三道闸门挡住「把中文当数字学进去」：
+/// 1. 只收单行（跨行框会把两行的字按 x 交错，下标必错）；
+/// 2. 切字数量必须和文字字数一致（多一个少一个都对不上）；
+/// 3. 字数一致时也只学数字/分隔符那几位。
+pub fn learn_panel(
+    learner: &mut font_lib::Learner,
+    panel: &image::RgbImage,
+    ocr: &crate::ocr::OcrText,
+    learn_all: bool,
+    skipped: &mut usize,
+    padding: u32,
+    dump: Option<(&std::path::Path, u32)>,
+) -> usize {
+    let (cell_w, cell_h) = learner.cell();
+    let cfg = font_lib::MatchConfig::default();
+    let mut learned = 0usize;
+    for (index, region) in ocr.regions.iter().enumerate() {
+        let Some((x, y, width, height)) = coord_fix::padded_box(region, padding, panel) else {
+            continue;
+        };
+        let Ok(crop) = font_lib::crop(panel, x, y, width, height) else {
+            continue;
+        };
+        let gray = font_lib::binarize(&crop);
+        if font_lib::row_spans(&gray, cfg.row_gap).len() != 1 {
+            *skipped += 1;
+            continue;
+        }
+        // 用 OCR 给的字数反推字宽，中文紧贴排版时也能按字数切。
+        let text_chars = region.text.chars().filter(|ch| !ch.is_whitespace()).count();
+        let advance = (text_chars > 0)
+            .then(|| gray.width() as f32 / text_chars as f32)
+            .filter(|advance| *advance > 2.0);
+        let cells = font_lib::analyze_with_advance(&gray, cfg, advance);
+        if let Some((dir, frame)) = dump {
+            let stem = dir.join(format!("f{frame:02}-{index:02}"));
+            let _ = crop.save(stem.with_extension("png"));
+            let _ = std::fs::write(stem.with_extension("txt"), &region.text);
+        }
+        let Some(labels) = labels_for(&region.text, cells.len(), learn_all) else {
+            *skipped += 1;
+            continue;
+        };
+        for (b, label) in cells.iter().zip(labels) {
+            let Some(label) = label else {
+                continue;
+            };
+            learner.observe(
+                font_lib::cell_of(&gray, b, cell_w, cell_h),
+                &label.to_string(),
+            );
+            learned += 1;
+        }
+    }
+    learned
 }
