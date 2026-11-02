@@ -710,15 +710,16 @@ pub fn learn_panel(
                 }
             }
         }
-        let Some(blocks) = blocks else {
-            *skipped += 1;
-            continue;
-        };
+        // 先存一份裁剪 + 文字：学不到的段也要能拿出来看（dump 是排查用的）。
         if let Some((dir, frame)) = dump {
             let stem = dir.join(format!("f{frame:02}-{index:02}"));
             let _ = crop.save(stem.with_extension("png"));
             let _ = std::fs::write(stem.with_extension("txt"), &region.text);
         }
+        let Some(blocks) = blocks else {
+            *skipped += 1;
+            continue;
+        };
         for (b, block) in boxes.iter().zip(blocks) {
             for (sub, ch) in split_span_by_block(b, &block).iter().zip(block.iter()) {
                 if !learn_all && !is_digitish(*ch) {
