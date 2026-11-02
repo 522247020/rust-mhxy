@@ -93,6 +93,8 @@ enum JobMsg {
         ocr: String,
         /// 检测框（点选建库要按行切字）。
         regions: Vec<ocr::OcrRegion>,
+        /// 这一帧用的放大倍数：界面若改了倍数，检测框要按比例换算。
+        upscale: u32,
         panel: image::RgbImage,
     },
     Done {
@@ -112,6 +114,7 @@ enum JobMsg {
         learned: usize,
         ocr: String,
         regions: Vec<ocr::OcrRegion>,
+        upscale: u32,
         panel: Option<image::RgbImage>,
         lib: GlyphLib,
         summary: Vec<font_lib::LabelSummary>,
@@ -230,6 +233,7 @@ fn spawn_job(plan: JobPlan, ctx: egui::Context) -> Receiver<JobMsg> {
                 learned,
                 ocr: ocr.text.trim().replace('\n', " / "),
                 regions: ocr.regions.clone(),
+                upscale: plan.upscale,
                 panel,
             });
             ctx.request_repaint();
@@ -320,6 +324,7 @@ fn spawn_accumulate(
                         learned: 0,
                         ocr: String::new(),
                         regions: Vec::new(),
+                        upscale: plan.upscale,
                         panel: None,
                         lib: learner.finish(),
                         summary: learner.summary(),
@@ -349,6 +354,7 @@ fn spawn_accumulate(
                     learned: 0,
                     ocr: String::new(),
                     regions: Vec::new(),
+                    upscale: plan.upscale,
                     panel: None,
                     lib: learner.finish(),
                     summary: learner.summary(),
@@ -372,6 +378,7 @@ fn spawn_accumulate(
                         learned: 0,
                         ocr: String::new(),
                         regions: Vec::new(),
+                        upscale: plan.upscale,
                         panel: Some(panel),
                         lib: learner.finish(),
                         summary: learner.summary(),
@@ -407,6 +414,7 @@ fn spawn_accumulate(
                 learned,
                 ocr: ocr.text.trim().replace('\n', " / "),
                 regions: ocr.regions.clone(),
+                upscale: plan.upscale,
                 panel: Some(panel),
                 lib,
                 summary: learner.summary(),
@@ -561,6 +569,8 @@ struct Studio {
     show_binary: bool,
     /// 预览图的鼠标行为：点字形加样本，还是点图取色。
     preview_mode: PreviewMode,
+    /// 拍预览时游戏客户区的尺寸：窗口被缩放时框会整体错位，要重拍。
+    preview_client_size: Option<(u32, u32)>,
     /// 当前选中的格子（点选建库用）。
     pending_cell: Option<font_lib::GlyphBox>,
     /// 给选中字形打标签的输入框。
@@ -609,6 +619,7 @@ impl Studio {
             glyph_textures: Vec::new(),
             only_coordinate: true,
             show_binary: false,
+            preview_client_size: None,
             preview_mode: PreviewMode::Label,
             pending_cell: None,
             label_input: String::new(),
@@ -759,6 +770,7 @@ impl Studio {
             Ok(ocr) => {
                 let text = ocr.text.trim().replace('\n', " / ");
                 let rows = ocr.regions.len();
+                self.preview_client_size = capture::client_size(window.handle);
                 self.set_preview(ctx, raw, text.clone(), ocr.regions, self.upscale);
                 self.log(format!(
                     "预览：识别到 {rows} 行｜OCR {}",
@@ -868,6 +880,7 @@ impl Studio {
                     learned,
                     ocr,
                     regions,
+                    upscale,
                     panel,
                 } => {
                     if let Some(job) = &mut self.job {
@@ -877,7 +890,7 @@ impl Studio {
                         "第 {index}/{total} 帧：采到 {learned} 个字模｜OCR {}",
                         if ocr.is_empty() { "无文字" } else { &ocr }
                     ));
-                    self.set_preview(ctx, panel, ocr, regions, self.upscale);
+                    self.set_preview(ctx, panel, ocr, regions, upscale);
                 }
                 JobMsg::Done {
                     lib,
@@ -996,6 +1009,7 @@ impl Studio {
                 JobMsg::Progress {
                     attempts,
                     regions,
+                    upscale,
                     frames_used,
                     samples,
                     learned,
@@ -1041,7 +1055,7 @@ impl Studio {
                         ));
                     }
                     if let Some(panel) = panel {
-                        self.set_preview(ctx, panel, ocr, regions, self.upscale);
+                        self.set_preview(ctx, panel, ocr, regions, upscale);
                     }
                 }
                 JobMsg::AccStopped {
@@ -1154,6 +1168,7 @@ impl eframe::App for Studio {
         let ctx = ui.ctx().clone();
         self.poll_job(&ctx);
         self.poll_acc(&ctx);
+        self.watch_client_size(&ctx);
         // 采集中要持续刷新进度。
         if self.busy() {
             ctx.request_repaint_after(Duration::from_millis(200));
@@ -2322,8 +2337,8 @@ struct PreviewRow {
 }
 
 impl Preview {
-    /// 按「行」重建切字：行框来自 OCR 检测框，行内用「2 个数字 = 1 个汉字宽」
-    /// 的规律等比例切开。坐标 1~3 位会让每行宽度不同，这里每行各算各的。
+    /// 按「行」重建切字：行框来自 OCR 检测框（先裁到墨迹），行内用
+    /// 「2 个数字 = 1 个汉字宽」的规律等比例切开。
     fn rebuild_rows(&mut self, upscale: u32) {
         self.rows.clear();
         if self.ocr_regions.is_empty() || self.gray.width() < 2 {
@@ -2338,9 +2353,10 @@ impl Preview {
                 ((region.right * ratio).round() as u32).min(self.gray.width()),
                 ((region.bottom * ratio).round() as u32).min(self.gray.height()),
             );
-            if band.2 <= band.0 || band.3 <= band.1 {
+            // OCR 框常比文字宽一圈：先裁到墨迹，框才贴着字。
+            let Some(band) = font_lib::trim_to_ink(&self.gray, band) else {
                 continue;
-            }
+            };
             let cells = font_lib::split_row_by_text(&self.gray, band, &region.text);
             self.rows.push(PreviewRow {
                 band: font_lib::GlyphBox {
@@ -2354,6 +2370,33 @@ impl Preview {
                 text: region.text.clone(),
                 cells,
             });
+        }
+    }
+}
+
+impl Studio {
+    /// 游戏窗口被缩放/拖大小时，预览里缓存的框会整体错位 —— 直接重拍一次。
+    ///
+    /// 识别区域存的是百分比，窗口大小一变，同一块百分比就落到别的像素上；
+    /// 而预览图和检测框还是旧尺寸的，看起来就"完全错位"。
+    fn watch_client_size(&mut self, ctx: &egui::Context) {
+        if self.preview.is_none() || self.picker.is_some() {
+            return;
+        }
+        let Some(window) = self.current_window() else {
+            return;
+        };
+        let size = capture::client_size(window.handle);
+        if size.is_none() || size == self.preview_client_size {
+            return;
+        }
+        self.log(format!(
+            "游戏窗口尺寸变了（{:?} -> {:?}）：重新截图预览",
+            self.preview_client_size, size
+        ));
+        self.preview_client_size = size;
+        if !self.busy() {
+            self.refresh_preview(ctx);
         }
     }
 }

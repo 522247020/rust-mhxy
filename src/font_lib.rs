@@ -2023,3 +2023,51 @@ mod row_split_tests {
         assert!(widths[4] <= widths[0], "{widths:?}");
     }
 }
+
+/// 把矩形裁到里面「真正有墨迹」的范围。
+///
+/// OCR 的检测框常常比文字宽一圈（尤其放大倍数高、字小的时候），
+/// 直接按它画框/平分会出现「框比字宽得多」。这里按墨迹收一遍。
+pub fn trim_to_ink(gray: &GrayImage, band: (u32, u32, u32, u32)) -> Option<(u32, u32, u32, u32)> {
+    let (x0, y0, x1, y1) = (
+        band.0.min(gray.width()),
+        band.1.min(gray.height()),
+        band.2.min(gray.width()),
+        band.3.min(gray.height()),
+    );
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    let (mut left, mut top, mut right, mut bottom) = (u32::MAX, u32::MAX, 0u32, 0u32);
+    for y in y0..y1 {
+        for x in x0..x1 {
+            if gray.get_pixel(x, y)[0] < 128 {
+                left = left.min(x);
+                top = top.min(y);
+                right = right.max(x + 1);
+                bottom = bottom.max(y + 1);
+            }
+        }
+    }
+    (right > left && bottom > top).then_some((left, top, right, bottom))
+}
+
+#[cfg(test)]
+mod trim_tests {
+    use super::*;
+
+    #[test]
+    fn trims_band_to_ink() {
+        let mut gray = GrayImage::from_pixel(100, 40, Luma([255]));
+        for y in 10..20 {
+            for x in 30..50 {
+                gray.put_pixel(x, y, Luma([0]));
+            }
+        }
+        let trimmed = trim_to_ink(&gray, (0, 0, 100, 40)).expect("应当有墨迹");
+        assert_eq!(trimmed, (30, 10, 50, 20));
+
+        // 空框返回 None。
+        assert!(trim_to_ink(&gray, (60, 0, 100, 40)).is_none());
+    }
+}
