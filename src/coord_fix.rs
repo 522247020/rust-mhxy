@@ -125,31 +125,45 @@ pub fn correct(
         if font_lib::row_spans(&gray, cfg.row_gap).len() != 1 {
             continue;
         }
-        let read = font_lib::read_line_gray(&gray, lib, cfg);
-        if !read.confident {
+        // 读法一：整块就是一个坐标（OCR 把坐标单独检出来时最准）。
+        // 读法二：整行混着中文时，只认**窄的字形**（数字约中文一半宽），
+        //         挑出连着的数字串——这就是任务栏最常见的形态。
+        let read = {
+            let whole = font_lib::read_line_gray(&gray, lib, cfg);
+            let whole_chars = whole.text.chars().count();
+            if whole.confident
+                && coordinate_shape(&whole.text) == Some(0..whole_chars)
+                && whole_chars == local.len()
+            {
+                Some(whole.text)
+            } else {
+                font_lib::read_narrow_runs(&gray, lib, cfg)
+                    .into_iter()
+                    .map(|run| run.iter().map(|m| m.label.as_str()).collect::<String>())
+                    .find(|text| {
+                        let chars = text.chars().count();
+                        coordinate_shape(text) == Some(0..chars)
+                    })
+            }
+        };
+        let Some(read) = read else {
             continue;
-        }
-        // 整块必须就是一个坐标：中文混排、多段数字之类一律不动。
-        // 字数也要对得上（OCR 把一位数字认成字母时字数不变）。
-        let read_chars = read.text.chars().count();
-        if coordinate_shape(&read.text) != Some(0..read_chars) || local.len() != read_chars {
-            continue;
-        }
+        };
         let before: String = region
             .text
             .chars()
             .skip(local.start)
             .take(local.len())
             .collect();
-        if before == read.text {
+        if before == read {
             continue;
         }
         let start = region.range.start + local.start;
         let end = region.range.start + local.end;
-        edits.push((start..end, read.text.clone()));
+        edits.push((start..end, read.clone()));
         fixes.push(Fix {
             before,
-            after: read.text,
+            after: read,
         });
     }
     (apply_edits(text, edits), fixes)

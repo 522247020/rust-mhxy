@@ -1563,18 +1563,11 @@ pub fn analyze_components(gray: &GrayImage, cfg: MatchConfig) -> Vec<GlyphBox> {
         return Vec::new();
     }
 
-    // 2) 丢掉噪点（太小、太矮的块）。
-    let max_height = boxes
-        .iter()
-        .map(|(_, y0, _, y1)| y1 - y0)
-        .max()
-        .unwrap_or(1) as f32;
+    // 2) 只按面积丢噪点：不能用「高度占比」过滤，否则旁边的中文会把
+    //    逗号、句点这类矮字当成噪点删掉。
     let mut parts: Vec<(u32, u32, u32, u32)> = boxes
         .into_iter()
-        .filter(|(x0, y0, x1, y1)| {
-            let (w, h) = (x1 - x0, y1 - y0);
-            w * h >= 3 && (h as f32) >= max_height * 0.15
-        })
+        .filter(|(x0, y0, x1, y1)| (x1 - x0) * (y1 - y0) >= 4)
         .collect();
     if parts.is_empty() {
         return Vec::new();
@@ -1595,19 +1588,14 @@ pub fn analyze_components(gray: &GrayImage, cfg: MatchConfig) -> Vec<GlyphBox> {
         }
     }
 
-    // 4) 行高取所有组的外包络，保证逗号/句点的垂直位置可区分。
-    let line_top = groups.iter().map(|group| group.1).min().unwrap_or(0);
-    let line_bottom = groups
-        .iter()
-        .map(|group| group.3)
-        .max()
-        .unwrap_or(height as u32);
+    // 4) 每个组用**自己的**竖直范围：否则旁边中文的高度会把数字的归一化拉伸，
+    //    学出来和用起来就不一致（实测分数会掉到 0.5）。
     groups
         .into_iter()
-        .map(|(x0, _, x1, _)| GlyphBox {
+        .map(|(x0, y0, x1, y1)| GlyphBox {
             span: Span { x0, x1 },
-            top: line_top,
-            bottom: line_bottom,
+            top: y0,
+            bottom: y1,
         })
         .collect()
 }
@@ -1644,5 +1632,197 @@ mod component_tests {
         let cfg = MatchConfig::default();
         let groups = analyze_components(&gray, cfg);
         assert_eq!(groups.len(), 2, "{groups:?}");
+    }
+}
+
+// ------------------------------------------------- 只认窄字形（中文行里的数字）
+
+/// 一行字里，「窄」的组。
+///
+/// 中文/全角标点近似方框（宽 ≈ 行高），数字只有一半宽。判据：
+/// - 行里**有宽字**（最宽的组接近行高）时，取宽度 ≤ 最宽 72% 的组；
+/// - 行里**没有宽字**（整行都是数字，比如 `119,60` 单独一行）时，全部保留。
+///
+/// 这样既不用猜「文字第 N 个字对应第几个格子」，也不用要求整框就是坐标。
+pub fn narrow_groups(boxes: &[GlyphBox]) -> Vec<usize> {
+    if boxes.is_empty() {
+        return Vec::new();
+    }
+    let line_height = boxes[0].bottom.saturating_sub(boxes[0].top).max(1) as f32;
+    let widest = boxes
+        .iter()
+        .map(|b| b.span.width())
+        .max()
+        .unwrap_or(1)
+        .max(1) as f32;
+    // 最宽的组都不到行高的 0.78：这行没有中文，整行都是窄组。
+    let limit = if widest <= line_height * 0.78 {
+        widest + 1.0
+    } else {
+        widest * 0.72
+    };
+    boxes
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| (b.span.width() as f32) <= limit)
+        .map(|(index, _)| index)
+        .collect()
+}
+/// 单组的分类结果：标签、分数、与次优标签的差值。
+pub fn classify_group(
+    gray: &GrayImage,
+    b: &GlyphBox,
+    lib: &GlyphLib,
+    cfg: MatchConfig,
+) -> Option<(String, f32, f32)> {
+    if lib.is_empty() {
+        return None;
+    }
+    best_match(gray, b, lib, cfg)
+}
+
+/// 把「窄组」按水平间距切成若干段。
+///
+/// 判据用**相邻组的起点间距**：同一段数字的间距约等于字距（advance），
+/// 而「（第2个）」和「1，55」之间的空档远大于它。不切段的话多个数字串会被
+/// 拼成 `21,55` 这种垃圾。
+pub fn group_runs(boxes: &[GlyphBox], indices: &[usize]) -> Vec<Vec<usize>> {
+    if indices.is_empty() {
+        return Vec::new();
+    }
+    // 相邻窄组的起点间距，取中位数当「正常字距」。
+    let mut steps: Vec<u32> = indices
+        .windows(2)
+        .map(|pair| {
+            boxes[pair[1]]
+                .span
+                .x0
+                .saturating_sub(boxes[pair[0]].span.x0)
+        })
+        .filter(|step| *step > 0)
+        .collect();
+    if steps.is_empty() {
+        return vec![indices.to_vec()];
+    }
+    steps.sort_unstable();
+    let advance = steps[steps.len() / 2].max(4) as f32;
+    let max_step = (advance * 2.0).max(6.0);
+    let mut runs: Vec<Vec<usize>> = Vec::new();
+    let mut previous_x0: Option<u32> = None;
+    for index in indices {
+        let x0 = boxes[*index].span.x0;
+        let new_run = match previous_x0 {
+            Some(previous) => x0.saturating_sub(previous) as f32 > max_step,
+            None => true,
+        };
+        if new_run {
+            runs.push(Vec::new());
+        }
+        runs.last_mut().expect("run exists").push(*index);
+        previous_x0 = Some(x0);
+    }
+    runs
+}
+/// 在单行裁剪图里「找数字」：只分类**窄的字形组**，宽字（中文）直接跳过。
+///
+/// 返回若干「连着的数字串」（每个串是若干 `GlyphMatch`）。中文认不对、
+/// 甚至完全没学中文都不影响——这正是它在混排任务文字里能用的原因。
+pub fn read_narrow_runs(
+    gray: &GrayImage,
+    lib: &GlyphLib,
+    cfg: MatchConfig,
+) -> Vec<Vec<GlyphMatch>> {
+    let boxes = analyze_components(gray, cfg);
+    let indices = narrow_groups(&boxes);
+    if indices.is_empty() {
+        return Vec::new();
+    }
+    let mut runs: Vec<Vec<GlyphMatch>> = Vec::new();
+    for run in group_runs(&boxes, &indices) {
+        let mut matches: Vec<GlyphMatch> = Vec::with_capacity(run.len());
+        let mut usable = true;
+        for index in run {
+            let b = boxes[index];
+            let Some((label, score, margin)) = classify_group(gray, &b, lib, cfg) else {
+                usable = false;
+                break;
+            };
+            if score < cfg.min_score || margin < cfg.min_margin || label.chars().count() != 1 {
+                usable = false;
+                break;
+            }
+            matches.push(GlyphMatch {
+                label,
+                score,
+                margin,
+                x: b.span.x0,
+                width: b.span.width(),
+            });
+        }
+        if usable && matches.len() >= 2 {
+            runs.push(matches);
+        }
+    }
+    runs
+}
+
+#[cfg(test)]
+mod narrow_logic_tests {
+    use super::*;
+
+    fn boxed(x0: u32, width: u32, top: u32, bottom: u32) -> GlyphBox {
+        GlyphBox {
+            span: Span { x0, x1: x0 + width },
+            top,
+            bottom,
+        }
+    }
+
+    /// 有中文（40 宽）时，只挑 20 宽的数字。
+    #[test]
+    fn narrow_groups_skips_wide_glyphs() {
+        let boxes = vec![
+            boxed(0, 40, 0, 48),
+            boxed(44, 40, 0, 48),
+            boxed(88, 20, 10, 38),
+            boxed(112, 20, 10, 38),
+            boxed(136, 40, 0, 48),
+        ];
+        assert_eq!(narrow_groups(&boxes), vec![2, 3]);
+    }
+
+    /// 整行都是数字（没有 40 宽的字）时不能把窄的「1」筛掉。
+    #[test]
+    fn narrow_groups_keeps_all_without_wide_glyph() {
+        let boxes = vec![
+            boxed(0, 12, 10, 38),
+            boxed(24, 20, 10, 38),
+            boxed(48, 20, 10, 38),
+        ];
+        assert_eq!(narrow_groups(&boxes), vec![0, 1, 2]);
+    }
+
+    /// 远处另起一段数字：要切开，不能拼成 `21,55`。
+    #[test]
+    fn group_runs_splits_on_big_gap() {
+        let boxes: Vec<GlyphBox> = [0u32, 24, 48, 72]
+            .iter()
+            .map(|x| boxed(*x, 20, 10, 38))
+            .chain(std::iter::once(boxed(400, 20, 10, 38)))
+            .chain(std::iter::once(boxed(424, 20, 10, 38)))
+            .collect();
+        let indices: Vec<usize> = (0..boxes.len()).collect();
+        let runs = group_runs(&boxes, &indices);
+        assert_eq!(runs.len(), 2, "{runs:?}");
+        assert_eq!(runs[0].len(), 4);
+        assert_eq!(runs[1].len(), 2);
+    }
+
+    /// 紧挨着的一串数字（正常字距）必须保持一段。
+    #[test]
+    fn group_runs_keeps_tight_digits_together() {
+        let boxes: Vec<GlyphBox> = (0..6).map(|i| boxed(i * 24, 18, 10, 38)).collect();
+        let indices: Vec<usize> = (0..boxes.len()).collect();
+        assert_eq!(group_runs(&boxes, &indices).len(), 1);
     }
 }

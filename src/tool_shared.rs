@@ -694,7 +694,7 @@ pub fn learn_panel(
             *skipped += 1;
             continue;
         }
-        // 先按列投影切；对不上（中文把字切开、背景粘连）再换连通域切一次。
+        // ① 列投影 / 字宽 DP 对齐（纯数字行最准）
         let widths_of = |boxes: &[font_lib::GlyphBox]| -> Vec<u32> {
             boxes.iter().map(|b| b.span.width()).collect()
         };
@@ -710,12 +710,55 @@ pub fn learn_panel(
                 }
             }
         }
-        // 先存一份裁剪 + 文字：学不到的段也要能拿出来看（dump 是排查用的）。
+        // ② 混排中文时对齐基本不可能，改用「窄字形」策略：
+        //    一行里数字大约只有中文一半宽，挑出窄组并按间距分段，
+        //    段长正好等于坐标长度就打标签 —— 中文认得对不对完全不影响。
+        let mut narrow_labels: Option<Vec<(font_lib::GlyphBox, char)>> = None;
+        if blocks.is_none() {
+            if let Some(shape) = coord_fix::coordinate_shape(&region.text) {
+                let coord: Vec<char> = region
+                    .text
+                    .chars()
+                    .skip(shape.start)
+                    .take(shape.len())
+                    .collect();
+                let groups = font_lib::analyze_components(&gray, cfg);
+                let indices = font_lib::narrow_groups(&groups);
+                let runs: Vec<Vec<usize>> = font_lib::group_runs(&groups, &indices)
+                    .into_iter()
+                    .filter(|run| run.len() == coord.len())
+                    .collect();
+                // 只有唯一一段长度对得上才用：多段都对上说明分不清是哪一段。
+                if runs.len() == 1 {
+                    narrow_labels = Some(
+                        runs[0]
+                            .iter()
+                            .zip(coord)
+                            .map(|(index, ch)| (groups[*index], ch))
+                            .collect(),
+                    );
+                }
+            }
+        }
+
         if let Some((dir, frame)) = dump {
             let stem = dir.join(format!("f{frame:02}-{index:02}"));
             let _ = crop.save(stem.with_extension("png"));
             let _ = std::fs::write(stem.with_extension("txt"), &region.text);
         }
+
+        if let Some(labels) = narrow_labels {
+            for (b, ch) in labels {
+                if !learn_all && !is_digitish(ch) {
+                    continue;
+                }
+                let cell = font_lib::cell_of(&gray, &b, cell_w, cell_h);
+                learner.observe(cell, &ch.to_string());
+                learned += 1;
+            }
+            continue;
+        }
+
         let Some(blocks) = blocks else {
             *skipped += 1;
             continue;
@@ -733,7 +776,6 @@ pub fn learn_panel(
     }
     learned
 }
-///
 /// 一个跨度里可能并了好几个字（中文紧贴、`119,60` 这种连续数字），
 /// 这里按块内字宽比例把跨度再切开，保证「一个框 ↔ 一个字」。
 fn split_span_by_block(b: &font_lib::GlyphBox, block: &[char]) -> Vec<font_lib::GlyphBox> {

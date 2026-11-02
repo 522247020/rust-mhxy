@@ -437,6 +437,8 @@ struct Preview {
     cells: Vec<Vec<u8>>,
     /// 字模贴图，重算时一起建好（每帧重建会卡）。
     cell_textures: Vec<egui::TextureHandle>,
+    /// 用字库「只认窄字形」读出来的数字串（空=这个面板读不出坐标）。
+    narrow_runs: Vec<String>,
     ocr: String,
 }
 
@@ -453,6 +455,7 @@ impl Preview {
             binary_texture: texture_of(ctx, "preview-binary", &image),
             cells: Vec::new(),
             cell_textures: Vec::new(),
+            narrow_runs: Vec::new(),
             image,
             ocr,
         };
@@ -1457,6 +1460,26 @@ impl Studio {
             if !preview.ocr.is_empty() {
                 ui.label(format!("OCR：{}", preview.ocr));
             }
+            if !preview.narrow_runs.is_empty() {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "字库只认窄字形读出：{}",
+                        preview
+                            .narrow_runs
+                            .iter()
+                            .map(|run| format!("「{run}」"))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    ))
+                    .color(OK_GREEN),
+                );
+            } else if !self.lib.is_empty() {
+                ui.label(
+                    egui::RichText::new("字库在这个面板上没读出数字串（先调好预处理再看）")
+                        .small()
+                        .color(WARN),
+                );
+            }
             if !preview.cells.is_empty() {
                 ui.label(
                     egui::RichText::new(format!(
@@ -1902,6 +1925,7 @@ impl Studio {
         let mut preview = Preview::new(ctx, raw, ocr);
         preview.reprocess(ctx, pipeline, color, tolerance, upscale);
         self.preview = Some(preview);
+        self.refresh_narrow_runs(ctx);
     }
 
     /// 预处理参数变了：拿同一张原图重算，不用回游戏重截。
@@ -1911,6 +1935,7 @@ impl Studio {
         if let Some(preview) = &mut self.preview {
             preview.reprocess(ctx, pipeline, color, tolerance, upscale);
         }
+        self.refresh_narrow_runs(ctx);
     }
 }
 
@@ -2019,5 +2044,34 @@ mod pick_tests {
     fn pick_returns_none_when_everything_is_out_of_bounds() {
         let image = image::RgbImage::from_pixel(4, 4, image::Rgb([0, 0, 0]));
         assert!(pick_stroke_color(&image, -10, -10, 2).is_none());
+    }
+}
+
+impl Studio {
+    /// 用当前字库在预览图上「只认窄字形」读一遍，让用户立刻看到能不能用。
+    fn refresh_narrow_runs(&mut self, ctx: &egui::Context) {
+        if self.lib.is_empty() {
+            return;
+        }
+        let Some(preview) = &self.preview else {
+            return;
+        };
+        let panel = process_panel(
+            &preview.image,
+            self.pipeline(),
+            self.color,
+            self.tolerance,
+            self.upscale,
+        );
+        let gray = font_lib::binarize(&panel);
+        let runs: Vec<String> =
+            font_lib::read_narrow_runs(&gray, &self.lib, MatchConfig::default())
+                .into_iter()
+                .map(|run| run.iter().map(|m| m.label.as_str()).collect::<String>())
+                .collect();
+        if let Some(preview) = &mut self.preview {
+            preview.narrow_runs = runs;
+        }
+        let _ = ctx;
     }
 }
