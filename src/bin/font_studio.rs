@@ -91,6 +91,8 @@ enum JobMsg {
         total: u32,
         learned: usize,
         ocr: String,
+        /// 检测框（点选建库要按行切字）。
+        regions: Vec<ocr::OcrRegion>,
         panel: image::RgbImage,
     },
     Done {
@@ -109,6 +111,7 @@ enum JobMsg {
         samples: usize,
         learned: usize,
         ocr: String,
+        regions: Vec<ocr::OcrRegion>,
         panel: Option<image::RgbImage>,
         lib: GlyphLib,
         summary: Vec<font_lib::LabelSummary>,
@@ -226,6 +229,7 @@ fn spawn_job(plan: JobPlan, ctx: egui::Context) -> Receiver<JobMsg> {
                 total: plan.frames,
                 learned,
                 ocr: ocr.text.trim().replace('\n', " / "),
+                regions: ocr.regions.clone(),
                 panel,
             });
             ctx.request_repaint();
@@ -315,6 +319,7 @@ fn spawn_accumulate(
                         samples: learner.sample_count(),
                         learned: 0,
                         ocr: String::new(),
+                        regions: Vec::new(),
                         panel: None,
                         lib: learner.finish(),
                         summary: learner.summary(),
@@ -343,6 +348,7 @@ fn spawn_accumulate(
                     samples: learner.sample_count(),
                     learned: 0,
                     ocr: String::new(),
+                    regions: Vec::new(),
                     panel: None,
                     lib: learner.finish(),
                     summary: learner.summary(),
@@ -365,6 +371,7 @@ fn spawn_accumulate(
                         samples: learner.sample_count(),
                         learned: 0,
                         ocr: String::new(),
+                        regions: Vec::new(),
                         panel: Some(panel),
                         lib: learner.finish(),
                         summary: learner.summary(),
@@ -399,6 +406,7 @@ fn spawn_accumulate(
                 samples: learner.sample_count(),
                 learned,
                 ocr: ocr.text.trim().replace('\n', " / "),
+                regions: ocr.regions.clone(),
                 panel: Some(panel),
                 lib,
                 summary: learner.summary(),
@@ -442,8 +450,11 @@ struct Preview {
     /// 预处理后的面板和二值图：点选建库要按坐标取图。
     panel: image::RgbImage,
     gray: image::GrayImage,
-    /// 切出来的字形框（预览上画出来，点一下就能选）。
-    boxes: Vec<font_lib::GlyphBox>,
+    /// 切出来的行（预览上按行画框，行内再画每个字的格子）。
+    rows: Vec<PreviewRow>,
+    /// OCR 检测框，用来确定每行范围；换放大倍数时按比例换算。
+    ocr_regions: Vec<crate::ocr::OcrRegion>,
+    ocr_upscale: u32,
     ocr: String,
 }
 
@@ -463,7 +474,9 @@ impl Preview {
             narrow_runs: Vec::new(),
             panel: image::RgbImage::new(1, 1),
             gray: image::GrayImage::new(1, 1),
-            boxes: Vec::new(),
+            rows: Vec::new(),
+            ocr_regions: Vec::new(),
+            ocr_upscale: 1,
             image,
             ocr,
         };
@@ -486,9 +499,9 @@ impl Preview {
         let gray = font_lib::binarize(&panel);
         self.binary_texture = texture_of_gray(ctx, "preview-binary", &gray);
         self.cells = cells_of(&gray);
-        self.boxes = font_lib::analyze_components(&gray, font_lib::MatchConfig::default());
         self.panel = panel;
         self.gray = gray;
+        self.rebuild_rows(upscale);
         self.cell_textures = self
             .cells
             .iter()
@@ -548,8 +561,8 @@ struct Studio {
     show_binary: bool,
     /// 预览图的鼠标行为：点字形加样本，还是点图取色。
     preview_mode: PreviewMode,
-    /// 当前选中的字形框（点选建库用）。
-    pending_box: Option<usize>,
+    /// 当前选中的格子（点选建库用）。
+    pending_cell: Option<font_lib::GlyphBox>,
     /// 给选中字形打标签的输入框。
     label_input: String,
     /// 下一次绘制时把焦点给标签输入框。
@@ -597,7 +610,7 @@ impl Studio {
             only_coordinate: true,
             show_binary: false,
             preview_mode: PreviewMode::Label,
-            pending_box: None,
+            pending_cell: None,
             label_input: String::new(),
             focus_label: false,
             lib_dirty: false,
@@ -727,19 +740,39 @@ impl Studio {
             let full = capture::capture_client(window.handle, self.region)?;
             Ok(capture::crop_task_region(&full, self.region))
         })();
-        match raw {
-            Ok(raw) => {
-                self.set_preview(ctx, raw, String::new());
-                if let Some(preview) = &self.preview {
-                    self.log(format!(
-                        "预览：{}x{}，切出 {} 个字模（每个格子应该正好一个字）",
-                        preview.size.x as u32,
-                        preview.size.y as u32,
-                        preview.cells.len()
-                    ));
-                }
+        let raw = match raw {
+            Ok(raw) => raw,
+            Err(err) => {
+                self.log(err);
+                return;
             }
-            Err(err) => self.log(err),
+        };
+        // 预览也跑一次 OCR：拿到检测框才能在图上按行画框、按行切字。
+        let panel = process_panel(
+            &raw,
+            self.pipeline(),
+            self.color,
+            self.tolerance,
+            self.upscale,
+        );
+        match ocr::recognize_panel(&panel, self.high_recall) {
+            Ok(ocr) => {
+                let text = ocr.text.trim().replace('\n', " / ");
+                let rows = ocr.regions.len();
+                self.set_preview(ctx, raw, text.clone(), ocr.regions, self.upscale);
+                self.log(format!(
+                    "预览：识别到 {rows} 行｜OCR {}",
+                    if text.is_empty() {
+                        "无文字".to_string()
+                    } else {
+                        text
+                    }
+                ));
+            }
+            Err(err) => {
+                self.log(format!("预览识别失败：{err}"));
+                self.set_preview(ctx, raw, String::new(), Vec::new(), self.upscale);
+            }
         }
     }
 
@@ -834,6 +867,7 @@ impl Studio {
                     total,
                     learned,
                     ocr,
+                    regions,
                     panel,
                 } => {
                     if let Some(job) = &mut self.job {
@@ -843,7 +877,7 @@ impl Studio {
                         "第 {index}/{total} 帧：采到 {learned} 个字模｜OCR {}",
                         if ocr.is_empty() { "无文字" } else { &ocr }
                     ));
-                    self.set_preview(ctx, panel, ocr);
+                    self.set_preview(ctx, panel, ocr, regions, self.upscale);
                 }
                 JobMsg::Done {
                     lib,
@@ -961,6 +995,7 @@ impl Studio {
             match message {
                 JobMsg::Progress {
                     attempts,
+                    regions,
                     frames_used,
                     samples,
                     learned,
@@ -1006,7 +1041,7 @@ impl Studio {
                         ));
                     }
                     if let Some(panel) = panel {
-                        self.set_preview(ctx, panel, ocr);
+                        self.set_preview(ctx, panel, ocr, regions, self.upscale);
                     }
                 }
                 JobMsg::AccStopped {
@@ -1445,7 +1480,7 @@ impl Studio {
     }
     fn preview_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let mut picked_color: Option<[u8; 3]> = None;
-        let mut clicked_box: Option<usize> = None;
+        let mut clicked_cell: Option<(font_lib::GlyphBox, char)> = None;
         if let Some(preview) = &self.preview {
             ui.horizontal(|ui| {
                 ui.checkbox(&mut self.show_binary, "显示二值化");
@@ -1474,23 +1509,45 @@ impl Studio {
                 egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                 egui::Color32::WHITE,
             );
-            // 把切出来的字形框画出来：点选建库全靠这个。
-            for (index, b) in preview.boxes.iter().enumerate() {
-                let box_rect = egui::Rect::from_min_max(
-                    rect.min + egui::vec2(b.span.x0 as f32 * scale, b.top as f32 * scale),
-                    rect.min + egui::vec2(b.span.x1 as f32 * scale, b.bottom as f32 * scale),
+            // 先画「行框」，再画行内每个字的格子：文字是横排的，框不该竖着套在笔画上。
+            for (row_index, row) in preview.rows.iter().enumerate() {
+                let band_rect = egui::Rect::from_min_max(
+                    rect.min
+                        + egui::vec2(row.band.span.x0 as f32 * scale, row.band.top as f32 * scale),
+                    rect.min
+                        + egui::vec2(
+                            row.band.span.x1 as f32 * scale,
+                            row.band.bottom as f32 * scale,
+                        ),
                 );
-                let color = if self.pending_box == Some(index) {
-                    WARN
-                } else {
-                    egui::Color32::from_rgba_unmultiplied(0x4c, 0xd9, 0x8a, 90)
-                };
                 ui.painter().rect_stroke(
-                    box_rect,
+                    band_rect,
                     0.0,
-                    egui::Stroke::new(1.0, color),
+                    egui::Stroke::new(1.0, egui::Color32::from_rgb(0x4c, 0x8a, 0xd9)),
                     egui::StrokeKind::Outside,
                 );
+                for (cell_index, (cell, _)) in row.cells.iter().enumerate() {
+                    let cell_rect = egui::Rect::from_min_max(
+                        rect.min + egui::vec2(cell.span.x0 as f32 * scale, cell.top as f32 * scale),
+                        rect.min
+                            + egui::vec2(cell.span.x1 as f32 * scale, cell.bottom as f32 * scale),
+                    );
+                    let selected = self.pending_cell.is_some_and(|pending| {
+                        pending.span == cell.span && pending.top == cell.top
+                    });
+                    let color = if selected {
+                        WARN
+                    } else {
+                        egui::Color32::from_rgba_unmultiplied(0x4c, 0xd9, 0x8a, 120)
+                    };
+                    ui.painter().rect_stroke(
+                        cell_rect,
+                        0.0,
+                        egui::Stroke::new(1.0, color),
+                        egui::StrokeKind::Outside,
+                    );
+                    let _ = (row_index, cell_index);
+                }
             }
             if response.clicked() {
                 if let Some(pos) = response.interact_pointer_pos() {
@@ -1501,19 +1558,18 @@ impl Studio {
                             picked_color = pick_stroke_color(&preview.image, x as i32, y as i32, 3);
                         }
                         PreviewMode::Label => {
-                            // 命中最小的那个框（叠在一起时选更紧的）。
-                            clicked_box = preview
-                                .boxes
+                            // 命中最小的格子（格子是行内切出来的，天然不重叠）。
+                            clicked_cell = preview
+                                .rows
                                 .iter()
-                                .enumerate()
-                                .filter(|(_, b)| {
-                                    x as u32 >= b.span.x0
-                                        && (x as u32) < b.span.x1
-                                        && y >= b.top as f32
-                                        && (y as u32) < b.bottom
+                                .flat_map(|row| row.cells.iter())
+                                .find(|(cell, _)| {
+                                    x >= cell.span.x0 as f32
+                                        && x < cell.span.x1 as f32
+                                        && y >= cell.top as f32
+                                        && y < cell.bottom as f32
                                 })
-                                .min_by_key(|(_, b)| b.span.width())
-                                .map(|(index, _)| index);
+                                .copied();
                         }
                     }
                 }
@@ -1572,23 +1628,21 @@ impl Studio {
         } else {
             ui.label("还没有预览：左边点「截图预览」抓一张看看区域和预处理对不对。");
         }
-        if let Some(index) = clicked_box {
-            self.pending_box = Some(index);
+        if let Some((cell, ch)) = clicked_cell {
+            self.pending_cell = Some(cell);
+            // 直接用 OCR 给的字符预填：多半是对的，错了改一下就行。
+            self.label_input = ch.to_string();
             self.focus_label = true;
-            if let Some(preview) = &self.preview {
-                if let Some(b) = preview.boxes.get(index) {
-                    self.log(format!(
-                        "选中第 {index} 个字形（宽 {}px）：输入字符后点「加入字库」",
-                        b.span.width()
-                    ));
-                }
-            }
+            self.log(format!(
+                "选中一个格子（宽 {}px），预填「{ch}」：回车加入，或改成正确字符",
+                cell.span.width()
+            ));
         }
-        // 选中字形后：输入一个字符就能加进字库（点选建库）。
-        if let Some(index) = self.pending_box {
+        // 选中格子后：确认/修正标签就能加进字库（点选建库）。
+        if let Some(cell) = self.pending_cell {
             ui.separator();
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(format!("第 {index} 个字形 → 标签")).strong());
+                ui.label(egui::RichText::new("标签").strong());
                 let response = ui.add(
                     egui::TextEdit::singleline(&mut self.label_input)
                         .desired_width(36.0)
@@ -1604,16 +1658,16 @@ impl Studio {
                     .clicked()
                     || (typed && ui.input(|input| input.key_pressed(egui::Key::Enter)));
                 if ui.button("取消").clicked() {
-                    self.pending_box = None;
+                    self.pending_cell = None;
                 }
                 if submit {
                     let label: String = self.label_input.trim().chars().take(1).collect();
-                    self.add_labeled_sample(ctx, index, &label);
+                    self.add_labeled_sample(ctx, cell, &label);
                 }
             });
             ui.label(
                 egui::RichText::new(
-                    "标签框会保留上一次的输入：连着标同一个字的多种写法时，点框 → 回车即可",
+                    "标签框保留上次输入：连着标同一个字的多种写法时，点格子 → 回车即可",
                 )
                 .small()
                 .weak(),
@@ -2028,10 +2082,21 @@ fn process_panel(
 
 impl Studio {
     /// 用一帧原图刷新预览：预处理按界面**当前**参数算，调参能立刻重算。
-    fn set_preview(&mut self, ctx: &egui::Context, raw: image::RgbImage, ocr: String) {
+    ///
+    /// `regions` 是这一帧 OCR 的检测框（用来按行切字）；点选建库靠它。
+    fn set_preview(
+        &mut self,
+        ctx: &egui::Context,
+        raw: image::RgbImage,
+        ocr: String,
+        regions: Vec<ocr::OcrRegion>,
+        ocr_upscale: u32,
+    ) {
         let (pipeline, color, tolerance, upscale) =
             (self.pipeline(), self.color, self.tolerance, self.upscale);
         let mut preview = Preview::new(ctx, raw, ocr);
+        preview.ocr_regions = regions;
+        preview.ocr_upscale = ocr_upscale.max(1);
         preview.reprocess(ctx, pipeline, color, tolerance, upscale);
         self.preview = Some(preview);
         self.refresh_narrow_runs(ctx);
@@ -2195,10 +2260,15 @@ enum PreviewMode {
 }
 
 impl Studio {
-    /// 把预览里第 `index` 个字形按用户给的标签加进字库（点选建库）。
+    /// 把预览里的某个格子按用户给的标签加进字库（点选建库）。
     ///
-    /// 这是唯一不靠猜的建库方式：切字框来自连通域，标签来自用户亲手输入。
-    fn add_labeled_sample(&mut self, ctx: &egui::Context, index: usize, label: &str) {
+    /// 这是唯一不靠猜的建库方式：格子来自「行 + 字宽」切分，标签来自用户确认。
+    fn add_labeled_sample(
+        &mut self,
+        ctx: &egui::Context,
+        cell_box: font_lib::GlyphBox,
+        label: &str,
+    ) {
         let label: String = label.trim().chars().take(1).collect();
         if label.is_empty() {
             return;
@@ -2206,12 +2276,9 @@ impl Studio {
         let Some(preview) = &self.preview else {
             return;
         };
-        let Some(b) = preview.boxes.get(index).copied() else {
-            return;
-        };
         let cell = font_lib::cell_of(
             &preview.gray,
-            &b,
+            &cell_box,
             font_lib::DEFAULT_CELL_W,
             font_lib::DEFAULT_CELL_H,
         );
@@ -2231,7 +2298,7 @@ impl Studio {
         });
         self.bump_lib_revision();
         self.lib_dirty = true;
-        self.pending_box = None;
+        self.pending_cell = None;
         let missing = font_lib::missing_coordinate_labels(&self.lib);
         if missing.is_empty() {
             self.log(format!("加入「{label}」：坐标字符齐了，可以点「保存」"));
@@ -2241,7 +2308,52 @@ impl Studio {
                 missing.iter().collect::<String>()
             ));
         }
-        // 整了样本，字库变了，顺手重算一次窄字形读出结果。
+        // 字库变了，顺手重算一次窄字形读出结果。
         self.refresh_narrow_runs(ctx);
+    }
+}
+
+/// 预览里的一行：行框 + 行内每个字的格子。
+#[derive(Clone)]
+struct PreviewRow {
+    band: font_lib::GlyphBox,
+    text: String,
+    cells: Vec<(font_lib::GlyphBox, char)>,
+}
+
+impl Preview {
+    /// 按「行」重建切字：行框来自 OCR 检测框，行内用「2 个数字 = 1 个汉字宽」
+    /// 的规律等比例切开。坐标 1~3 位会让每行宽度不同，这里每行各算各的。
+    fn rebuild_rows(&mut self, upscale: u32) {
+        self.rows.clear();
+        if self.ocr_regions.is_empty() || self.gray.width() < 2 {
+            return;
+        }
+        // OCR 是在它自己那次放大倍数下跑的；换倍数时把矩形等比换算。
+        let ratio = upscale.max(1) as f32 / self.ocr_upscale.max(1) as f32;
+        for region in &self.ocr_regions {
+            let band = (
+                (region.left * ratio).round().max(0.0) as u32,
+                (region.top * ratio).round().max(0.0) as u32,
+                ((region.right * ratio).round() as u32).min(self.gray.width()),
+                ((region.bottom * ratio).round() as u32).min(self.gray.height()),
+            );
+            if band.2 <= band.0 || band.3 <= band.1 {
+                continue;
+            }
+            let cells = font_lib::split_row_by_text(&self.gray, band, &region.text);
+            self.rows.push(PreviewRow {
+                band: font_lib::GlyphBox {
+                    span: font_lib::Span {
+                        x0: band.0,
+                        x1: band.2,
+                    },
+                    top: band.1,
+                    bottom: band.3,
+                },
+                text: region.text.clone(),
+                cells,
+            });
+        }
     }
 }

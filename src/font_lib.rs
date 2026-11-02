@@ -1388,18 +1388,17 @@ mod learner_tests {
 
 // ---------------------------------------------------------- 文字↔切字对齐
 
-/// 一个字符大约占多少「字宽单位」（中文 1.0，数字/字母约 0.55，逗号句点约 0.35）。
+/// 一个字符占多少「字宽单位」，按游戏字体的实际规律：
+/// **2 个数字 = 1 个汉字宽**，**全角符号（，（）：“”）= 1 个汉字宽**。
 ///
 /// 建库时用它把 OCR 的一行文字对齐到切出来的跨度：中文紧贴排版会把相邻字并成
-/// 一个跨度，而数字比中文窄，单纯按「平均字宽等分」是分不对的。
+/// 一个跨度，而数字只有半宽，单纯按「平均字宽等分」是分不对的。
 pub fn char_width_units(ch: char) -> f32 {
-    if ch.is_ascii_digit() || ch.is_ascii_alphabetic() {
-        0.55
-    } else if matches!(ch, ',' | '.' | ':' | ';' | '\'' | '!' | '|') {
-        0.35
-    } else if ch.is_ascii() {
+    if ch.is_ascii() {
+        // 半角：数字、字母、半角标点都是半个汉字宽。
         0.5
     } else {
+        // 汉字和全角标点都是一个汉字宽。
         1.0
     }
 }
@@ -1824,5 +1823,203 @@ mod narrow_logic_tests {
         let boxes: Vec<GlyphBox> = (0..6).map(|i| boxed(i * 24, 18, 10, 38)).collect();
         let indices: Vec<usize> = (0..boxes.len()).collect();
         assert_eq!(group_runs(&boxes, &indices).len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod width_metric_tests {
+    use super::*;
+
+    /// 游戏字体规则：2 个数字 = 1 个汉字宽，全角符号 = 1 个汉字宽。
+    #[test]
+    fn half_width_digits_and_full_width_punctuation() {
+        assert_eq!(char_width_units('7'), 0.5);
+        assert_eq!(char_width_units('0'), 0.5);
+        assert_eq!(char_width_units('a'), 0.5);
+        assert_eq!(char_width_units('长'), 1.0);
+        assert_eq!(char_width_units('，'), 1.0);
+        assert_eq!(char_width_units('（'), 1.0);
+        // 「119，60」= 5 个半角 + 1 个全角 = 3.5 个汉字宽。
+        let units: f32 = "119，60".chars().map(char_width_units).sum();
+        assert!((units - 3.5).abs() < 1e-6, "{units}");
+    }
+
+    /// 坐标位数不同（1~3 位）时，行宽就是不一样，对齐要按各自的实际文字来。
+    #[test]
+    fn aligns_coordinates_of_different_lengths() {
+        // 「去 长寿村 7，6」：去=1，长寿村=3，7=0.5， ，=1， 6=0.5 → 共 6.0 单位
+        let boxes = 6;
+        let span = |units: f32| (units * 30.0) as u32;
+        let widths = vec![
+            span(1.0),
+            span(1.0),
+            span(1.0),
+            span(1.0),
+            span(0.5),
+            span(1.5),
+        ];
+        let blocks = align_chars_to_spans("去长寿村7，6", &widths).expect("应当对齐");
+        assert_eq!(blocks.len(), boxes);
+        assert_eq!(blocks[0], vec!['去']);
+        assert_eq!(blocks[4], vec!['7']);
+        assert_eq!(blocks[5], vec!['，', '6']);
+    }
+}
+
+// ------------------------------------------------------- 按行 + 字宽切字
+
+/// 某一行里这一列有没有墨迹。
+fn column_has_ink(gray: &GrayImage, y0: u32, y1: u32, x: u32) -> bool {
+    (y0..y1.min(gray.height())).any(|y| x < gray.width() && gray.get_pixel(x, y)[0] < 128)
+}
+
+/// 把一行按「字宽规律」切成一格一格。
+///
+/// 这是按游戏字体的实际排版推的：**2 个数字 = 1 个汉字宽，全角符号 = 1 个汉字宽**。
+/// 所以只要知道这一行的文字，就能按字数把行**等比例**切开；坐标 1~3 位导致的行宽
+/// 差异自然被吸收（每行都按自己的文字算，不需要等长）。
+///
+/// `band` 是这一行的矩形 `(x0, y0, x1, y1)`（一般来自 OCR 检测框）。
+/// 边界会尽量吸附到「没有墨迹的列」上，避免把笔画切一半。
+pub fn split_row_by_text(
+    gray: &GrayImage,
+    band: (u32, u32, u32, u32),
+    text: &str,
+) -> Vec<(GlyphBox, char)> {
+    let chars: Vec<char> = text.chars().filter(|ch| !ch.is_whitespace()).collect();
+    if chars.is_empty() {
+        return Vec::new();
+    }
+    let (bx0, by0, bx1, by1) = (
+        band.0.min(gray.width()),
+        band.1.min(gray.height()),
+        band.2.min(gray.width()),
+        band.3.min(gray.height()),
+    );
+    if bx1 <= bx0 || by1 <= by0 {
+        return Vec::new();
+    }
+    // OCR 框可能比文字略宽：先缩到行内墨迹的左右边界。
+    let mut ink: Option<(u32, u32)> = None;
+    for x in bx0..bx1 {
+        if column_has_ink(gray, by0, by1, x) {
+            ink = match ink {
+                Some((left, _)) => Some((left, x + 1)),
+                None => Some((x, x + 1)),
+            };
+        }
+    }
+    let Some((x0, x1)) = ink else {
+        return Vec::new();
+    };
+    let width = (x1 - x0) as f32;
+    let units: Vec<f32> = chars.iter().map(|ch| char_width_units(*ch)).collect();
+    let total: f32 = units.iter().sum();
+    if total <= 0.0 {
+        return Vec::new();
+    }
+
+    let mut cells = Vec::with_capacity(chars.len());
+    let mut consumed = 0.0f32;
+    let mut previous = x0;
+    for (index, ch) in chars.iter().enumerate() {
+        consumed += units[index];
+        let is_last = index + 1 == chars.len();
+        let mut boundary = if is_last {
+            x1
+        } else {
+            x0 + (width * consumed / total).round() as u32
+        };
+        if !is_last {
+            // 在半格范围内找最近的「空列」，把边界从笔画中间挪到字间。
+            let reach = ((width / total * units[index] * 0.4) as u32).max(2);
+            for delta in 0..=reach {
+                let left = boundary.saturating_sub(delta);
+                if column_has_ink(gray, by0, by1, left) {
+                    continue;
+                }
+                if left > previous && left < x1 {
+                    boundary = left;
+                    break;
+                }
+                let right = boundary + delta;
+                if right < x1 && !column_has_ink(gray, by0, by1, right) && right > previous {
+                    boundary = right;
+                    break;
+                }
+            }
+        }
+        let boundary = boundary.clamp(previous + 1, x1);
+        cells.push((
+            GlyphBox {
+                span: Span {
+                    x0: previous,
+                    x1: boundary,
+                },
+                top: by0,
+                bottom: by1,
+            },
+            *ch,
+        ));
+        previous = boundary;
+    }
+    cells
+}
+
+#[cfg(test)]
+mod row_split_tests {
+    use super::fixture::render;
+    use super::*;
+
+    /// 坐标位数不同 → 行宽不同，但每行都按自己的文字等比例切开。
+    #[test]
+    fn splits_row_by_character_widths() {
+        // 「119,60」6 个半角字符 → 每格宽度应当基本相等。
+        let line = binarize(&render("119,60", 5, 1));
+        let band = (0, 0, line.width(), line.height());
+        let cells = split_row_by_text(&line, band, "119,60");
+        assert_eq!(cells.len(), 6, "6 个字应当切 6 格");
+        let texts: String = cells.iter().map(|(_, ch)| *ch).collect();
+        assert_eq!(texts, "119,60");
+        let widths: Vec<u32> = cells.iter().map(|(b, _)| b.span.width()).collect();
+        let min = *widths.iter().min().unwrap();
+        let max = *widths.iter().max().unwrap();
+        // 边界会吸附到空列上，允许几个像素的浮动。
+        assert!(max - min <= 6, "半角字符应当等宽：{widths:?}");
+    }
+
+    /// 混排：中文宽、数字半宽，全角逗号占一个汉字宽。
+    #[test]
+    fn wide_and_half_width_glyphs_get_proportional_cells() {
+        let mut canvas = image::GrayImage::from_pixel(300, 40, image::Luma([255]));
+        // 两个「汉字」宽块 40x40
+        for y in 0..40 {
+            for x in 0..40 {
+                canvas.put_pixel(x, y, image::Luma([0]));
+                canvas.put_pixel(x + 40, y, image::Luma([0]));
+            }
+        }
+        // 「，」也按一个汉字宽（40px）
+        for y in 28..36 {
+            for x in 84..100 {
+                canvas.put_pixel(x, y, image::Luma([0]));
+            }
+        }
+        // 两个数字各半宽（20px）
+        for y in 10..30 {
+            for x in 120..140 {
+                canvas.put_pixel(x, y, image::Luma([0]));
+            }
+            for x in 140..160 {
+                canvas.put_pixel(x, y, image::Luma([0]));
+            }
+        }
+        let cells = split_row_by_text(&canvas, (0, 0, 300, 40), "阿阿，12");
+        assert_eq!(cells.len(), 5);
+        let widths: Vec<u32> = cells.iter().map(|(b, _)| b.span.width()).collect();
+        // 前两个和逗号约 1 个字宽，后面两个数字约半个字宽。
+        assert!(widths[0] >= 20 && widths[1] >= 20, "{widths:?}");
+        assert!(widths[3] <= widths[0], "{widths:?}");
+        assert!(widths[4] <= widths[0], "{widths:?}");
     }
 }
