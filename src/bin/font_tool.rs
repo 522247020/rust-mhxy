@@ -930,9 +930,40 @@ fn align(args: &[String]) -> Result<(), String> {
     let image_path: PathBuf = required(&flags, "image")?.into();
     let text = required(&flags, "text")?;
     let image = load_rgb(&image_path)?;
-    let gray = font_lib::binarize(&image);
-    let cfg = MatchConfig::default();
+    // 可选：先在原始裁剪图上跑一遍预处理，和采集时完全同一条流水线。
+    let pipeline = preprocess::Pipeline::from_config(
+        flags.get("preprocess").map(String::as_str).unwrap_or("off"),
+    );
+    let color = match flags.get("color") {
+        Some(spec) => {
+            gate::parse_hex(spec).ok_or_else(|| format!("--color 需要 #rrggbb：{spec}"))?
+        }
+        None => [0xea, 0xff, 0x65],
+    };
+    let tolerance: u8 = number(&flags, "tolerance", 24)?;
+    let upscale: u32 = number(&flags, "upscale", 1)?;
+    let processed = preprocess::upscale(
+        &preprocess::apply(image, pipeline, color, tolerance),
+        upscale,
+    );
+    if let Some(path) = flags.get("out") {
+        processed
+            .save(path)
+            .map_err(|err| format!("写入 {path} 失败：{err}"))?;
+        println!("预处理结果已写到 {path}");
+    }
+    let gray = font_lib::binarize(&processed);
+    let image = processed;
+    let mut cfg = MatchConfig::default();
+    cfg.gap_merge = number(&flags, "gap", cfg.gap_merge)?;
     let rows = font_lib::row_spans(&gray, cfg.row_gap);
+    println!(
+        "图片 {}x{}，预处理 {}｜切出 {} 行",
+        image.width(),
+        image.height(),
+        pipeline.summary(),
+        rows.len()
+    );
     println!(
         "图片 {}x{}，切出 {} 行",
         image.width(),
@@ -942,7 +973,11 @@ fn align(args: &[String]) -> Result<(), String> {
     if rows.len() != 1 {
         println!("不是单行，学习时会被跳过");
     }
-    let boxes = font_lib::analyze(&gray, cfg);
+    let boxes = if flags.contains_key("components") {
+        font_lib::analyze_components(&gray, cfg)
+    } else {
+        font_lib::analyze(&gray, cfg)
+    };
     let widths: Vec<u32> = boxes.iter().map(|b| b.span.width()).collect();
     println!("跨度宽度：{widths:?}");
     match font_lib::align_chars_to_spans(&text, &widths) {

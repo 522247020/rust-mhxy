@@ -694,13 +694,23 @@ pub fn learn_panel(
             *skipped += 1;
             continue;
         }
-        let boxes = font_lib::analyze(&gray, cfg);
-        if boxes.is_empty() {
-            *skipped += 1;
-            continue;
+        // 先按列投影切；对不上（中文把字切开、背景粘连）再换连通域切一次。
+        let widths_of = |boxes: &[font_lib::GlyphBox]| -> Vec<u32> {
+            boxes.iter().map(|b| b.span.width()).collect()
+        };
+        let mut boxes = font_lib::analyze(&gray, cfg);
+        let mut blocks = font_lib::align_chars_to_spans(&region.text, &widths_of(&boxes));
+        if blocks.is_none() {
+            let fallback = font_lib::analyze_components(&gray, cfg);
+            if !fallback.is_empty() {
+                let candidate = font_lib::align_chars_to_spans(&region.text, &widths_of(&fallback));
+                if candidate.is_some() {
+                    boxes = fallback;
+                    blocks = candidate;
+                }
+            }
         }
-        let widths: Vec<u32> = boxes.iter().map(|b| b.span.width()).collect();
-        let Some(blocks) = font_lib::align_chars_to_spans(&region.text, &widths) else {
+        let Some(blocks) = blocks else {
             *skipped += 1;
             continue;
         };

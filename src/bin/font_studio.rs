@@ -435,6 +435,8 @@ struct Preview {
     size: egui::Vec2,
     /// 预览时切出来的字模（检查切字是否正常）。
     cells: Vec<Vec<u8>>,
+    /// 字模贴图，重算时一起建好（每帧重建会卡）。
+    cell_textures: Vec<egui::TextureHandle>,
     ocr: String,
 }
 
@@ -450,6 +452,7 @@ impl Preview {
             texture: texture_of(ctx, "preview", &image),
             binary_texture: texture_of(ctx, "preview-binary", &image),
             cells: Vec::new(),
+            cell_textures: Vec::new(),
             image,
             ocr,
         };
@@ -472,6 +475,20 @@ impl Preview {
         let gray = font_lib::binarize(&panel);
         self.binary_texture = texture_of_gray(ctx, "preview-binary", &gray);
         self.cells = cells_of(&gray);
+        self.cell_textures = self
+            .cells
+            .iter()
+            .enumerate()
+            .map(|(index, cell)| {
+                make_glyph_texture(
+                    ctx,
+                    cell,
+                    font_lib::DEFAULT_CELL_W,
+                    font_lib::DEFAULT_CELL_H,
+                    &format!("preview-cell-{index}"),
+                )
+            })
+            .collect();
     }
 }
 
@@ -509,6 +526,10 @@ struct Studio {
 
     lib_path: String,
     lib: GlyphLib,
+    /// 字模贴图缓存（按字库下标），字库变了就清空。
+    glyph_textures: Vec<Option<egui::TextureHandle>>,
+    /// 字模网格只看坐标字符（字库可能很大，全画出来又慢又乱）。
+    only_coordinate: bool,
     /// 预览显示二值化结果（看文字有没有被干净地提出来）。
     show_binary: bool,
     lib_dirty: bool,
@@ -550,6 +571,8 @@ impl Studio {
             learn_all: false,
             lib_path: default_lib_path().display().to_string(),
             lib: GlyphLib::new(font_lib::DEFAULT_CELL_W, font_lib::DEFAULT_CELL_H),
+            glyph_textures: Vec::new(),
+            only_coordinate: true,
             show_binary: false,
             lib_dirty: false,
             seed_existing: true,
@@ -639,6 +662,7 @@ impl Studio {
                         .join(" ")
                 ));
                 self.lib = lib;
+                self.bump_lib_revision();
                 self.lib_dirty = false;
                 self.selected_glyph = None;
             }
@@ -818,6 +842,7 @@ impl Studio {
                         self.log(format!("提醒：{warning}"));
                     }
                     self.lib = lib;
+                    self.bump_lib_revision();
                     self.lib_dirty = true;
                     self.selected_glyph = None;
                     self.summary = summary;
@@ -931,6 +956,7 @@ impl Studio {
                         acc.complete = complete;
                     }
                     self.lib = lib;
+                    self.bump_lib_revision();
                     self.lib_dirty = true;
                     self.summary = summary;
                     if complete && !was_complete {
@@ -966,6 +992,7 @@ impl Studio {
                 } => {
                     stopped = true;
                     self.lib = lib;
+                    self.bump_lib_revision();
                     self.lib_dirty = true;
                     self.summary = summary;
                     let elapsed = self
@@ -984,25 +1011,53 @@ impl Studio {
             self.acc = None;
         }
     }
-    fn glyph_texture(
-        &self,
+    /// 取一个字模贴图：**缓存**，字库没变就不重建。
+    ///
+    /// 之前每帧对每个字模都 `load_texture` 一次，四百多个字模就是四百多次
+    /// 贴图创建 → 界面直接卡住。
+    fn glyph_texture_cached(
+        &mut self,
         ctx: &egui::Context,
-        pixels: &[u8],
         index: usize,
+        pixels: &[u8],
     ) -> egui::TextureHandle {
-        let (w, h) = (self.lib.cell_w, self.lib.cell_h);
-        let mut rgba = Vec::with_capacity((w * h * 4) as usize);
-        for value in pixels {
-            rgba.extend_from_slice(&[*value, *value, *value, 255]);
+        if self.glyph_textures.len() <= index {
+            self.glyph_textures.resize(index + 1, None);
         }
-        let image = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
-        // 用索引+内容长度当名字，字模改了自然会重建。
-        ctx.load_texture(
-            format!("glyph-{index}-{}", pixels.len()),
-            image,
-            egui::TextureOptions::NEAREST,
-        )
+        if let Some(texture) = &self.glyph_textures[index] {
+            return texture.clone();
+        }
+        let texture = make_glyph_texture(
+            ctx,
+            pixels,
+            self.lib.cell_w,
+            self.lib.cell_h,
+            &format!("glyph-{index}"),
+        );
+        self.glyph_textures[index] = Some(texture.clone());
+        texture
     }
+
+    /// 字库变了（采集/加载/改标签/删除/清空）就丢掉贴图缓存。
+    fn bump_lib_revision(&mut self) {
+        self.glyph_textures.clear();
+    }
+}
+
+/// 把 16x24 字模做成贴图。
+fn make_glyph_texture(
+    ctx: &egui::Context,
+    pixels: &[u8],
+    cell_w: u32,
+    cell_h: u32,
+    name: &str,
+) -> egui::TextureHandle {
+    let mut rgba = Vec::with_capacity((cell_w * cell_h * 4) as usize);
+    for value in pixels {
+        rgba.extend_from_slice(&[*value, *value, *value, 255]);
+    }
+    let image = egui::ColorImage::from_rgba_unmultiplied([cell_w as usize, cell_h as usize], &rgba);
+    ctx.load_texture(name, image, egui::TextureOptions::NEAREST)
 }
 
 fn default_lib_path() -> PathBuf {
@@ -1181,7 +1236,7 @@ impl Studio {
                 }
             }
             ui.add(
-                egui::Slider::new(&mut self.tolerance, 0..=80)
+                egui::Slider::new(&mut self.tolerance, 0..=120)
                     .text("容差")
                     .clamping(egui::SliderClamping::Always),
             );
@@ -1322,6 +1377,7 @@ impl Studio {
             }
             if ui.button("清空").clicked() {
                 self.lib = GlyphLib::new(font_lib::DEFAULT_CELL_W, font_lib::DEFAULT_CELL_H);
+                self.bump_lib_revision();
                 self.lib_dirty = true;
                 self.selected_glyph = None;
                 self.summary.clear();
@@ -1390,11 +1446,11 @@ impl Studio {
             );
             if response.clicked() {
                 if let Some(pos) = response.interact_pointer_pos() {
-                    let x = ((pos.x - rect.min.x) / scale) as u32;
-                    let y = ((pos.y - rect.min.y) / scale) as u32;
-                    if let Some(pixel) = preview.image.get_pixel_checked(x, y) {
-                        picked_color = Some([pixel[0], pixel[1], pixel[2]]);
-                    }
+                    let x = ((pos.x - rect.min.x) / scale) as i32;
+                    let y = ((pos.y - rect.min.y) / scale) as i32;
+                    // 点到的往往是有抗锯齿的边缘像素，直接取会得到一个「半透明的颜色」，
+                    // 提取出来只剩细边。所以在附近找笔画**核心**：最饱和、最亮的那个像素。
+                    picked_color = pick_stroke_color(&preview.image, x, y, 3);
                 }
             }
             ui.add_space(6.0);
@@ -1411,8 +1467,7 @@ impl Studio {
                     .weak(),
                 );
                 ui.horizontal_wrapped(|ui| {
-                    for (index, cell) in preview.cells.iter().enumerate() {
-                        let texture = self.glyph_texture(ctx, cell, index);
+                    for texture in preview.cell_textures.iter() {
                         let (cell_rect, _) = ui.allocate_exact_size(
                             egui::vec2(
                                 font_lib::DEFAULT_CELL_W as f32 * 2.0,
@@ -1437,6 +1492,10 @@ impl Studio {
             self.color_hex = format!("#{:02x}{:02x}{:02x}", color[0], color[1], color[2]);
             // 取色后直接勾上颜色提取并重算预览：点了就要能看见变化。
             self.color_key = true;
+            // 游戏字带描边/渐变，容差太小只剩一圈细边；先给个能看的值，可再微调。
+            if self.tolerance < 40 {
+                self.tolerance = 48;
+            }
             self.reprocess_preview(ctx);
             let cells = self.preview.as_ref().map(|p| p.cells.len()).unwrap_or(0);
             self.log(format!(
@@ -1461,10 +1520,40 @@ impl Studio {
         let locked = self.acc.is_some();
         let mut delete: Option<usize> = None;
         let mut relabel: Option<(usize, String)> = None;
+        // 字库可能有几百个字模：默认只显示坐标字符，否则一屏几百个格子又乱又慢。
+        let indices: Vec<usize> = self
+            .lib
+            .glyphs
+            .iter()
+            .enumerate()
+            .filter(|(_, glyph)| {
+                !self.only_coordinate
+                    || (glyph.label.chars().count() == 1
+                        && is_digitish(glyph.label.chars().next().unwrap_or(' ')))
+            })
+            .map(|(index, _)| index)
+            .collect();
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.only_coordinate, "只看坐标字符");
+            ui.label(
+                egui::RichText::new(format!(
+                    "显示 {} / {} 个字模",
+                    indices.len(),
+                    self.lib.len()
+                ))
+                .small()
+                .weak(),
+            );
+        });
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
-                for (index, glyph) in self.lib.glyphs.iter().enumerate() {
-                    let texture = self.glyph_texture(ctx, &glyph.pixels, index);
+                for index in indices {
+                    // 索引取数据：缓存贴图要 &mut self，不能同时借用 lib。
+                    let (pixels, label) = {
+                        let glyph = &self.lib.glyphs[index];
+                        (glyph.pixels.clone(), glyph.label.clone())
+                    };
+                    let texture = self.glyph_texture_cached(ctx, index, &pixels);
                     let selected = self.selected_glyph == Some(index);
                     let (rect, response) = ui.allocate_exact_size(
                         egui::vec2(self.lib.cell_w as f32 * 3.0, self.lib.cell_h as f32 * 3.0),
@@ -1472,7 +1561,7 @@ impl Studio {
                     );
                     if response.clicked() {
                         self.selected_glyph = Some(index);
-                        self.relabel = glyph.label.clone();
+                        self.relabel = label.clone();
                     }
                     ui.painter().image(
                         texture.id(),
@@ -1489,7 +1578,7 @@ impl Studio {
                         );
                     }
                     ui.vertical(|ui| {
-                        ui.label(egui::RichText::new(&glyph.label).strong());
+                        ui.label(egui::RichText::new(&label).strong());
                         if ui
                             .add_enabled(!locked, egui::Button::new("删").small())
                             .clicked()
@@ -1521,6 +1610,7 @@ impl Studio {
         if let Some((index, label)) = relabel {
             if let Some(glyph) = self.lib.glyphs.get_mut(index) {
                 glyph.label = label;
+                self.bump_lib_revision();
                 self.lib_dirty = true;
                 self.log(format!("第 {index} 个字模改标签为「{}」", self.relabel));
             }
@@ -1528,6 +1618,7 @@ impl Studio {
         if let Some(index) = delete {
             if index < self.lib.glyphs.len() {
                 let removed = self.lib.glyphs.remove(index);
+                self.bump_lib_revision();
                 self.lib_dirty = true;
                 self.selected_glyph = None;
                 self.log(format!("删除字模「{}」", removed.label));
@@ -1862,5 +1953,71 @@ mod preview_tests {
         let raw = image::RgbImage::from_pixel(10, 10, image::Rgb([9, 9, 9]));
         let out = process_panel(&raw, preprocess::Pipeline::default(), [0, 0, 0], 0, 3);
         assert_eq!((out.width(), out.height()), (30, 30));
+    }
+}
+
+/// 在点击位置附近找「笔画核心」颜色。
+///
+/// 抗锯齿会让字的边缘变成背景和文字的混色，直接拿点击点当目标色，
+/// 提取出来只剩一圈细线。这里取邻域内**饱和度×亮度最高**的像素，
+/// 也就是笔画内部最纯的那个颜色。
+fn pick_stroke_color(image: &image::RgbImage, x: i32, y: i32, radius: i32) -> Option<[u8; 3]> {
+    let mut best: Option<([u8; 3], f32)> = None;
+    for dy in -radius..=radius {
+        for dx in -radius..=radius {
+            let px = x + dx;
+            let py = y + dy;
+            if px < 0 || py < 0 {
+                continue;
+            }
+            let Some(pixel) = image.get_pixel_checked(px as u32, py as u32) else {
+                continue;
+            };
+            let [r, g, b] = [pixel[0] as f32, pixel[1] as f32, pixel[2] as f32];
+            let max = r.max(g).max(b);
+            let min = r.min(g).min(b);
+            // 饱和度（0~1）× 亮度（0~255）：字越纯、越亮，分越高。
+            let score = if max > 1.0 { (max - min) / max } else { 0.0 } * max;
+            if best.is_none_or(|(_, best_score)| score > best_score) {
+                best = Some(([pixel[0], pixel[1], pixel[2]], score));
+            }
+        }
+    }
+    // 邻域全是同一个暗色（点到背景了）：也给个值，用户能看到颜色不对再点准一点。
+    best.map(|(color, _)| color)
+}
+
+#[cfg(test)]
+mod pick_tests {
+    use super::*;
+
+    /// 点到笔画边缘（混色）时，应当取到附近笔画核心的颜色。
+    #[test]
+    fn picks_stroke_core_not_antialiased_edge() {
+        let mut image = image::RgbImage::from_pixel(20, 20, image::Rgb([30, 40, 30]));
+        // 一段「文字」：核心是纯黄，边缘是一圈混色。
+        for y in 8..12 {
+            for x in 8..12 {
+                image.put_pixel(x, y, image::Rgb([0xea, 0xff, 0x65]));
+            }
+        }
+        for y in 7..13 {
+            for x in 7..13 {
+                let pixel = image.get_pixel(x, y);
+                if pixel.0 == [0xea, 0xff, 0x65] {
+                    continue;
+                }
+                image.put_pixel(x, y, image::Rgb([120, 140, 70]));
+            }
+        }
+        // 点在混色边缘上。
+        let color = pick_stroke_color(&image, 7, 9, 3).expect("应当取到颜色");
+        assert_eq!(color, [0xea, 0xff, 0x65]);
+    }
+
+    #[test]
+    fn pick_returns_none_when_everything_is_out_of_bounds() {
+        let image = image::RgbImage::from_pixel(4, 4, image::Rgb([0, 0, 0]));
+        assert!(pick_stroke_color(&image, -10, -10, 2).is_none());
     }
 }

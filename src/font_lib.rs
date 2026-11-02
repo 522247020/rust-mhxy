@@ -1513,3 +1513,136 @@ mod align_tests {
         assert!(align_chars_to_spans("鬼王", &[]).is_none());
     }
 }
+
+/// 用连通域切字：先找连通的笔画块，再把「横向挨得近」的块并回一个字。
+///
+/// 列投影对中文不可靠：`刻` 的 `亥` 和 `刂` 之间有空隙，会被切成两个字；
+/// 连通域能把它合回来，代价是 `川` 这种左右分开的字也可能被并在一起——
+/// 所以它只做「列投影对不上时」的兜底，不替换默认路径。
+pub fn analyze_components(gray: &GrayImage, cfg: MatchConfig) -> Vec<GlyphBox> {
+    let (width, height) = (gray.width() as usize, gray.height() as usize);
+    if width == 0 || height == 0 {
+        return Vec::new();
+    }
+    let ink: Vec<bool> = gray.pixels().map(|pixel| pixel[0] < 128).collect();
+
+    // 1) 4 连通域标记（显式栈，避免深递归）。
+    let mut labels = vec![0u32; width * height];
+    let mut boxes: Vec<(u32, u32, u32, u32)> = Vec::new();
+    let mut stack: Vec<usize> = Vec::new();
+    for start in 0..ink.len() {
+        if !ink[start] || labels[start] != 0 {
+            continue;
+        }
+        let id = boxes.len() as u32 + 1;
+        let (mut x0, mut y0, mut x1, mut y1) = (usize::MAX, usize::MAX, 0usize, 0usize);
+        labels[start] = id;
+        stack.push(start);
+        while let Some(index) = stack.pop() {
+            let (x, y) = (index % width, index / width);
+            x0 = x0.min(x);
+            y0 = y0.min(y);
+            x1 = x1.max(x + 1);
+            y1 = y1.max(y + 1);
+            for (dx, dy) in [(-1i32, 0i32), (1, 0), (0, -1), (0, 1)] {
+                let nx = x as i32 + dx;
+                let ny = y as i32 + dy;
+                if nx < 0 || ny < 0 || nx >= width as i32 || ny >= height as i32 {
+                    continue;
+                }
+                let next = ny as usize * width + nx as usize;
+                if ink[next] && labels[next] == 0 {
+                    labels[next] = id;
+                    stack.push(next);
+                }
+            }
+        }
+        boxes.push((x0 as u32, y0 as u32, x1 as u32, y1 as u32));
+    }
+    if boxes.is_empty() {
+        return Vec::new();
+    }
+
+    // 2) 丢掉噪点（太小、太矮的块）。
+    let max_height = boxes
+        .iter()
+        .map(|(_, y0, _, y1)| y1 - y0)
+        .max()
+        .unwrap_or(1) as f32;
+    let mut parts: Vec<(u32, u32, u32, u32)> = boxes
+        .into_iter()
+        .filter(|(x0, y0, x1, y1)| {
+            let (w, h) = (x1 - x0, y1 - y0);
+            w * h >= 3 && (h as f32) >= max_height * 0.15
+        })
+        .collect();
+    if parts.is_empty() {
+        return Vec::new();
+    }
+
+    // 3) 按 x 排序后合并「挨得近」的块（间隙 ≤ gap_merge + 1 视为同一个字）。
+    parts.sort_by_key(|(x0, _, _, _)| *x0);
+    let merge_gap = cfg.gap_merge.max(1) + 1;
+    let mut groups: Vec<(u32, u32, u32, u32)> = Vec::new();
+    for (x0, y0, x1, y1) in parts {
+        match groups.last_mut() {
+            Some(group) if x0 <= group.2 + merge_gap => {
+                group.1 = group.1.min(y0);
+                group.2 = group.2.max(x1);
+                group.3 = group.3.max(y1);
+            }
+            _ => groups.push((x0, y0, x1, y1)),
+        }
+    }
+
+    // 4) 行高取所有组的外包络，保证逗号/句点的垂直位置可区分。
+    let line_top = groups.iter().map(|group| group.1).min().unwrap_or(0);
+    let line_bottom = groups
+        .iter()
+        .map(|group| group.3)
+        .max()
+        .unwrap_or(height as u32);
+    groups
+        .into_iter()
+        .map(|(x0, _, x1, _)| GlyphBox {
+            span: Span { x0, x1 },
+            top: line_top,
+            bottom: line_bottom,
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod component_tests {
+    use super::fixture::render;
+    use super::*;
+
+    /// 一顿画一个「拆开的字」：左右两块之间留 2px 空隙，列投影会切成两半，
+    /// 连通域兜底应当合并成一个字。
+    #[test]
+    fn merges_split_char_components() {
+        let mut gray = GrayImage::from_pixel(60, 20, Luma([255]));
+        for y in 4..16 {
+            for x in 10..14 {
+                gray.put_pixel(x, y, Luma([0]));
+            }
+            for x in 16..20 {
+                gray.put_pixel(x, y, Luma([0]));
+            }
+        }
+        let cfg = MatchConfig::default();
+        let projected = analyze(&gray, cfg);
+        assert_eq!(projected.len(), 2, "列投影会切成两块");
+        let merged = analyze_components(&gray, cfg);
+        assert_eq!(merged.len(), 1, "连通域兜底应当并回一个字");
+    }
+
+    #[test]
+    fn components_split_separate_digits() {
+        // 两个字之间留 6px：连通域要能分开，别把整行并成一个。
+        let gray = binarize(&render("38", 5, 2));
+        let cfg = MatchConfig::default();
+        let groups = analyze_components(&gray, cfg);
+        assert_eq!(groups.len(), 2, "{groups:?}");
+    }
+}
