@@ -79,6 +79,7 @@ fn usage() {
   font-tool pick    [--window 梦幻西游] [--out <校验小图.png>] [--write-config]
   font-tool crop    --image <大图.png> --crop x,y,w,h --out <小图.png>
   font-tool info    --lib <字库.json>
+  font-tool verify  --lib <字库.json> [--frames 6] [--interval 900]
   font-tool sheet   --lib <字库.json> --out <对照图.png> [--scale 3]
   font-tool region  --region 左,上,右,下 [--size 1218x994] [--config <config.json>]
                     [--window 梦幻西游] [--dry-run]
@@ -124,6 +125,7 @@ fn main() {
         Some("crop") => crop_image(&args[1..]),
         Some("region") => region(&args[1..]),
         Some("info") => info(&args[1..]),
+        Some("verify") => verify(&args[1..]),
         Some("sheet") => sheet(&args[1..]),
         Some("align") => align(&args[1..]),
         Some("snap") => snap(&args[1..]),
@@ -992,6 +994,113 @@ fn align(args: &[String]) -> Result<(), String> {
             }
         }
         None => println!("对齐不上：「{text}」"),
+    }
+    Ok(())
+}
+
+/// 字库自测：按当前区域抓 N 帧，对比「字库读出的坐标」和「OCR 认出的坐标」。
+///
+/// 这是判断字库到底有没有用的唯一可靠办法：一致率高就说明它认的数字是对的，
+/// 也就能在运行时替换 OCR 的错读；一致率低就别开复核开关。
+fn verify(args: &[String]) -> Result<(), String> {
+    let flags = parse_flags(args);
+    let lib_path: PathBuf = required(&flags, "lib")?.into();
+    let lib = GlyphLib::load(&lib_path)?;
+    if lib.is_empty() {
+        return Err(format!("字库 {} 是空的", lib_path.display()));
+    }
+    let frames: u32 = number(&flags, "frames", 6)?;
+    let interval_ms: u64 = number(&flags, "interval", 900)?;
+    let plan = CapturePlan::prepare(&flags)?;
+    println!("{}｜字库 {} 个字模", plan.describe(), lib.len());
+
+    let cfg = MatchConfig::default();
+    let (mut read_ok, mut same, mut total) = (0u32, 0u32, 0u32);
+    let mut examples: Vec<String> = Vec::new();
+    for frame in 0..frames {
+        if frame > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(interval_ms));
+        }
+        let panel = plan.grab()?;
+        let ocr = ocr::recognize_panel(&panel, plan.high_recall)?;
+        let mut frame_reads = 0;
+        for region in &ocr.regions {
+            let Some(shape) = coord_fix::coordinate_shape(&region.text) else {
+                continue;
+            };
+            let ocr_coord: String = region
+                .text
+                .chars()
+                .skip(shape.start)
+                .take(shape.len())
+                .collect();
+            let Some((x, y, width, height)) = coord_fix::padded_box(region, 2, &panel) else {
+                continue;
+            };
+            let Ok(crop) = font_lib::crop(&panel, x, y, width, height) else {
+                continue;
+            };
+            let gray = font_lib::binarize(&crop);
+            let runs = font_lib::read_narrow_runs(&gray, &lib, cfg);
+            let lib_coord = runs
+                .iter()
+                .map(|run| run.iter().map(|m| m.label.as_str()).collect::<String>())
+                .find(|text| {
+                    let chars = text.chars().count();
+                    coord_fix::coordinate_shape(text) == Some(0..chars)
+                });
+            total += 1;
+            match lib_coord {
+                Some(lib_coord) => {
+                    read_ok += 1;
+                    frame_reads += 1;
+                    if lib_coord == ocr_coord {
+                        same += 1;
+                    } else if examples.len() < 8 {
+                        examples.push(format!("OCR「{ocr_coord}」 vs 字库「{lib_coord}」"));
+                    }
+                }
+                None => {
+                    if examples.len() < 8 {
+                        let saw: Vec<String> = runs
+                            .iter()
+                            .map(|run| {
+                                format!(
+                                    "「{}」",
+                                    run.iter().map(|m| m.label.as_str()).collect::<String>()
+                                )
+                            })
+                            .collect();
+                        examples.push(format!(
+                            "OCR「{ocr_coord}」→ 字库读到 {}（不成坐标）",
+                            if saw.is_empty() {
+                                "空".to_string()
+                            } else {
+                                saw.join(" ")
+                            }
+                        ));
+                    }
+                }
+            }
+        }
+        println!(
+            "第 {}/{} 帧：OCR 坐标段 {} 个，字库读出 {} 个",
+            frame + 1,
+            frames,
+            total,
+            frame_reads
+        );
+    }
+    if total == 0 {
+        println!("没有任何一帧出现坐标形状的文字：区域不对，或任务追踪没显示带坐标的任务");
+        return Ok(());
+    }
+    println!(
+        "\n合计：坐标段 {total} 个，字库读出 {read_ok} 个，与 OCR 一致 {same} 个（{:.0}%）",
+        same as f32 * 100.0 / total as f32
+    );
+    for example in examples {
+        println!("  例：{example}");
     }
     Ok(())
 }

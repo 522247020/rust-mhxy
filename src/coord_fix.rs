@@ -149,6 +149,11 @@ pub fn correct(
         let Some(read) = read else {
             continue;
         };
+        // 字数必须与 OCR 原来那段一致：只修「认错一位」，不允许凭空加减字符。
+        // 字库一旦有脏模板，这条护栏能挡住「595，115 → 919,15」这种改写。
+        if read.chars().count() != local.len() {
+            continue;
+        }
         let before: String = region
             .text
             .chars()
@@ -416,5 +421,52 @@ mod tests {
         let edits = vec![(2..7, "79,26".to_string()), (9..14, "31,45".to_string())];
         let text: String = chars.into_iter().collect();
         assert_eq!(apply_edits(&text, edits), "aa79,26bb31,45cc");
+    }
+}
+
+#[cfg(test)]
+mod length_guard_tests {
+    use super::*;
+    use crate::font_lib::{binarize, build_from_lines, fixture, DEFAULT_CELL_H, DEFAULT_CELL_W};
+
+    /// 字库读出来的坐标长度和 OCR 那段不一致时，绝不能替换
+    /// （否则脏模板会把「595，115」改成「919,15」这种更糟的结果）。
+    #[test]
+    fn refuses_replacement_when_length_differs() {
+        // 字库只学了 0-9，用「79,26」建库。
+        let samples = vec![(
+            "0123456789.,".to_string(),
+            binarize(&fixture::render("0123456789.,", 4, 1)),
+        )];
+        let (lib, _) = build_from_lines(
+            DEFAULT_CELL_W,
+            DEFAULT_CELL_H,
+            &samples,
+            MatchConfig::default(),
+        );
+        // 面板上画的是「12,34」（5 个字符），OCR 却说成「12,3」（4 个字符）。
+        let line = fixture::render("12,34", 5, 1);
+        let mut panel = image::RgbImage::from_pixel(240, 60, image::Rgb([255, 255, 255]));
+        image::imageops::overlay(&mut panel, &line, 10, 10);
+        let region = crate::ocr::OcrRegion {
+            text: "12,3".into(),
+            score: 0.9,
+            left: 10.0,
+            top: 10.0,
+            right: 10.0 + line.width() as f32,
+            bottom: 10.0 + line.height() as f32,
+            range: 0..4,
+        };
+        let text = "坐标12,3处".to_string();
+        let (fixed, fixes) = correct(
+            &panel,
+            &text,
+            &[region],
+            &lib,
+            DEFAULT_MATCH,
+            DEFAULT_PADDING,
+        );
+        assert_eq!(fixed, text, "长度不一致时不该改");
+        assert!(fixes.is_empty());
     }
 }
