@@ -439,6 +439,11 @@ struct Preview {
     cell_textures: Vec<egui::TextureHandle>,
     /// 用字库「只认窄字形」读出来的数字串（空=这个面板读不出坐标）。
     narrow_runs: Vec<String>,
+    /// 预处理后的面板和二值图：点选建库要按坐标取图。
+    panel: image::RgbImage,
+    gray: image::GrayImage,
+    /// 切出来的字形框（预览上画出来，点一下就能选）。
+    boxes: Vec<font_lib::GlyphBox>,
     ocr: String,
 }
 
@@ -456,6 +461,9 @@ impl Preview {
             cells: Vec::new(),
             cell_textures: Vec::new(),
             narrow_runs: Vec::new(),
+            panel: image::RgbImage::new(1, 1),
+            gray: image::GrayImage::new(1, 1),
+            boxes: Vec::new(),
             image,
             ocr,
         };
@@ -478,6 +486,9 @@ impl Preview {
         let gray = font_lib::binarize(&panel);
         self.binary_texture = texture_of_gray(ctx, "preview-binary", &gray);
         self.cells = cells_of(&gray);
+        self.boxes = font_lib::analyze_components(&gray, font_lib::MatchConfig::default());
+        self.panel = panel;
+        self.gray = gray;
         self.cell_textures = self
             .cells
             .iter()
@@ -535,6 +546,14 @@ struct Studio {
     only_coordinate: bool,
     /// 预览显示二值化结果（看文字有没有被干净地提出来）。
     show_binary: bool,
+    /// 预览图的鼠标行为：点字形加样本，还是点图取色。
+    preview_mode: PreviewMode,
+    /// 当前选中的字形框（点选建库用）。
+    pending_box: Option<usize>,
+    /// 给选中字形打标签的输入框。
+    label_input: String,
+    /// 下一次绘制时把焦点给标签输入框。
+    focus_label: bool,
     lib_dirty: bool,
     seed_existing: bool,
     selected_glyph: Option<usize>,
@@ -577,6 +596,10 @@ impl Studio {
             glyph_textures: Vec::new(),
             only_coordinate: true,
             show_binary: false,
+            preview_mode: PreviewMode::Label,
+            pending_box: None,
+            label_input: String::new(),
+            focus_label: false,
             lib_dirty: false,
             seed_existing: true,
             selected_glyph: None,
@@ -1420,14 +1443,18 @@ impl Studio {
             );
         }
     }
-
     fn preview_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let mut picked_color: Option<[u8; 3]> = None;
+        let mut clicked_box: Option<usize> = None;
         if let Some(preview) = &self.preview {
             ui.horizontal(|ui| {
                 ui.checkbox(&mut self.show_binary, "显示二值化");
+                ui.separator();
+                ui.label("点击预览图：");
+                ui.radio_value(&mut self.preview_mode, PreviewMode::Label, "标字（建库）");
+                ui.radio_value(&mut self.preview_mode, PreviewMode::PickColor, "取色");
                 ui.label(
-                    egui::RichText::new("在图上点一下可以取文字颜色（自动勾选颜色提取）")
+                    egui::RichText::new("标字模式：点一个字形框，输入字符就能加进字库")
                         .small()
                         .weak(),
                 );
@@ -1447,13 +1474,48 @@ impl Studio {
                 egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                 egui::Color32::WHITE,
             );
+            // 把切出来的字形框画出来：点选建库全靠这个。
+            for (index, b) in preview.boxes.iter().enumerate() {
+                let box_rect = egui::Rect::from_min_max(
+                    rect.min + egui::vec2(b.span.x0 as f32 * scale, b.top as f32 * scale),
+                    rect.min + egui::vec2(b.span.x1 as f32 * scale, b.bottom as f32 * scale),
+                );
+                let color = if self.pending_box == Some(index) {
+                    WARN
+                } else {
+                    egui::Color32::from_rgba_unmultiplied(0x4c, 0xd9, 0x8a, 90)
+                };
+                ui.painter().rect_stroke(
+                    box_rect,
+                    0.0,
+                    egui::Stroke::new(1.0, color),
+                    egui::StrokeKind::Outside,
+                );
+            }
             if response.clicked() {
                 if let Some(pos) = response.interact_pointer_pos() {
-                    let x = ((pos.x - rect.min.x) / scale) as i32;
-                    let y = ((pos.y - rect.min.y) / scale) as i32;
-                    // 点到的往往是有抗锯齿的边缘像素，直接取会得到一个「半透明的颜色」，
-                    // 提取出来只剩细边。所以在附近找笔画**核心**：最饱和、最亮的那个像素。
-                    picked_color = pick_stroke_color(&preview.image, x, y, 3);
+                    let x = (pos.x - rect.min.x) / scale;
+                    let y = (pos.y - rect.min.y) / scale;
+                    match self.preview_mode {
+                        PreviewMode::PickColor => {
+                            picked_color = pick_stroke_color(&preview.image, x as i32, y as i32, 3);
+                        }
+                        PreviewMode::Label => {
+                            // 命中最小的那个框（叠在一起时选更紧的）。
+                            clicked_box = preview
+                                .boxes
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, b)| {
+                                    x as u32 >= b.span.x0
+                                        && (x as u32) < b.span.x1
+                                        && y >= b.top as f32
+                                        && (y as u32) < b.bottom
+                                })
+                                .min_by_key(|(_, b)| b.span.width())
+                                .map(|(index, _)| index);
+                        }
+                    }
                 }
             }
             ui.add_space(6.0);
@@ -1509,6 +1571,53 @@ impl Studio {
             }
         } else {
             ui.label("还没有预览：左边点「截图预览」抓一张看看区域和预处理对不对。");
+        }
+        if let Some(index) = clicked_box {
+            self.pending_box = Some(index);
+            self.focus_label = true;
+            if let Some(preview) = &self.preview {
+                if let Some(b) = preview.boxes.get(index) {
+                    self.log(format!(
+                        "选中第 {index} 个字形（宽 {}px）：输入字符后点「加入字库」",
+                        b.span.width()
+                    ));
+                }
+            }
+        }
+        // 选中字形后：输入一个字符就能加进字库（点选建库）。
+        if let Some(index) = self.pending_box {
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(format!("第 {index} 个字形 → 标签")).strong());
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut self.label_input)
+                        .desired_width(36.0)
+                        .hint_text("?"),
+                );
+                if self.focus_label {
+                    response.request_focus();
+                    self.focus_label = false;
+                }
+                let typed = !self.label_input.trim().is_empty();
+                let submit = ui
+                    .add_enabled(typed, egui::Button::new("加入字库"))
+                    .clicked()
+                    || (typed && ui.input(|input| input.key_pressed(egui::Key::Enter)));
+                if ui.button("取消").clicked() {
+                    self.pending_box = None;
+                }
+                if submit {
+                    let label: String = self.label_input.trim().chars().take(1).collect();
+                    self.add_labeled_sample(ctx, index, &label);
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "标签框会保留上一次的输入：连着标同一个字的多种写法时，点框 → 回车即可",
+                )
+                .small()
+                .weak(),
+            );
         }
         if let Some(color) = picked_color {
             self.color = color;
@@ -2073,5 +2182,66 @@ impl Studio {
             preview.narrow_runs = runs;
         }
         let _ = ctx;
+    }
+}
+
+/// 预览图的鼠标行为。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PreviewMode {
+    /// 点字形框 → 选中 → 打一个字加进字库（点选建库）。
+    Label,
+    /// 点图 → 取文字颜色（自动勾颜色提取）。
+    PickColor,
+}
+
+impl Studio {
+    /// 把预览里第 `index` 个字形按用户给的标签加进字库（点选建库）。
+    ///
+    /// 这是唯一不靠猜的建库方式：切字框来自连通域，标签来自用户亲手输入。
+    fn add_labeled_sample(&mut self, ctx: &egui::Context, index: usize, label: &str) {
+        let label: String = label.trim().chars().take(1).collect();
+        if label.is_empty() {
+            return;
+        }
+        let Some(preview) = &self.preview else {
+            return;
+        };
+        let Some(b) = preview.boxes.get(index).copied() else {
+            return;
+        };
+        let cell = font_lib::cell_of(
+            &preview.gray,
+            &b,
+            font_lib::DEFAULT_CELL_W,
+            font_lib::DEFAULT_CELL_H,
+        );
+        // 已经有一模一样的就不重复加，避免连点把同一形态刷成几十份。
+        let same = self
+            .lib
+            .glyphs
+            .iter()
+            .any(|glyph| glyph.label == label && glyph.pixels == cell);
+        if same {
+            self.log(format!("「{label}」这个字形已经在字库里了"));
+            return;
+        }
+        self.lib.glyphs.push(font_lib::Glyph {
+            label: label.clone(),
+            pixels: cell,
+        });
+        self.bump_lib_revision();
+        self.lib_dirty = true;
+        self.pending_box = None;
+        let missing = font_lib::missing_coordinate_labels(&self.lib);
+        if missing.is_empty() {
+            self.log(format!("加入「{label}」：坐标字符齐了，可以点「保存」"));
+        } else {
+            self.log(format!(
+                "加入「{label}」：还缺 {}",
+                missing.iter().collect::<String>()
+            ));
+        }
+        // 整了样本，字库变了，顺手重算一次窄字形读出结果。
+        self.refresh_narrow_runs(ctx);
     }
 }
