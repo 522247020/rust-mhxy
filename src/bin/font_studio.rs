@@ -183,26 +183,25 @@ fn spawn_job(plan: JobPlan, ctx: egui::Context) -> Receiver<JobMsg> {
             if index > 0 {
                 std::thread::sleep(Duration::from_millis(plan.interval_ms));
             }
-            let panel = (|| -> Result<image::RgbImage, String> {
+            let raw = (|| -> Result<image::RgbImage, String> {
                 let full = capture::capture_client(plan.handle, plan.region)?;
-                let mut panel = preprocess::apply(
-                    capture::crop_task_region(&full, plan.region),
-                    plan.pipeline,
-                    plan.color,
-                    plan.tolerance,
-                );
-                if plan.upscale > 1 {
-                    panel = preprocess::upscale(&panel, plan.upscale);
-                }
-                Ok(panel)
+                Ok(capture::crop_task_region(&full, plan.region))
             })();
-            let panel = match panel {
-                Ok(panel) => panel,
+            let raw = match raw {
+                Ok(raw) => raw,
                 Err(err) => {
                     let _ = tx.send(JobMsg::Failed(err));
                     return;
                 }
             };
+            // 界面收到的是原图，预处理由界面按当前参数做：调容差/取色能立刻重算。
+            let panel = process_panel(
+                &raw,
+                plan.pipeline,
+                plan.color,
+                plan.tolerance,
+                plan.upscale,
+            );
             let ocr = match ocr::recognize_panel(&panel, plan.high_recall) {
                 Ok(ocr) => ocr,
                 Err(err) => {
@@ -304,20 +303,11 @@ fn spawn_accumulate(
             attempts += 1;
             let captured = (|| -> Result<image::RgbImage, String> {
                 let full = capture::capture_client(plan.handle, plan.region)?;
-                let mut panel = preprocess::apply(
-                    capture::crop_task_region(&full, plan.region),
-                    plan.pipeline,
-                    plan.color,
-                    plan.tolerance,
-                );
-                if plan.upscale > 1 {
-                    panel = preprocess::upscale(&panel, plan.upscale);
-                }
-                Ok(panel)
+                Ok(capture::crop_task_region(&full, plan.region))
             })();
 
-            let panel = match captured {
-                Ok(panel) => panel,
+            let raw = match captured {
+                Ok(raw) => raw,
                 Err(err) => {
                     let _ = tx.send(JobMsg::Progress {
                         attempts,
@@ -338,6 +328,13 @@ fn spawn_accumulate(
                 }
             };
 
+            let panel = process_panel(
+                &raw,
+                plan.pipeline,
+                plan.color,
+                plan.tolerance,
+                plan.upscale,
+            );
             let hash = panel_hash(&panel);
             if hash == last_hash {
                 let _ = tx.send(JobMsg::Progress {
@@ -431,7 +428,7 @@ fn spawn_accumulate(
 // ---------------------------------------------------------------- 界面状态
 
 struct Preview {
-    /// 原始面板（点图取色、重新二值化都要用）。
+    /// **原始**裁剪图（未预处理、未放大）：改参数时拿它重算。
     image: std::sync::Arc<image::RgbImage>,
     texture: egui::TextureHandle,
     binary_texture: egui::TextureHandle,
@@ -442,25 +439,39 @@ struct Preview {
 }
 
 impl Preview {
-    fn new(ctx: &egui::Context, panel: image::RgbImage, ocr: String) -> Self {
-        let image = std::sync::Arc::new(panel);
-        let texture = texture_of(ctx, "preview", &image);
-        let gray = font_lib::binarize(&image);
-        let binary_texture = texture_of_gray(ctx, "preview-binary", &gray);
-        let cells = cells_of(&gray);
-        Self {
-            size: egui::vec2(image.width() as f32, image.height() as f32),
-            image,
-            texture,
-            binary_texture,
-            cells,
-            ocr,
-        }
+    fn new(ctx: &egui::Context, raw: image::RgbImage, ocr: String) -> Self {
+        Self::from_raw(ctx, std::sync::Arc::new(raw), ocr)
     }
 
-    /// 画面变了就一起刷新两张图。
-    fn update(&mut self, ctx: &egui::Context, panel: image::RgbImage, ocr: String) {
-        *self = Self::new(ctx, panel, ocr);
+    /// 已经拿到 `Arc` 时直接用，避免多一次拷贝。
+    fn from_raw(ctx: &egui::Context, image: std::sync::Arc<image::RgbImage>, ocr: String) -> Self {
+        let mut preview = Self {
+            size: egui::vec2(1.0, 1.0),
+            texture: texture_of(ctx, "preview", &image),
+            binary_texture: texture_of(ctx, "preview-binary", &image),
+            cells: Vec::new(),
+            image,
+            ocr,
+        };
+        preview.reprocess(ctx, preprocess::Pipeline::default(), [0, 0, 0], 0, 1);
+        preview
+    }
+
+    /// 按给定参数把**原图**重新算一遍：贴图、二值图、切字。
+    fn reprocess(
+        &mut self,
+        ctx: &egui::Context,
+        pipeline: preprocess::Pipeline,
+        color: [u8; 3],
+        tolerance: u8,
+        upscale: u32,
+    ) {
+        let panel = process_panel(&self.image, pipeline, color, tolerance, upscale);
+        self.texture = texture_of(ctx, "preview", &panel);
+        self.size = egui::vec2(panel.width() as f32, panel.height() as f32);
+        let gray = font_lib::binarize(&panel);
+        self.binary_texture = texture_of_gray(ctx, "preview-binary", &gray);
+        self.cells = cells_of(&gray);
     }
 }
 
@@ -661,30 +672,22 @@ impl Studio {
             self.log("还没有选中窗口，点「刷新窗口」");
             return;
         };
-        let captured = (|| -> Result<image::RgbImage, String> {
+        // 只截原图：预处理交给 set_preview 按当前参数算，之后调参不用重截。
+        let raw = (|| -> Result<image::RgbImage, String> {
             let full = capture::capture_client(window.handle, self.region)?;
-            let mut panel = preprocess::apply(
-                capture::crop_task_region(&full, self.region),
-                self.pipeline(),
-                self.color,
-                self.tolerance,
-            );
-            if self.upscale > 1 {
-                panel = preprocess::upscale(&panel, self.upscale);
-            }
-            Ok(panel)
+            Ok(capture::crop_task_region(&full, self.region))
         })();
-        match captured {
-            Ok(panel) => {
-                let gray = font_lib::binarize(&panel);
-                let cells = cells_of(&gray);
-                self.log(format!(
-                    "预览：{}x{}，切出 {} 个字模",
-                    panel.width(),
-                    panel.height(),
-                    cells.len()
-                ));
-                self.preview = Some(Preview::new(ctx, panel, String::new()));
+        match raw {
+            Ok(raw) => {
+                self.set_preview(ctx, raw, String::new());
+                if let Some(preview) = &self.preview {
+                    self.log(format!(
+                        "预览：{}x{}，切出 {} 个字模（每个格子应该正好一个字）",
+                        preview.size.x as u32,
+                        preview.size.y as u32,
+                        preview.cells.len()
+                    ));
+                }
             }
             Err(err) => self.log(err),
         }
@@ -790,10 +793,7 @@ impl Studio {
                         "第 {index}/{total} 帧：采到 {learned} 个字模｜OCR {}",
                         if ocr.is_empty() { "无文字" } else { &ocr }
                     ));
-                    match &mut self.preview {
-                        Some(preview) => preview.update(ctx, panel, ocr),
-                        None => self.preview = Some(Preview::new(ctx, panel, ocr)),
-                    }
+                    self.set_preview(ctx, panel, ocr);
                 }
                 JobMsg::Done {
                     lib,
@@ -954,10 +954,7 @@ impl Studio {
                         ));
                     }
                     if let Some(panel) = panel {
-                        match &mut self.preview {
-                            Some(preview) => preview.update(ctx, panel, ocr),
-                            None => self.preview = Some(Preview::new(ctx, panel, ocr)),
-                        }
+                        self.set_preview(ctx, panel, ocr);
                     }
                 }
                 JobMsg::AccStopped {
@@ -1163,8 +1160,16 @@ impl Studio {
         });
         ui.horizontal(|ui| {
             ui.label("文字颜色");
+            // 颜色块：点它就能直接调色，取色结果也在这里看得到。
+            if ui.color_edit_button_srgb(&mut self.color).changed() {
+                self.color_hex = format!(
+                    "#{:02x}{:02x}{:02x}",
+                    self.color[0], self.color[1], self.color[2]
+                );
+                changed = true;
+            }
             if ui
-                .add(egui::TextEdit::singleline(&mut self.color_hex).desired_width(80.0))
+                .add(egui::TextEdit::singleline(&mut self.color_hex).desired_width(72.0))
                 .changed()
             {
                 match gate::parse_hex(&self.color_hex) {
@@ -1201,7 +1206,13 @@ impl Studio {
             );
         });
         if changed {
-            self.log(format!("预处理：{}", self.pipeline().summary()));
+            // 改参数立刻重算预览：同一张原图，不用回游戏重截。
+            self.reprocess_preview(ctx);
+            let cells = self.preview.as_ref().map(|p| p.cells.len()).unwrap_or(0);
+            self.log(format!(
+                "预处理：{}｜切出 {cells} 个字模",
+                self.pipeline().summary()
+            ));
         }
 
         ui.add_space(8.0);
@@ -1424,11 +1435,14 @@ impl Studio {
         if let Some(color) = picked_color {
             self.color = color;
             self.color_hex = format!("#{:02x}{:02x}{:02x}", color[0], color[1], color[2]);
-            if !self.color_key {
-                self.color_key = true;
-                self.log("已勾选「颜色提取」，点「截图预览」看效果（容差可调）");
-            }
-            self.log(format!("取色：{}", self.color_hex));
+            // 取色后直接勾上颜色提取并重算预览：点了就要能看见变化。
+            self.color_key = true;
+            self.reprocess_preview(ctx);
+            let cells = self.preview.as_ref().map(|p| p.cells.len()).unwrap_or(0);
+            self.log(format!(
+                "取色 {}，已勾选颜色提取｜切出 {cells} 个字模",
+                self.color_hex
+            ));
         }
         ui.separator();
         ui.horizontal(|ui| {
@@ -1769,4 +1783,84 @@ fn texture_of_gray(
         &rgba,
     );
     ctx.load_texture(name, color, egui::TextureOptions::NEAREST)
+}
+
+/// 把「原始裁剪图」按当前预处理参数变成送 OCR / 预览的图。
+///
+/// 单独拎出来是为了让界面能拿同一张原图反复重算：调容差、点图取色之后
+/// 立刻能看到效果，不用再回游戏截一次。
+fn process_panel(
+    raw: &image::RgbImage,
+    pipeline: preprocess::Pipeline,
+    color: [u8; 3],
+    tolerance: u8,
+    upscale: u32,
+) -> image::RgbImage {
+    let mut panel = preprocess::apply(raw.clone(), pipeline, color, tolerance);
+    if upscale > 1 {
+        panel = preprocess::upscale(&panel, upscale);
+    }
+    panel
+}
+
+impl Studio {
+    /// 用一帧原图刷新预览：预处理按界面**当前**参数算，调参能立刻重算。
+    fn set_preview(&mut self, ctx: &egui::Context, raw: image::RgbImage, ocr: String) {
+        let (pipeline, color, tolerance, upscale) =
+            (self.pipeline(), self.color, self.tolerance, self.upscale);
+        let mut preview = Preview::new(ctx, raw, ocr);
+        preview.reprocess(ctx, pipeline, color, tolerance, upscale);
+        self.preview = Some(preview);
+    }
+
+    /// 预处理参数变了：拿同一张原图重算，不用回游戏重截。
+    fn reprocess_preview(&mut self, ctx: &egui::Context) {
+        let (pipeline, color, tolerance, upscale) =
+            (self.pipeline(), self.color, self.tolerance, self.upscale);
+        if let Some(preview) = &mut self.preview {
+            preview.reprocess(ctx, pipeline, color, tolerance, upscale);
+        }
+    }
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::*;
+
+    /// 预览必须能从**原图**反复重算：取色/改预处理后不用回游戏重截。
+    #[test]
+    fn preview_reprocesses_from_raw_image() {
+        let ctx = egui::Context::default();
+        let mut raw = image::RgbImage::from_pixel(80, 30, image::Rgb([20, 60, 20]));
+        // 画两个「文字」像素块（亮黄），模拟任务文字。
+        for y in 10..20 {
+            for x in 5..15 {
+                raw.put_pixel(x, y, image::Rgb([0xea, 0xff, 0x65]));
+            }
+        }
+        let mut preview = Preview::new(&ctx, raw, String::new());
+        // 默认（无预处理，1x）：尺寸就是原图。
+        assert_eq!(preview.size, egui::vec2(80.0, 30.0));
+
+        // 勾颜色提取 + 2x 放大：尺寸翻倍，且能切出东西。
+        let pipeline = preprocess::Pipeline {
+            color_key: true,
+            binarize: true,
+            ..Default::default()
+        };
+        preview.reprocess(&ctx, pipeline, [0xea, 0xff, 0x65], 24, 2);
+        assert_eq!(preview.size, egui::vec2(160.0, 60.0));
+        assert!(!preview.cells.is_empty(), "应当切出字模");
+
+        // 换回不处理：尺寸回到原图，说明确实是从原图重算的。
+        preview.reprocess(&ctx, preprocess::Pipeline::default(), [0, 0, 0], 0, 1);
+        assert_eq!(preview.size, egui::vec2(80.0, 30.0));
+    }
+
+    #[test]
+    fn process_panel_applies_pipeline_and_upscale() {
+        let raw = image::RgbImage::from_pixel(10, 10, image::Rgb([9, 9, 9]));
+        let out = process_panel(&raw, preprocess::Pipeline::default(), [0, 0, 0], 0, 3);
+        assert_eq!((out.width(), out.height()), (30, 30));
+    }
 }
