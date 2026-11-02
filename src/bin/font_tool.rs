@@ -30,6 +30,11 @@ mod gate;
 mod ocr;
 #[path = "../preprocess.rs"]
 mod preprocess;
+/// 和 `font-studio` 共用的窗口 / 选区 / 配置逻辑。
+#[path = "../tool_shared.rs"]
+mod shared;
+
+use shared::*;
 
 /// `ocr.rs` 只用它定位随包的 PP-OCR 模型；这里给一个最小实现，
 /// 免得为了一个命令行工具把整个 config 模块链都编译进来。
@@ -137,21 +142,6 @@ fn main() {
     }
 }
 
-/// 把本进程设成 per-monitor-v2 DPI 感知，和主程序一致。
-/// 失败（已经被框架设置过、旧系统不支持）就当没这回事，不能因为一个提示失败就不干活。
-#[cfg(windows)]
-fn enable_dpi_awareness() {
-    use windows::Win32::UI::HiDpi::{
-        SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
-    };
-    unsafe {
-        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-    }
-}
-
-#[cfg(not(windows))]
-fn enable_dpi_awareness() {}
-
 // ------------------------------------------------------------------ 参数解析
 
 fn parse_flags(args: &[String]) -> HashMap<String, String> {
@@ -222,109 +212,6 @@ fn cell_size(flags: &HashMap<String, String>) -> Result<(u32, u32), String> {
 }
 
 // -------------------------------------------------------------------- 采集
-
-/// `config.json` 里和采集相关的几项。读不出来就用默认值（配置本来也可以没有）。
-struct CaptureDefaults {
-    region: core::TaskRegion,
-    /// 按分辨率保存的识别区域（和主程序一样：1920x1080 一套）。
-    region_presets: HashMap<String, core::TaskRegion>,
-    preprocess: String,
-    color: [u8; 3],
-    tolerance: u8,
-    upscale: u32,
-    high_recall: bool,
-}
-
-impl CaptureDefaults {
-    /// 当前窗口分辨率下该用的区域：优先用分辨率预设，再退到通用区域。
-    fn region_for(&self, size: Option<(u32, u32)>) -> core::TaskRegion {
-        size.and_then(|(width, height)| {
-            self.region_presets
-                .get(&format!("{width}x{height}"))
-                .copied()
-        })
-        .unwrap_or(self.region)
-    }
-}
-
-fn read_capture_defaults() -> CaptureDefaults {
-    let mut defaults = CaptureDefaults {
-        region: core::DEFAULT_TASK_REGION,
-        region_presets: HashMap::new(),
-        preprocess: "off".into(),
-        color: [0xea, 0xff, 0x65],
-        tolerance: 24,
-        upscale: 2,
-        high_recall: true,
-    };
-    let path = config_path();
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return defaults;
-    };
-    // 配置是 json5（带注释、尾逗号），所以走 json5 而不是 serde_json。
-    let Ok(value) = json5::from_str::<serde_json::Value>(&text) else {
-        eprintln!("提示：{} 解析失败，采集参数用默认值", path.display());
-        return defaults;
-    };
-    if let Some(region) = value
-        .get("ocr/task_region")
-        .and_then(|value| value.as_str())
-        .and_then(core::parse_region)
-    {
-        defaults.region = region;
-    }
-    if let Some(presets) = value
-        .get("ocr/region_presets")
-        .and_then(|value| value.as_object())
-    {
-        for (key, region) in presets {
-            if let Some(region) = region.as_str().and_then(core::parse_region) {
-                defaults.region_presets.insert(key.clone(), region);
-            }
-        }
-    }
-    if let Some(mode) = value.get("ocr/preprocess").and_then(|value| value.as_str()) {
-        defaults.preprocess = mode.to_string();
-    }
-    if let Some(color) = value
-        .get("ocr/preprocess_color")
-        .and_then(|value| value.as_str())
-        .and_then(gate::parse_hex)
-    {
-        defaults.color = color;
-    }
-    if let Some(tolerance) = value
-        .get("ocr/preprocess_tolerance")
-        .and_then(|value| value.as_u64())
-    {
-        defaults.tolerance = tolerance.min(255) as u8;
-    }
-    if let Some(upscale) = value.get("ocr/upscale").and_then(|value| value.as_u64()) {
-        defaults.upscale = (upscale as u32).clamp(1, 3);
-    }
-    if let Some(high_recall) = value
-        .get("ocr/high_recall")
-        .and_then(|value| value.as_bool())
-    {
-        defaults.high_recall = high_recall;
-    }
-    defaults
-}
-
-/// 和主程序同一条规则：优先用当前目录下的 config.json（开发期），否则用 exe 旁边的。
-fn config_path() -> PathBuf {
-    if let Ok(cwd) = std::env::current_dir() {
-        if cwd.join("Cargo.toml").exists() {
-            return cwd.join("config.json");
-        }
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            return dir.join("config.json");
-        }
-    }
-    PathBuf::from("config.json")
-}
 
 /// 一次采集需要的全部参数（窗口 + 区域 + 预处理）。`capture` 和 `snap` 共用。
 struct CapturePlan {
@@ -455,41 +342,6 @@ fn crop_image(args: &[String]) -> Result<(), String> {
 // ------------------------------------------------------------------ 框选取点
 
 /// 整屏截图 + 拖拽框选，算出相对客户区的百分比区域，并当场校验一次。
-/// 一个候选游戏窗口：客户区在屏幕上的位置。
-#[derive(Clone, Debug)]
-struct Candidate {
-    handle: i64,
-    title: String,
-    rect: (i32, i32, u32, u32),
-}
-
-impl Candidate {
-    fn area(&self) -> f32 {
-        self.rect.2 as f32 * self.rect.3 as f32
-    }
-}
-
-/// 选区和哪个窗口重叠最多——不依赖窗口枚举顺序（多开时顺序不可靠）。
-fn best_candidate(candidates: &[Candidate], selection: (f32, f32, f32, f32)) -> Option<&Candidate> {
-    let mut best: Option<(&Candidate, f32)> = None;
-    for candidate in candidates {
-        let (x, y, width, height) = candidate.rect;
-        let left = selection.0.max(x as f32);
-        let top = selection.1.max(y as f32);
-        let right = selection.2.min((x + width as i32) as f32);
-        let bottom = selection.3.min((y + height as i32) as f32);
-        let overlap = (right - left).max(0.0) * (bottom - top).max(0.0);
-        if best.is_none_or(|(_, best_overlap)| overlap > best_overlap) {
-            best = Some((candidate, overlap));
-        }
-    }
-    let selection_area = ((selection.2 - selection.0) * (selection.3 - selection.1)).max(1.0);
-    // 选区至少要有一半落在窗口里，否则说明选到的是别的程序。
-    best.filter(|(_, overlap)| *overlap >= selection_area * 0.5)
-        .map(|(candidate, _)| candidate)
-}
-
-/// 整屏截图 + 拖拽框选，算出相对客户区的百分比区域，并当场校验一次。
 fn pick(args: &[String]) -> Result<(), String> {
     let flags = parse_flags(args);
     let filter = flags.get("window").cloned();
@@ -595,84 +447,6 @@ fn pick(args: &[String]) -> Result<(), String> {
         println!("要直接写进配置加 --write-config；或手动填 config.json 的 \"ocr/task_region\"");
     }
     Ok(())
-}
-
-fn region_from_selection(
-    selection: (f32, f32, f32, f32),
-    client: (i32, i32, u32, u32),
-) -> Result<core::TaskRegion, String> {
-    let (client_x, client_y) = (client.0 as f32, client.1 as f32);
-    let (client_w, client_h) = (client.2 as f32, client.3 as f32);
-    if client_w <= 0.0 || client_h <= 0.0 {
-        return Err("客户区尺寸为 0".into());
-    }
-    let left = ((selection.0 - client_x) / client_w).clamp(0.0, 1.0);
-    let top = ((selection.1 - client_y) / client_h).clamp(0.0, 1.0);
-    let right = ((selection.2 - client_x) / client_w).clamp(0.0, 1.0);
-    let bottom = ((selection.3 - client_y) / client_h).clamp(0.0, 1.0);
-    if right - left < 0.01 || bottom - top < 0.01 {
-        return Err("框太小了：请在图上拖一个大一点的矩形".into());
-    }
-    Ok((left, top, right, bottom))
-}
-
-/// 两张同尺寸图的平均像素差；尺寸差太多就没法比。
-fn mean_abs_diff(a: &image::RgbImage, b: &image::RgbImage) -> Option<f32> {
-    let width = a.width().min(b.width());
-    let height = a.height().min(b.height());
-    if width == 0 || height == 0 {
-        return None;
-    }
-    if a.width().abs_diff(b.width()) > 8 || a.height().abs_diff(b.height()) > 8 {
-        return None;
-    }
-    let mut total = 0f64;
-    let mut count = 0f64;
-    for y in 0..height {
-        for x in 0..width {
-            let pa = a.get_pixel(x, y);
-            let pb = b.get_pixel(x, y);
-            for channel in 0..3 {
-                total += (pa[channel] as f64 - pb[channel] as f64).abs();
-                count += 1.0;
-            }
-        }
-    }
-    (count > 0.0).then(|| (total / count) as f32)
-}
-
-/// 中文字体，让框选窗口的提示不显示成方块。
-fn install_cjk(ctx: &egui::Context) {
-    const CANDIDATES: &[&str] = &[
-        "C:/Windows/Fonts/msyh.ttc",
-        "C:/Windows/Fonts/msyh.ttf",
-        "C:/Windows/Fonts/simhei.ttf",
-        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
-    ];
-    for path in CANDIDATES {
-        let Ok(bytes) = std::fs::read(path) else {
-            continue;
-        };
-        let bytes: &'static [u8] = Box::leak(bytes.into_boxed_slice());
-        let mut fonts = egui::FontDefinitions::default();
-        fonts.font_data.insert(
-            "cjk".to_owned(),
-            std::sync::Arc::new(egui::FontData::from_static(bytes)),
-        );
-        fonts
-            .families
-            .entry(egui::FontFamily::Proportional)
-            .or_default()
-            .insert(0, "cjk".to_owned());
-        fonts
-            .families
-            .entry(egui::FontFamily::Monospace)
-            .or_default()
-            .push("cjk".to_owned());
-        ctx.set_fonts(fonts);
-        return;
-    }
 }
 
 /// 选区：整屏像素矩形 `(x0, y0, x1, y1)`。
@@ -896,114 +670,6 @@ fn run_picker(
     picked
 }
 // -------------------------------------------------------------- 写回 config.json
-
-/// 把区域写回 `config.json`：更新 `ocr/task_region`，并补上当前分辨率的预设。
-/// 改写后会先解析一遍，解析不过就放弃（不碰原文件）。
-fn write_config_region(path: &Path, region: &str, size_key: &str) -> Result<(), String> {
-    let original = std::fs::read_to_string(path)
-        .map_err(|err| format!("读取 {} 失败：{err}", path.display()))?;
-    let mut text = replace_key_value(&original, "ocr/task_region", region);
-    text = patch_preset(&text, size_key, region);
-    if json5::from_str::<serde_json::Value>(&text).is_err() {
-        return Err(format!(
-            "改写后会破坏 {} 的格式，已放弃写入（原文件未动）——请手动把区域填进去",
-            path.display()
-        ));
-    }
-    std::fs::write(path, text).map_err(|err| format!("写入 {} 失败：{err}", path.display()))
-}
-
-/// 把某一行的 `"key": "..."` 值替换掉，保留缩进、注释和行尾逗号。
-fn replace_key_value(text: &str, key: &str, value: &str) -> String {
-    let needle = format!("\"{key}\"");
-    let mut out = String::with_capacity(text.len() + 32);
-    let mut done = false;
-    for line in text.lines() {
-        if !done {
-            if let Some(colon) = line.find(':') {
-                let (head, _) = line.split_at(colon);
-                if head.contains(&needle) {
-                    let indent: String = line.chars().take_while(|ch| ch.is_whitespace()).collect();
-                    let comma = if line.trim_end().ends_with(',') {
-                        ","
-                    } else {
-                        ""
-                    };
-                    out.push_str(&format!("{indent}{needle}: \"{value}\"{comma}\n"));
-                    done = true;
-                    continue;
-                }
-            }
-        }
-        out.push_str(line);
-        out.push('\n');
-    }
-    if !done {
-        // 配置里还没有这个键：插到最后一个 '}' 前面。
-        if let Some(pos) = out.rfind('}') {
-            out.insert_str(pos, &format!("  \"{key}\": \"{value}\",\n"));
-        }
-    }
-    out
-}
-
-/// 在 `ocr/region_presets` 里更新/插入当前分辨率的区域。
-fn patch_preset(text: &str, size_key: &str, value: &str) -> String {
-    let lines: Vec<&str> = text.lines().collect();
-    let Some(header) = lines
-        .iter()
-        .position(|line| line.contains("\"ocr/region_presets\""))
-    else {
-        return text.to_string();
-    };
-    let size_needle = format!("\"{size_key}\"");
-    let mut out: Vec<String> = Vec::with_capacity(lines.len() + 2);
-    let mut finished = false;
-    for (index, line) in lines.iter().enumerate() {
-        if finished {
-            out.push((*line).to_string());
-            continue;
-        }
-        let indent: String = line.chars().take_while(|ch| ch.is_whitespace()).collect();
-        if index == header {
-            // 单行写法 `"ocr/region_presets": {}`：直接在花括号里塞一项。
-            if line.contains("{}") {
-                let filled = format!("{{\n{indent}  {size_needle}: \"{value}\",\n{indent}}}");
-                out.push(line.replacen("{}", &filled, 1));
-                finished = true;
-                continue;
-            }
-            out.push((*line).to_string());
-            continue;
-        }
-        if index > header {
-            // 键已存在：改值。
-            if line.contains(&size_needle) && line.contains(':') {
-                out.push(format!("{indent}{size_needle}: \"{value}\","));
-                finished = true;
-                continue;
-            }
-            // 到了对象结尾还没有这个键：插在它前面。
-            if line.trim_start().starts_with('}') {
-                // 原文件最后一项可能没有逗号，不补就会写出非法 JSON5。
-                if let Some(last) = out.iter_mut().rev().find(|line| !line.trim().is_empty()) {
-                    let trimmed = last.trim_end();
-                    if !trimmed.ends_with(',') && !trimmed.ends_with('{') {
-                        last.push(',');
-                    }
-                }
-                out.push(format!("{indent}  {size_needle}: \"{value}\","));
-                out.push((*line).to_string());
-                finished = true;
-                continue;
-            }
-        }
-        out.push((*line).to_string());
-    }
-    let mut result = out.join("\n");
-    result.push('\n');
-    result
-}
 
 /// 列一下截得到的窗口和它们的客户区坐标（排查「位置不对」时先看这个）。
 fn windows(_args: &[String]) -> Result<(), String> {
@@ -1263,19 +929,16 @@ fn capture_frames(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// 报告坐标字符覆盖情况：缺哪个字直接列出来，比「只有 N 个字模」有用得多。
+/// 把覆盖情况打印出来：齐了就说齐了，缺了就把缺的字符列出来。
 fn report_coverage(lib: &GlyphLib) {
-    let missing = font_lib::missing_coordinate_labels(lib);
-    if missing.is_empty() {
-        println!("覆盖：0-9 和 , . 都有了");
-        return;
+    match coverage_report(lib) {
+        Ok(note) => println!("覆盖：{note}"),
+        Err(missing) => eprintln!(
+            "提醒：还缺这些坐标字符：{missing}\n\
+             采集时任务栏里要有带坐标的任务（抓鬼/鬼王/降妖…），或者多跑几次；\
+             重复运行会自动合并到同一份字库（从零重建加 --fresh）。"
+        ),
     }
-    let missing: String = missing.iter().collect();
-    eprintln!(
-        "提醒：还缺这些坐标字符：{missing}\n\
-         采集时任务栏里要有带坐标的任务（抓鬼/鬼王/降妖…），或者多跑几次；\
-         重复运行会自动合并到同一份字库（从零重建加 --fresh）。"
-    );
 }
 
 /// 体检已有字库：字符覆盖、每个字的字模数，以及缺哪些坐标字符。
@@ -1299,101 +962,6 @@ fn info(args: &[String]) -> Result<(), String> {
     println!();
     report_coverage(&lib);
     Ok(())
-}
-
-fn is_game_title(title: &str) -> bool {
-    if title.contains("梦幻西游") {
-        return true;
-    }
-    // 英文客户端/多开工具可能写 MHXY，但本项目自己的终端窗口叫 rust-mhxy，得排掉。
-    let lower = title.to_lowercase();
-    lower.contains("mhxy") && !lower.contains("rust-mhxy")
-}
-
-/// 枚举真正可用的游戏窗口。
-///
-/// 不「猜一个」：游戏最小化时 `list_windows` 会返回所有窗口，
-/// 随手取第一个只会截到终端 / 输入法。找不到就报错并列出可选项。
-fn game_windows() -> Result<Vec<capture::WindowInfo>, String> {
-    let all = capture::list_windows()?;
-    let matched: Vec<capture::WindowInfo> = all
-        .iter()
-        .filter(|window| is_game_title(&window.title))
-        .cloned()
-        .collect();
-    if !matched.is_empty() {
-        return Ok(matched);
-    }
-    Err(format!(
-        "没找到标题含「梦幻西游」的窗口：游戏可能最小化了。\n\
-         当前可见窗口：{}\n可以用 --window <标题片段> 指定。",
-        window_titles(&all)
-    ))
-}
-
-fn pick_window<'a>(
-    windows: &'a [capture::WindowInfo],
-    filter: Option<&String>,
-) -> Result<&'a capture::WindowInfo, String> {
-    if windows.is_empty() {
-        return Err("没有找到可截图的窗口：先把游戏窗口打开".into());
-    }
-    if let Some(filter) = filter {
-        return windows
-            .iter()
-            .find(|window| window.title.contains(filter.as_str()))
-            .ok_or_else(|| {
-                format!(
-                    "没有标题包含「{filter}」的窗口，可选：{}",
-                    window_titles(windows)
-                )
-            });
-    }
-    // 默认优先游戏窗口，而不是枚举结果里的第一个（可能是个 IME 全屏窗口）。
-    Ok(windows
-        .iter()
-        .find(|window| is_game_title(&window.title))
-        .unwrap_or(&windows[0]))
-}
-
-fn window_titles(windows: &[capture::WindowInfo]) -> String {
-    windows
-        .iter()
-        .map(|window| window.title.as_str())
-        .collect::<Vec<_>>()
-        .join("｜")
-}
-
-fn is_digitish(ch: char) -> bool {
-    ch.is_ascii_digit() || matches!(ch, ',' | '，' | '、' | '.' | '．' | '。')
-}
-
-/// 把切出来的字模对到 OCR 文字上。
-///
-/// - 字数与切字数一致 → 逐字对应；
-/// - 否则，若文字里有坐标片段、且切字数正好等于坐标长度 → 对到坐标那一段
-///   （OCR 常把「去长寿村（79,26）附近」检成一个框）；
-/// - 其余情况返回 None：宁可跳过这一段，也不给字模打错误标签。
-///
-/// `learn_all` 为 false 时只学数字和分隔符，避免把界面上的中文/噪声塞进坐标字库。
-fn labels_for(text: &str, cells: usize, learn_all: bool) -> Option<Vec<Option<char>>> {
-    let chars: Vec<char> = text.chars().filter(|ch| !ch.is_whitespace()).collect();
-    let labels: Vec<char> = if chars.len() == cells {
-        chars
-    } else {
-        let shape = coord_fix::coordinate_shape(text)?;
-        let sub: Vec<char> = text.chars().skip(shape.start).take(shape.len()).collect();
-        if sub.len() != cells {
-            return None;
-        }
-        sub
-    };
-    Some(
-        labels
-            .into_iter()
-            .map(|ch| (learn_all || is_digitish(ch)).then_some(ch))
-            .collect(),
-    )
 }
 
 // -------------------------------------------------------------------- 建库
@@ -1504,126 +1072,4 @@ fn load_rgb(path: &Path) -> Result<image::RgbImage, String> {
     let image =
         image::open(path).map_err(|err| format!("读取图片 {} 失败：{err}", path.display()))?;
     Ok(image.to_rgb8())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn labels_align_with_cells_when_counts_match() {
-        let labels = labels_for("79,26", 5, false).expect("应当对齐");
-        let kept: String = labels.into_iter().flatten().collect();
-        assert_eq!(kept, "79,26");
-    }
-
-    #[test]
-    fn labels_fall_back_to_coordinate_segment() {
-        // OCR 把整行检成一个框，只有坐标那一段切成 5 个字模。
-        let labels = labels_for("去长寿村（79,26）附近", 5, false).expect("应当对上坐标段");
-        let kept: String = labels.into_iter().flatten().collect();
-        assert_eq!(kept, "79,26");
-    }
-
-    #[test]
-    fn labels_skip_chinese_unless_learning_everything() {
-        // 字数对得上但混着中文：默认只学数字和分隔符。
-        let labels = labels_for("长寿村79,26", 8, false).expect("应当对齐");
-        let kept: String = labels.into_iter().flatten().collect();
-        assert_eq!(kept, "79,26");
-
-        let all = labels_for("长寿村79,26", 8, true).expect("应当对齐");
-        assert_eq!(all.iter().filter(|label| label.is_some()).count(), 8);
-    }
-
-    #[test]
-    fn labels_reject_count_mismatch() {
-        assert!(labels_for("79,26", 4, false).is_none());
-        assert!(labels_for("没有数字也没有坐标", 3, false).is_none());
-    }
-
-    #[test]
-    fn maps_screen_selection_to_client_percent() {
-        let client = (900, 700, 800, 600);
-        // 客户区内 80..400 像素 → 10%..50%
-        let region = region_from_selection((980.0, 760.0, 1300.0, 1000.0), client).unwrap();
-        assert!((region.0 - 0.10).abs() < 1e-6, "{region:?}");
-        assert!((region.1 - 0.10).abs() < 1e-6, "{region:?}");
-        assert!((region.2 - 0.50).abs() < 1e-6, "{region:?}");
-        assert!((region.3 - 0.50).abs() < 1e-6, "{region:?}");
-        // 框太小要报错，避免写出一个没法用的区域。
-        assert!(region_from_selection((980.0, 760.0, 982.0, 762.0), client).is_err());
-    }
-
-    #[test]
-    fn replaces_task_region_line_keeping_comments() {
-        let text = "{\n  // 注释要留着\n  \"ocr/task_region\": \"0.1,0.2,0.3,0.4\",\n  \"ocr/upscale\": 2,\n}\n";
-        let patched = replace_key_value(text, "ocr/task_region", "0.5,0.6,0.7,0.8");
-        assert!(patched.contains("// 注释要留着"), "{patched}");
-        assert!(
-            patched.contains("\"ocr/task_region\": \"0.5,0.6,0.7,0.8\","),
-            "{patched}"
-        );
-        assert!(patched.contains("\"ocr/upscale\": 2,"), "{patched}");
-        assert!(json5::from_str::<serde_json::Value>(&patched).is_ok());
-    }
-
-    #[test]
-    fn patches_region_presets_both_ways() {
-        let existing =
-            "{\n  \"ocr/region_presets\": {\n    \"1920x1080\": \"0.1,0.2,0.3,0.4\",\n  },\n}\n";
-        let patched = patch_preset(existing, "1920x1080", "0.5,0.6,0.7,0.8");
-        assert!(
-            patched.contains("\"1920x1080\": \"0.5,0.6,0.7,0.8\""),
-            "{patched}"
-        );
-        let value: serde_json::Value = json5::from_str(&patched).unwrap();
-        assert_eq!(value["ocr/region_presets"]["1920x1080"], "0.5,0.6,0.7,0.8");
-
-        let empty = "{\n  \"ocr/region_presets\": {},\n}\n";
-        let patched = patch_preset(empty, "812x663", "0.5,0.6,0.7,0.8");
-        let value: serde_json::Value = json5::from_str(&patched).unwrap();
-        assert_eq!(value["ocr/region_presets"]["812x663"], "0.5,0.6,0.7,0.8");
-    }
-
-    #[test]
-    fn writes_config_region_only_when_still_valid() {
-        let path =
-            std::env::temp_dir().join(format!("font-tool-config-{}.json", std::process::id()));
-        std::fs::write(
-            &path,
-            "{\n  \"ocr/task_region\": \"0.1,0.2,0.3,0.4\",\n  \"ocr/region_presets\": {},\n}\n",
-        )
-        .unwrap();
-        write_config_region(&path, "0.5,0.6,0.7,0.8", "812x663").unwrap();
-        let text = std::fs::read_to_string(&path).unwrap();
-        let value: serde_json::Value = json5::from_str(&text).unwrap();
-        assert_eq!(value["ocr/task_region"], "0.5,0.6,0.7,0.8");
-        assert_eq!(value["ocr/region_presets"]["812x663"], "0.5,0.6,0.7,0.8");
-
-        // 原文件本来就坏了：宁可报错也不能写坏。
-        std::fs::write(&path, "{ 这不是合法 json5").unwrap();
-        assert!(write_config_region(&path, "0.9,0.9,0.9,0.95", "812x663").is_err());
-        assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
-            "{ 这不是合法 json5"
-        );
-        let _ = std::fs::remove_file(&path);
-    }
-
-    /// 真实配置的写法：多行 presets，**最后一项没有逗号**。
-    /// 之前直接插一行会写出非法 JSON5（上一行缺逗号），这条就是回归用例。
-    #[test]
-    fn patches_preset_when_last_entry_has_no_trailing_comma() {
-        let existing = "{\n  \"ocr/region_presets\": {\n    \"1218x994\": \"0.795,0.292,0.985,0.538\",\n    \"978x814\": \"0.742,0.35,0.987,0.645\"\n  },\n  \"ocr/task_region\": \"0.795,0.292,0.985,0.538\",\n}\n";
-        let patched = patch_preset(existing, "1628x1326", "0.5,0.6,0.7,0.8");
-        let value: serde_json::Value = json5::from_str(&patched)
-            .unwrap_or_else(|err| panic!("写出非法 JSON5：{err}\n{patched}"));
-        assert_eq!(value["ocr/region_presets"]["1628x1326"], "0.5,0.6,0.7,0.8");
-        assert_eq!(
-            value["ocr/region_presets"]["978x814"],
-            "0.742,0.35,0.987,0.645"
-        );
-        assert_eq!(value["ocr/task_region"], "0.795,0.292,0.985,0.538");
-    }
 }

@@ -14,6 +14,11 @@ path = "src/main.rs"
 name = "font-tool"
 path = "src/bin/font_tool.rs"
 
+# 字库采集的图形界面：选窗口 / 框区域 / 看切字 / 逐个检查字模。
+[[bin]]
+name = "font-studio"
+path = "src/bin/font_studio.rs"
+
 [dependencies]
 eframe = { version = "0.36", default-features = false, features = [
     "default_fonts",
