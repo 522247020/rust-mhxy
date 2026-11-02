@@ -1385,3 +1385,131 @@ mod learner_tests {
         assert!(conflicts[0].contains("3"), "{conflicts:?}");
     }
 }
+
+// ---------------------------------------------------------- 文字↔切字对齐
+
+/// 一个字符大约占多少「字宽单位」（中文 1.0，数字/字母约 0.55，逗号句点约 0.35）。
+///
+/// 建库时用它把 OCR 的一行文字对齐到切出来的跨度：中文紧贴排版会把相邻字并成
+/// 一个跨度，而数字比中文窄，单纯按「平均字宽等分」是分不对的。
+pub fn char_width_units(ch: char) -> f32 {
+    if ch.is_ascii_digit() || ch.is_ascii_alphabetic() {
+        0.55
+    } else if matches!(ch, ',' | '.' | ':' | ';' | '\'' | '!' | '|') {
+        0.35
+    } else if ch.is_ascii() {
+        0.5
+    } else {
+        1.0
+    }
+}
+
+/// 把一行文字按字宽先验对齐到切出来的跨度（动态规划，最小化宽度误差）。
+///
+/// 返回每个跨度对应的那段文字；对齐不上（字数与跨度数量差太多、宽度差异离谱）
+/// 返回 None —— 宁可不学，也不要把标签按错。
+pub fn align_chars_to_spans(text: &str, span_widths: &[u32]) -> Option<Vec<Vec<char>>> {
+    let chars: Vec<char> = text.chars().filter(|ch| !ch.is_whitespace()).collect();
+    let spans = span_widths.len();
+    if chars.is_empty() || spans == 0 || spans > chars.len() {
+        return None;
+    }
+    let total_units: f32 = chars.iter().map(|ch| char_width_units(*ch)).sum();
+    let total_width: u32 = span_widths.iter().sum();
+    if total_units <= 0.0 || total_width == 0 {
+        return None;
+    }
+    // 一个像素大约对应多少「字宽单位」。
+    let scale = total_units / total_width as f32;
+
+    // 每个跨度最多吃这么多个字：合并跨度里可能是好几个数字。
+    const MAX_BLOCK: usize = 8;
+    // 单个跨度的宽度误差超过这个值就不做对齐：说明切字本身是坏的
+    // （背景没清干净、跨行框、粘连），硬按字数打标签只会把字库弄脏。
+    const MAX_ALIGN_ERROR: f32 = 0.5;
+    let inf = f32::INFINITY;
+    // dp[j][i] = 用前 i 个字填满前 j 个跨度时的最小累计误差。
+    let mut dp = vec![vec![inf; chars.len() + 1]; spans + 1];
+    let mut from = vec![vec![0usize; chars.len() + 1]; spans + 1];
+    dp[0][0] = 0.0;
+    for j in 1..=spans {
+        let target = span_widths[j - 1] as f32 * scale;
+        for i in 1..=chars.len() {
+            for block in 1..=MAX_BLOCK.min(i) {
+                let start = i - block;
+                if dp[j - 1][start] == inf {
+                    continue;
+                }
+                let units: f32 = chars[start..i].iter().map(|ch| char_width_units(*ch)).sum();
+                // 相对误差的平方：宽跨度多吃几个字、窄跨度少吃几个字。
+                let error = ((units - target) / target.max(0.5)).powi(2);
+                let cost = dp[j - 1][start] + error;
+                if cost < dp[j][i] {
+                    dp[j][i] = cost;
+                    from[j][i] = block;
+                }
+            }
+        }
+    }
+    if dp[spans][chars.len()] == inf {
+        return None;
+    }
+    // 回调出每个跨度对应的文字块，并逐个检查宽度误差。
+    let mut blocks: Vec<Vec<char>> = vec![Vec::new(); spans];
+    let mut index = chars.len();
+    for j in (1..=spans).rev() {
+        let block = from[j][index];
+        if block == 0 {
+            return None;
+        }
+        let measured = span_widths[j - 1] as f32 * scale;
+        let units: f32 = chars[index - block..index]
+            .iter()
+            .map(|ch| char_width_units(*ch))
+            .sum();
+        if ((units - measured) / measured.max(0.5)).abs() > MAX_ALIGN_ERROR {
+            return None;
+        }
+        blocks[j - 1] = chars[index - block..index].to_vec();
+        index -= block;
+    }
+    if index != 0 {
+        return None;
+    }
+    Some(blocks)
+}
+
+#[cfg(test)]
+mod align_tests {
+    use super::*;
+
+    /// 中文 30px、数字约 16px：`朱紫国119,60处` 会把 `119,60` 并成一个跨度，
+    /// 要靠字宽先验把 6 个字符对到这 1 个跨度上。
+    #[test]
+    fn aligns_digits_inside_chinese_line() {
+        // 朱 紫 国 = 3 个中文跨度，119,60 = 1 个合并跨度，处 = 1 个中文跨度
+        let spans = [30u32, 30, 30, 86, 30];
+        let blocks = align_chars_to_spans("朱紫国119,60处", &spans).expect("应当对齐");
+        assert_eq!(blocks.len(), 5);
+        assert_eq!(blocks[0], vec!['朱']);
+        assert_eq!(blocks[1], vec!['紫']);
+        assert_eq!(blocks[2], vec!['国']);
+        assert_eq!(blocks[3], vec!['1', '1', '9', ',', '6', '0']);
+        assert_eq!(blocks[4], vec!['处']);
+    }
+
+    #[test]
+    fn aligns_one_char_per_span() {
+        let spans = [30u32, 30, 30];
+        let blocks = align_chars_to_spans("鬼王钟", &spans).expect("应当对齐");
+        assert_eq!(blocks, vec![vec!['鬼'], vec!['王'], vec!['钟']]);
+    }
+
+    #[test]
+    fn rejects_hopeless_alignment() {
+        // 6 个跨度对 2 个字：差太多，宁可不学。
+        assert!(align_chars_to_spans("鬼王", &[30, 30, 30, 30, 30, 30]).is_none());
+        assert!(align_chars_to_spans("", &[30]).is_none());
+        assert!(align_chars_to_spans("鬼王", &[]).is_none());
+    }
+}

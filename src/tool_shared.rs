@@ -660,14 +660,16 @@ mod tests {
 }
 
 /// 从一帧面板里学一批字模，返回学到的数量。
+/// 从一帧面板里学一批字模，返回学到的数量。
 ///
 /// `font-tool capture` 和 `font-studio`（固定帧数 / 后台积累）共用这一段：
-/// OCR 定位 → 按框裁图 → 切字 → 用 OCR 文字当标签 → 交给 `Learner` 聚类投票。
+/// OCR 定位 → 按框裁图 → 切字 → **按字宽把文字对齐到切出来的跨度** →
+/// 交给 `Learner` 聚类投票。
 ///
 /// 三道闸门挡住「把中文当数字学进去」：
-/// 1. 只收单行（跨行框会把两行的字按 x 交错，下标必错）；
-/// 2. 切字数量必须和文字字数一致（多一个少一个都对不上）；
-/// 3. 字数一致时也只学数字/分隔符那几位。
+/// 1. 只收单行（跨行框会把两行的字按 x 交错，按下标对标签必错）；
+/// 2. 对齐不上（字数与跨度差太多）就整段跳过；
+/// 3. 默认只学数字/分隔符那几位。
 pub fn learn_panel(
     learner: &mut font_lib::Learner,
     panel: &image::RgbImage,
@@ -692,31 +694,66 @@ pub fn learn_panel(
             *skipped += 1;
             continue;
         }
-        // 用 OCR 给的字数反推字宽，中文紧贴排版时也能按字数切。
-        let text_chars = region.text.chars().filter(|ch| !ch.is_whitespace()).count();
-        let advance = (text_chars > 0)
-            .then(|| gray.width() as f32 / text_chars as f32)
-            .filter(|advance| *advance > 2.0);
-        let cells = font_lib::analyze_with_advance(&gray, cfg, advance);
+        let boxes = font_lib::analyze(&gray, cfg);
+        if boxes.is_empty() {
+            *skipped += 1;
+            continue;
+        }
+        let widths: Vec<u32> = boxes.iter().map(|b| b.span.width()).collect();
+        let Some(blocks) = font_lib::align_chars_to_spans(&region.text, &widths) else {
+            *skipped += 1;
+            continue;
+        };
         if let Some((dir, frame)) = dump {
             let stem = dir.join(format!("f{frame:02}-{index:02}"));
             let _ = crop.save(stem.with_extension("png"));
             let _ = std::fs::write(stem.with_extension("txt"), &region.text);
         }
-        let Some(labels) = labels_for(&region.text, cells.len(), learn_all) else {
-            *skipped += 1;
-            continue;
-        };
-        for (b, label) in cells.iter().zip(labels) {
-            let Some(label) = label else {
-                continue;
-            };
-            learner.observe(
-                font_lib::cell_of(&gray, b, cell_w, cell_h),
-                &label.to_string(),
-            );
-            learned += 1;
+        for (b, block) in boxes.iter().zip(blocks) {
+            for (sub, ch) in split_span_by_block(b, &block).iter().zip(block.iter()) {
+                if !learn_all && !is_digitish(*ch) {
+                    continue;
+                }
+                let cell = font_lib::cell_of(&gray, sub, cell_w, cell_h);
+                learner.observe(cell, &ch.to_string());
+                learned += 1;
+            }
         }
     }
     learned
+}
+///
+/// 一个跨度里可能并了好几个字（中文紧贴、`119,60` 这种连续数字），
+/// 这里按块内字宽比例把跨度再切开，保证「一个框 ↔ 一个字」。
+fn split_span_by_block(b: &font_lib::GlyphBox, block: &[char]) -> Vec<font_lib::GlyphBox> {
+    if block.len() <= 1 {
+        return vec![*b];
+    }
+    let units: Vec<f32> = block
+        .iter()
+        .map(|ch| font_lib::char_width_units(*ch))
+        .collect();
+    let total: f32 = units.iter().sum();
+    let width = b.span.width().max(1);
+    let mut out = Vec::with_capacity(block.len());
+    let mut x0 = b.span.x0;
+    let mut consumed = 0f32;
+    for (index, unit) in units.iter().enumerate() {
+        consumed += unit;
+        let x1 = if index + 1 == block.len() {
+            b.span.x1
+        } else {
+            b.span.x0 + (width as f32 * consumed / total).round() as u32
+        };
+        out.push(font_lib::GlyphBox {
+            span: font_lib::Span {
+                x0,
+                x1: x1.max(x0 + 1).min(b.span.x1),
+            },
+            top: b.top,
+            bottom: b.bottom,
+        });
+        x0 = x1;
+    }
+    out
 }

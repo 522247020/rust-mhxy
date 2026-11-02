@@ -431,11 +431,37 @@ fn spawn_accumulate(
 // ---------------------------------------------------------------- 界面状态
 
 struct Preview {
+    /// 原始面板（点图取色、重新二值化都要用）。
+    image: std::sync::Arc<image::RgbImage>,
     texture: egui::TextureHandle,
+    binary_texture: egui::TextureHandle,
     size: egui::Vec2,
     /// 预览时切出来的字模（检查切字是否正常）。
     cells: Vec<Vec<u8>>,
     ocr: String,
+}
+
+impl Preview {
+    fn new(ctx: &egui::Context, panel: image::RgbImage, ocr: String) -> Self {
+        let image = std::sync::Arc::new(panel);
+        let texture = texture_of(ctx, "preview", &image);
+        let gray = font_lib::binarize(&image);
+        let binary_texture = texture_of_gray(ctx, "preview-binary", &gray);
+        let cells = cells_of(&gray);
+        Self {
+            size: egui::vec2(image.width() as f32, image.height() as f32),
+            image,
+            texture,
+            binary_texture,
+            cells,
+            ocr,
+        }
+    }
+
+    /// 画面变了就一起刷新两张图。
+    fn update(&mut self, ctx: &egui::Context, panel: image::RgbImage, ocr: String) {
+        *self = Self::new(ctx, panel, ocr);
+    }
 }
 
 struct Picker {
@@ -472,6 +498,8 @@ struct Studio {
 
     lib_path: String,
     lib: GlyphLib,
+    /// 预览显示二值化结果（看文字有没有被干净地提出来）。
+    show_binary: bool,
     lib_dirty: bool,
     seed_existing: bool,
     selected_glyph: Option<usize>,
@@ -511,6 +539,7 @@ impl Studio {
             learn_all: false,
             lib_path: default_lib_path().display().to_string(),
             lib: GlyphLib::new(font_lib::DEFAULT_CELL_W, font_lib::DEFAULT_CELL_H),
+            show_binary: false,
             lib_dirty: false,
             seed_existing: true,
             selected_glyph: None,
@@ -655,12 +684,7 @@ impl Studio {
                     panel.height(),
                     cells.len()
                 ));
-                self.preview = Some(Preview {
-                    texture: texture_of(ctx, "preview", &panel),
-                    size: egui::vec2(panel.width() as f32, panel.height() as f32),
-                    cells,
-                    ocr: String::new(),
-                });
+                self.preview = Some(Preview::new(ctx, panel, String::new()));
             }
             Err(err) => self.log(err),
         }
@@ -766,18 +790,9 @@ impl Studio {
                         "第 {index}/{total} 帧：采到 {learned} 个字模｜OCR {}",
                         if ocr.is_empty() { "无文字" } else { &ocr }
                     ));
-                    if let Some(preview) = &mut self.preview {
-                        preview.texture = texture_of(ctx, "preview", &panel);
-                        preview.ocr = ocr;
-                    } else {
-                        let gray = font_lib::binarize(&panel);
-                        let cells = cells_of(&gray);
-                        self.preview = Some(Preview {
-                            texture: texture_of(ctx, "preview", &panel),
-                            size: egui::vec2(panel.width() as f32, panel.height() as f32),
-                            cells,
-                            ocr,
-                        });
+                    match &mut self.preview {
+                        Some(preview) => preview.update(ctx, panel, ocr),
+                        None => self.preview = Some(Preview::new(ctx, panel, ocr)),
                     }
                 }
                 JobMsg::Done {
@@ -939,23 +954,9 @@ impl Studio {
                         ));
                     }
                     if let Some(panel) = panel {
-                        let cells = cells_of(&font_lib::binarize(&panel));
                         match &mut self.preview {
-                            Some(preview) => {
-                                preview.texture = texture_of(ctx, "preview", &panel);
-                                preview.size =
-                                    egui::vec2(panel.width() as f32, panel.height() as f32);
-                                preview.cells = cells;
-                                preview.ocr = ocr;
-                            }
-                            None => {
-                                self.preview = Some(Preview {
-                                    texture: texture_of(ctx, "preview", &panel),
-                                    size: egui::vec2(panel.width() as f32, panel.height() as f32),
-                                    cells,
-                                    ocr,
-                                });
-                            }
+                            Some(preview) => preview.update(ctx, panel, ocr),
+                            None => self.preview = Some(Preview::new(ctx, panel, ocr)),
                         }
                     }
                 }
@@ -1351,26 +1352,52 @@ impl Studio {
     }
 
     fn preview_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let mut picked_color: Option<[u8; 3]> = None;
         if let Some(preview) = &self.preview {
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.show_binary, "显示二值化");
+                ui.label(
+                    egui::RichText::new("在图上点一下可以取文字颜色（自动勾选颜色提取）")
+                        .small()
+                        .weak(),
+                );
+            });
             let available = ui.available_width().min(preview.size.x.max(1.0));
             let scale = (available / preview.size.x).clamp(0.2, 3.0);
             let size = preview.size * scale;
-            let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+            let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+            let texture = if self.show_binary {
+                preview.binary_texture.id()
+            } else {
+                preview.texture.id()
+            };
             ui.painter().image(
-                preview.texture.id(),
+                texture,
                 rect,
                 egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                 egui::Color32::WHITE,
             );
+            if response.clicked() {
+                if let Some(pos) = response.interact_pointer_pos() {
+                    let x = ((pos.x - rect.min.x) / scale) as u32;
+                    let y = ((pos.y - rect.min.y) / scale) as u32;
+                    if let Some(pixel) = preview.image.get_pixel_checked(x, y) {
+                        picked_color = Some([pixel[0], pixel[1], pixel[2]]);
+                    }
+                }
+            }
             ui.add_space(6.0);
             if !preview.ocr.is_empty() {
                 ui.label(format!("OCR：{}", preview.ocr));
             }
             if !preview.cells.is_empty() {
                 ui.label(
-                    egui::RichText::new(format!("切出 {} 个字模", preview.cells.len()))
-                        .small()
-                        .weak(),
+                    egui::RichText::new(format!(
+                        "切出 {} 个字模（每个格子应该正好一个字）",
+                        preview.cells.len()
+                    ))
+                    .small()
+                    .weak(),
                 );
                 ui.horizontal_wrapped(|ui| {
                     for (index, cell) in preview.cells.iter().enumerate() {
@@ -1394,7 +1421,15 @@ impl Studio {
         } else {
             ui.label("还没有预览：左边点「截图预览」抓一张看看区域和预处理对不对。");
         }
-
+        if let Some(color) = picked_color {
+            self.color = color;
+            self.color_hex = format!("#{:02x}{:02x}{:02x}", color[0], color[1], color[2]);
+            if !self.color_key {
+                self.color_key = true;
+                self.log("已勾选「颜色提取」，点「截图预览」看效果（容差可调）");
+            }
+            self.log(format!("取色：{}", self.color_hex));
+        }
         ui.separator();
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("字库字模").strong());
@@ -1716,4 +1751,22 @@ mod tests {
             "停止要立即生效"
         );
     }
+}
+
+/// 二值化图的贴图（黑白，单通道存成灰度 RGBA）。
+fn texture_of_gray(
+    ctx: &egui::Context,
+    name: &str,
+    image: &image::GrayImage,
+) -> egui::TextureHandle {
+    let mut rgba = Vec::with_capacity((image.width() * image.height() * 4) as usize);
+    for pixel in image.pixels() {
+        let value = pixel[0];
+        rgba.extend_from_slice(&[value, value, value, 255]);
+    }
+    let color = egui::ColorImage::from_rgba_unmultiplied(
+        [image.width() as usize, image.height() as usize],
+        &rgba,
+    );
+    ctx.load_texture(name, color, egui::TextureOptions::NEAREST)
 }

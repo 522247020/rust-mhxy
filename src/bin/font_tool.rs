@@ -125,6 +125,7 @@ fn main() {
         Some("region") => region(&args[1..]),
         Some("info") => info(&args[1..]),
         Some("sheet") => sheet(&args[1..]),
+        Some("align") => align(&args[1..]),
         Some("snap") => snap(&args[1..]),
         Some("capture") => capture_frames(&args[1..]),
         Some("build") => build(&args[1..]),
@@ -921,6 +922,43 @@ fn report_coverage(lib: &GlyphLib) {
              重复运行会自动合并到同一份字库（从零重建加 --fresh）。"
         ),
     }
+}
+
+/// 调试：看一段文字怎么对齐到切出来的跨度（排查「学不到/学错」时用）。
+fn align(args: &[String]) -> Result<(), String> {
+    let flags = parse_flags(args);
+    let image_path: PathBuf = required(&flags, "image")?.into();
+    let text = required(&flags, "text")?;
+    let image = load_rgb(&image_path)?;
+    let gray = font_lib::binarize(&image);
+    let cfg = MatchConfig::default();
+    let rows = font_lib::row_spans(&gray, cfg.row_gap);
+    println!(
+        "图片 {}x{}，切出 {} 行",
+        image.width(),
+        image.height(),
+        rows.len()
+    );
+    if rows.len() != 1 {
+        println!("不是单行，学习时会被跳过");
+    }
+    let boxes = font_lib::analyze(&gray, cfg);
+    let widths: Vec<u32> = boxes.iter().map(|b| b.span.width()).collect();
+    println!("跨度宽度：{widths:?}");
+    match font_lib::align_chars_to_spans(&text, &widths) {
+        Some(blocks) => {
+            for (index, (b, block)) in boxes.iter().zip(blocks).enumerate() {
+                let chars: String = block.iter().collect();
+                println!(
+                    "  #{index} x={:<4} 宽={:<4} → 「{chars}」",
+                    b.span.x0,
+                    b.span.width()
+                );
+            }
+        }
+        None => println!("对齐不上：「{text}」"),
+    }
+    Ok(())
 }
 
 /// 把字库渲染成对照图：**一行一个标签**，同一标签的多个字模并排。
