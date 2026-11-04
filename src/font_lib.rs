@@ -2291,9 +2291,14 @@ pub fn binarize_text(image: &RgbImage) -> GrayImage {
             bright += 1;
         }
     }
-    // 亮像素是少数 → 文字是亮的（深色背景）；否则文字是暗的（浅色背景）。
-    let ink_is_bright = bright * 2 <= total;
-    GrayImage::from_fn(gray.width(), gray.height(), |x, y| {
+    // 先用边框亮度估背景：背景在暗侧 → 文字是亮的；边框混了文字/背景时退回少数派。
+    let background = border_luma(&gray);
+    let ink_is_bright = if background.abs_diff(threshold) > 6 {
+        background <= threshold
+    } else {
+        bright * 2 <= total
+    };
+    let mut out = GrayImage::from_fn(gray.width(), gray.height(), |x, y| {
         let value = gray.get_pixel(x, y)[0];
         let ink = if ink_is_bright {
             value > threshold
@@ -2301,13 +2306,70 @@ pub fn binarize_text(image: &RgbImage) -> GrayImage {
             value <= threshold
         };
         Luma([if ink { 0 } else { 255 }])
-    })
+    });
+    // 兜底：约定永远是「白底黑字」。墨迹过半说明判反了，翻转。
+    // （整屏彩图两边各占一半，全局阙值本身无意义——那种图要靠局部对比度，见 binarize_adaptive。）
+    let dark = out.pixels().filter(|pixel| pixel[0] < 128).count();
+    if dark * 2 > total as usize {
+        for pixel in out.pixels_mut() {
+            pixel[0] = 255 - pixel[0];
+        }
+    }
+    out
+}
+
+/// 图像边框亮度的中位数，用来估「背景是什么亮度」。
+fn border_luma(gray: &GrayImage) -> u8 {
+    let (width, height) = gray.dimensions();
+    if width == 0 || height == 0 {
+        return 255;
+    }
+    let mut values: Vec<u8> = Vec::with_capacity((width * 2 + height * 2) as usize);
+    for x in 0..width {
+        values.push(gray.get_pixel(x, 0)[0]);
+        if height > 1 {
+            values.push(gray.get_pixel(x, height - 1)[0]);
+        }
+    }
+    for y in 1..height.saturating_sub(1) {
+        values.push(gray.get_pixel(0, y)[0]);
+        if width > 1 {
+            values.push(gray.get_pixel(width - 1, y)[0]);
+        }
+    }
+    if values.is_empty() {
+        return 255;
+    }
+    values.sort_unstable();
+    values[values.len() / 2]
 }
 
 #[cfg(test)]
 mod binarize_text_tests {
     use super::fixture::render;
     use super::*;
+    use image::Rgb;
+
+    /// 不管输入怎么判，输出必须是「白底黑字」：墨迹不能过半。
+    #[test]
+    fn always_returns_dark_text_on_white_background() {
+        // 一张「大片深色背景 + 几块亮斑」的图：判反了就会变成黑底白字。
+        let mut image = RgbImage::from_pixel(120, 80, Rgb([20, 24, 30]));
+        for y in 10..20 {
+            for x in 10..30 {
+                image.put_pixel(x, y, Rgb([250, 250, 250]));
+            }
+        }
+        for y in 50..70 {
+            for x in 80..110 {
+                image.put_pixel(x, y, Rgb([240, 240, 240]));
+            }
+        }
+        let gray = binarize_text(&image);
+        let dark = gray.pixels().filter(|pixel| pixel[0] < 128).count();
+        let total = gray.pixels().count();
+        assert!(dark < total / 2, "墨迹 {dark}/{total}：输出不是白底黑字");
+    }
 
     /// 黑字白底：笔画必须实心（不能只剩描边）。
     #[test]
