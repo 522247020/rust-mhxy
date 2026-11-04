@@ -4,8 +4,8 @@ version = "0.2.18"
 edition = "2021"
 description = "梦幻西游抓鬼/鬼王任务坐标辅助（Rust + egui）"
 license = "MIT"
-# 有三个 bin：不加这行 `cargo run` 会报「无法确定要运行哪个」。
-# 字库工具用 `cargo run --bin font-tool` / `cargo run --bin font-studio`。
+# 有多个 bin：不加这行 `cargo run` 会报「无法确定要运行哪个」。
+# 字库工具用 `cargo run --bin font-tool` / `font-studio` / `font-pick`。
 default-run = "rust-mhxy"
 
 [[bin]]
@@ -21,6 +21,11 @@ path = "src/bin/font_tool.rs"
 [[bin]]
 name = "font-studio"
 path = "src/bin/font_studio.rs"
+
+# 完全手动的字库工具：不跑 OCR，自己拖框圈字 + 填标签。
+[[bin]]
+name = "font-pick"
+path = "src/bin/font_pick.rs"
 
 [dependencies]
 eframe = { version = "0.36", default-features = false, features = [
@@ -55,6 +60,14 @@ windows = { version = "0.62", features = [
 
 [target.'cfg(not(windows))'.dependencies]
 xcap = "0.9"
+
+# 字库工具是逐像素处理（截图放大 + 二值 + 模板匹配），debug 下慢到没法调参；
+# 开一级优化让它能正常交互，代价是初次编译略慢。
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
 
 [profile.release]
 opt-level = 3

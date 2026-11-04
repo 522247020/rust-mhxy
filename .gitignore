@@ -11,3 +11,10 @@ __pycache__/
 /.ci-cache
 /logs
 /assets/fontlib.json
+/assets/fontlib.json.bak
+/assets/mapfontlib.json
+/assets/mapfontlib.json.bak
+/assets/mapcharlib.json
+/assets/mapcharlib.json.bak
+/assets/tasklib.json
+/assets/tasklib.json.bak
