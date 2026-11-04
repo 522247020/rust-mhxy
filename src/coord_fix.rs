@@ -11,6 +11,7 @@ use crate::font_lib::{self, GlyphLib, MatchConfig};
 use crate::ocr::OcrRegion;
 use image::RgbImage;
 use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// 复核用的默认匹配参数。和建库时的参数保持一致即可（建库用 `MatchConfig::default()`）。
 pub const DEFAULT_MATCH: MatchConfig = MatchConfig {
@@ -95,7 +96,157 @@ pub fn widen_over_confusables(text: &str, shape: Range<usize>) -> Range<usize> {
     start..end
 }
 
+/// 一次复核的统计：用来告诉用户「字库到底参与了吗、效果如何」。
+///
+/// - `candidates`：文本里有多少段长得像坐标（值得复核的）
+/// - `matched`：字库能确认的段数（读出的字数与 OCR 那段一致）
+/// - `agreed`：字库读出来和 OCR 一模一样（说明 OCR 本来就对）
+/// - `fixes`：字库真正改写了 OCR 的段数（`fixes = matched - agreed`）
+///
+/// `candidates == 0` 说明这一帧根本没坐标，不怪字库；
+/// `candidates > 0` 但 `matched == 0` 才是「字库参与了但不够确信」。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LibReport {
+    pub candidates: usize,
+    pub matched: usize,
+    pub agreed: usize,
+    pub fixes: usize,
+}
+
+/// 百分比，分母 0 时给 `—`（避免除零，也别把「没数据」说成 0%）。
+fn pct(part: usize, whole: usize) -> String {
+    if whole == 0 {
+        "—".to_string()
+    } else {
+        format!("{:.0}%", part as f32 * 100.0 / whole as f32)
+    }
+}
+
+impl LibReport {
+    /// 字库「敢下结论」的比例：确认数 / 候选数。低就说明字模不够或预处理不对。
+    pub fn match_rate(&self) -> String {
+        pct(self.matched, self.candidates)
+    }
+
+    /// 字库改写 OCR 的比例：改写数 / 确认数。这就是「字库真正干了多少活」。
+    pub fn fix_rate(&self) -> String {
+        pct(self.fixes, self.matched)
+    }
+
+    /// OCR 本来就认对的比例：一致数 / 确认数。
+    pub fn agree_rate(&self) -> String {
+        pct(self.agreed, self.matched)
+    }
+
+    /// 写详细日志用的一行。
+    pub fn summary(&self) -> String {
+        if self.candidates == 0 {
+            "本帧没有坐标形状的文字，字库未参与".to_string()
+        } else {
+            format!(
+                "坐标段 {}｜确认 {}（成功率 {}）｜一致 {}｜改写 {}（改写率 {}）｜无法确认 {}",
+                self.candidates,
+                self.matched,
+                self.match_rate(),
+                self.agreed,
+                self.fixes,
+                self.fix_rate(),
+                self.candidates.saturating_sub(self.matched)
+            )
+        }
+    }
+}
+
+// ---------------------------------------------------------------- 累计统计
+//
+// 用户常问「我怎么知道字库真的在用？」。累计计数器就是答案：
+// 侧边栏直接显示「跑了几帧 / 见过几个坐标段 / 确认几个 / 改写几个」，
+// 不用去翻详细日志。
+
+/// 进程内累计。单线程读取、后台识别线程写入，用原子量足够。
+pub struct Totals {
+    pub frames: u64,
+    pub candidates: u64,
+    pub matched: u64,
+    pub agreed: u64,
+    pub fixes: u64,
+}
+
+impl Totals {
+    pub fn report(&self) -> LibReport {
+        LibReport {
+            candidates: self.candidates as usize,
+            matched: self.matched as usize,
+            agreed: self.agreed as usize,
+            fixes: self.fixes as usize,
+        }
+    }
+}
+
+static FRAMES: AtomicU64 = AtomicU64::new(0);
+static CANDIDATES: AtomicU64 = AtomicU64::new(0);
+static MATCHED: AtomicU64 = AtomicU64::new(0);
+static AGREED: AtomicU64 = AtomicU64::new(0);
+static FIXES: AtomicU64 = AtomicU64::new(0);
+static LAST_CANDIDATES: AtomicU64 = AtomicU64::new(0);
+static LAST_MATCHED: AtomicU64 = AtomicU64::new(0);
+static LAST_AGREED: AtomicU64 = AtomicU64::new(0);
+static LAST_FIXES: AtomicU64 = AtomicU64::new(0);
+
+fn record(report: &LibReport) {
+    FRAMES.fetch_add(1, Ordering::Relaxed);
+    CANDIDATES.fetch_add(report.candidates as u64, Ordering::Relaxed);
+    MATCHED.fetch_add(report.matched as u64, Ordering::Relaxed);
+    AGREED.fetch_add(report.agreed as u64, Ordering::Relaxed);
+    FIXES.fetch_add(report.fixes as u64, Ordering::Relaxed);
+    LAST_CANDIDATES.store(report.candidates as u64, Ordering::Relaxed);
+    LAST_MATCHED.store(report.matched as u64, Ordering::Relaxed);
+    LAST_AGREED.store(report.agreed as u64, Ordering::Relaxed);
+    LAST_FIXES.store(report.fixes as u64, Ordering::Relaxed);
+}
+
+pub fn totals() -> Totals {
+    Totals {
+        frames: FRAMES.load(Ordering::Relaxed),
+        candidates: CANDIDATES.load(Ordering::Relaxed),
+        matched: MATCHED.load(Ordering::Relaxed),
+        agreed: AGREED.load(Ordering::Relaxed),
+        fixes: FIXES.load(Ordering::Relaxed),
+    }
+}
+
+/// 最近一帧的统计（侧边栏用来显示「上一帧干了什么」）。
+pub fn last_frame() -> LibReport {
+    LibReport {
+        candidates: LAST_CANDIDATES.load(Ordering::Relaxed) as usize,
+        matched: LAST_MATCHED.load(Ordering::Relaxed) as usize,
+        agreed: LAST_AGREED.load(Ordering::Relaxed) as usize,
+        fixes: LAST_FIXES.load(Ordering::Relaxed) as usize,
+    }
+}
+
+pub fn reset_totals() {
+    FRAMES.store(0, Ordering::Relaxed);
+    CANDIDATES.store(0, Ordering::Relaxed);
+    MATCHED.store(0, Ordering::Relaxed);
+    AGREED.store(0, Ordering::Relaxed);
+    FIXES.store(0, Ordering::Relaxed);
+    LAST_CANDIDATES.store(0, Ordering::Relaxed);
+    LAST_MATCHED.store(0, Ordering::Relaxed);
+    LAST_AGREED.store(0, Ordering::Relaxed);
+    LAST_FIXES.store(0, Ordering::Relaxed);
+}
+
+/// 字库复核的结果：新文本 + 替换记录 + 统计。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Corrected {
+    pub text: String,
+    pub fixes: Vec<Fix>,
+    pub report: LibReport,
+}
+
 /// 对一整段 OCR 结果做字库复核，返回（新文本, 替换记录）。
+#[cfg(test)]
 pub fn correct(
     panel: &RgbImage,
     text: &str,
@@ -104,8 +255,26 @@ pub fn correct(
     cfg: MatchConfig,
     padding: u32,
 ) -> (String, Vec<Fix>) {
+    let corrected = correct_with_report(panel, text, regions, lib, cfg, padding);
+    (corrected.text, corrected.fixes)
+}
+
+/// 同 [`correct`]，额外返回「字库参与程度」的统计，用来在 UI / 日志里证明它确实在跑。
+pub fn correct_with_report(
+    panel: &RgbImage,
+    text: &str,
+    regions: &[OcrRegion],
+    lib: &GlyphLib,
+    cfg: MatchConfig,
+    padding: u32,
+) -> Corrected {
+    let mut report = LibReport::default();
     if lib.is_empty() || regions.is_empty() {
-        return (text.to_string(), Vec::new());
+        return Corrected {
+            text: text.to_string(),
+            fixes: Vec::new(),
+            report,
+        };
     }
     let mut edits: Vec<(Range<usize>, String)> = Vec::new();
     let mut fixes = Vec::new();
@@ -113,6 +282,7 @@ pub fn correct(
         let Some(local) = coordinate_shape(&region.text) else {
             continue;
         };
+        report.candidates += 1;
         let local = widen_over_confusables(&region.text, local);
         let Some((x, y, width, height)) = padded_box(region, padding, panel) else {
             continue;
@@ -154,6 +324,7 @@ pub fn correct(
         if read.chars().count() != local.len() {
             continue;
         }
+        report.matched += 1;
         let before: String = region
             .text
             .chars()
@@ -161,6 +332,8 @@ pub fn correct(
             .take(local.len())
             .collect();
         if before == read {
+            // 字库读出来和 OCR 一样：OCR 本来就对，这里不算“改写”。
+            report.agreed += 1;
             continue;
         }
         let start = region.range.start + local.start;
@@ -171,7 +344,13 @@ pub fn correct(
             after: read,
         });
     }
-    (apply_edits(text, edits), fixes)
+    report.fixes = fixes.len();
+    record(&report);
+    Corrected {
+        text: apply_edits(text, edits),
+        fixes,
+        report,
+    }
 }
 
 /// 检测框向外扩 `padding` 后夹到图片范围内。空框返回 None。
@@ -314,6 +493,84 @@ mod tests {
                 after: "79,26".into()
             }]
         );
+    }
+
+    #[test]
+    fn report_counts_candidates_matched_and_fixes() {
+        let lib = trained_lib();
+        // 一段认错一位（会被改写）、一段本来就对、一段没有坐标形状。
+        let (panel, mut regions, _) = panel_with("79,26", "79,2G", (60, 40));
+        let mut second = regions[0].clone();
+        second.text = "12,34".into();
+        second.range = 8..13;
+        let mut third = regions[0].clone();
+        third.text = "附近".into();
+        third.range = 13..15;
+        regions.push(second);
+        regions.push(third);
+        let text = "79,2G 12,34 附近".to_string();
+        let corrected = correct_with_report(
+            &panel,
+            &text,
+            &regions,
+            &lib,
+            DEFAULT_MATCH,
+            DEFAULT_PADDING,
+        );
+        // 两段像坐标（第三段「附近」不算）。
+        assert_eq!(corrected.report.candidates, 2);
+        assert_eq!(corrected.report.fixes, corrected.fixes.len());
+        assert!(!corrected.report.summary().contains("未参与"));
+    }
+
+    #[test]
+    fn report_marks_a_frame_without_coordinates() {
+        let lib = trained_lib();
+        let (panel, regions, text) = panel_with("79,26", "附近", (60, 40));
+        let corrected =
+            correct_with_report(&panel, &text, &regions, &lib, DEFAULT_MATCH, DEFAULT_PADDING);
+        assert_eq!(corrected.report.candidates, 0);
+        assert!(corrected.report.summary().contains("未参与"));
+    }
+
+    #[test]
+    fn report_separates_agreement_from_rewrites() {
+        let lib = trained_lib();
+        // OCR 本来就对：算「一致」，不算「改写」，成功率/一致率都 100%。
+        let (panel, regions, text) = panel_with("79,26", "79,26", (60, 40));
+        let corrected =
+            correct_with_report(&panel, &text, &regions, &lib, DEFAULT_MATCH, DEFAULT_PADDING);
+        assert_eq!(corrected.report.candidates, 1);
+        assert_eq!(corrected.report.matched, 1);
+        assert_eq!(corrected.report.agreed, 1);
+        assert_eq!(corrected.report.fixes, 0);
+        assert_eq!(corrected.report.match_rate(), "100%");
+        assert_eq!(corrected.report.agree_rate(), "100%");
+        assert_eq!(corrected.report.fix_rate(), "0%");
+
+        // OCR 认错一位：一致 0、改写 1，改写率 100%。
+        let (panel, regions, text) = panel_with("79,26", "79,2G", (60, 40));
+        let corrected =
+            correct_with_report(&panel, &text, &regions, &lib, DEFAULT_MATCH, DEFAULT_PADDING);
+        assert_eq!(corrected.report.agreed, 0);
+        assert_eq!(corrected.report.fixes, 1);
+        assert_eq!(corrected.report.fix_rate(), "100%");
+    }
+
+    #[test]
+    fn totals_accumulate_across_frames() {
+        let lib = trained_lib();
+        let before = totals();
+        for _ in 0..2 {
+            let (panel, regions, text) = panel_with("79,26", "79,2G", (60, 40));
+            let _ =
+                correct_with_report(&panel, &text, &regions, &lib, DEFAULT_MATCH, DEFAULT_PADDING);
+        }
+        let after = totals();
+        // 其他测试也在跑，所以只断言「至少增加了这么多」。
+        assert!(after.frames >= before.frames + 2, "帧数应累加");
+        assert!(after.candidates >= before.candidates + 2, "坐标段应累加");
+        assert!(after.matched >= before.matched + 2, "确认数应累加");
     }
 
     #[test]

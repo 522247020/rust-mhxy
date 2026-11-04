@@ -743,10 +743,56 @@ impl MhxyApp {
                     match (&self.font_lib, &self.font_lib_error) {
                         (Some(lib), _) => {
                             ui.label(
-                                egui::RichText::new(format!("已加载 {} 个字模", lib.len()))
-                                    .small()
-                                    .color(theme::jade()),
+                                egui::RichText::new(format!(
+                                    "已加载 {} 个字模（{}x{}）",
+                                    lib.len(),
+                                    lib.cell_w,
+                                    lib.cell_h
+                                ))
+                                .small()
+                                .color(theme::jade()),
                             );
+                            // 累计统计：直接回答「字库到底在不在用」。
+                            let totals = crate::coord_fix::totals();
+                            let last = crate::coord_fix::last_frame();
+                            let all = totals.report();
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "累计：{} 帧｜坐标段 {}｜确认 {}（成功率 {}）",
+                                    totals.frames,
+                                    all.candidates,
+                                    all.matched,
+                                    all.match_rate()
+                                ))
+                                .small()
+                                .weak(),
+                            );
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "　　　一致 {}（{}）｜改写 {}（改写率 {}）",
+                                    all.agreed,
+                                    all.agree_rate(),
+                                    all.fixes,
+                                    all.fix_rate()
+                                ))
+                                .small()
+                                .weak(),
+                            );
+                            let hint = if totals.frames == 0 {
+                                "还没跑过识别：按一次识别（或快捷键）后这里会动".to_string()
+                            } else if totals.candidates == 0 {
+                                "跑过识别，但画面里没有带坐标的任务行".to_string()
+                            } else {
+                                format!("上一帧：{}", last.summary())
+                            };
+                            ui.label(egui::RichText::new(hint).small().weak());
+                            if ui
+                                .small_button("统计清零")
+                                .on_hover_text("重新开始累计，方便确认本次测试期间到底用了几次")
+                                .clicked()
+                            {
+                                crate::coord_fix::reset_totals();
+                            }
                         }
                         (None, Some(err)) => {
                             ui.label(egui::RichText::new(err).small().color(theme::red()));

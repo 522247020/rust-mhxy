@@ -130,7 +130,7 @@ impl LocalWorker {
                     // 点阵字库复核：OCR 负责「这段文字大概是什么」，字库负责
                     // 「这几个数字到底是几」。字库读不确信时不改任何东西。
                     if let Some(lib) = &job.font_lib {
-                        let (text, fixes) = crate::coord_fix::correct(
+                        let corrected = crate::coord_fix::correct_with_report(
                             &job.image,
                             &ocr.text,
                             &ocr.regions,
@@ -138,11 +138,17 @@ impl LocalWorker {
                             crate::coord_fix::DEFAULT_MATCH,
                             crate::coord_fix::DEFAULT_PADDING,
                         );
-                        for fix in fixes {
-                            ocr.notes
-                                .push(format!("字库复核坐标 {} → {}", fix.before, fix.after));
+                        for fix in &corrected.fixes {
+                            ocr.notes.push(format!(
+                                "字库复核坐标 {} → {}",
+                                fix.before, fix.after
+                            ));
                         }
-                        ocr.text = text;
+                        ocr.notes.push(format!(
+                            "字库复核：{}",
+                            corrected.report.summary()
+                        ));
+                        ocr.text = corrected.text;
                     }
                     Ok(ocr)
                 })();
