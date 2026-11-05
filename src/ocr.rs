@@ -1,7 +1,15 @@
 //! OCR：本地 PP-OCR（oar-ocr + ONNX Runtime）与远端 PP-OCR 服务。
+//!
+//! 本地识别有两条路：
+//! 1. **分行路径（主）**：先用 `text_layout` 做投影分行，每行裁图后只跑识别模型
+//!    （rec-only，跳过检测）。任务栏行数少、行距小，检测模型最容易在这里把相邻两行
+//!    并成一个框，分行路径从根上避开这个问题。
+//! 2. **检测路径（兜底）**：分行不可信（行数异常、行高差异过大）时回退到 PP-OCR 的
+//!    「检测 + 识别」完整流程。
 use image::{ImageEncoder, RgbImage};
 use oar_ocr::core::config::OrtSessionConfig;
 use oar_ocr::oarocr::OAROCRBuilder;
+use oar_ocr::predictors::text_recognition::TextRecognitionPredictor;
 use serde_json::Value;
 use std::io::Cursor;
 use std::sync::mpsc::{channel, Sender};
@@ -16,14 +24,21 @@ pub const LOCAL_DICT: &str = "ppocrv5_dict.txt";
 const LOCAL_INTRA_THREADS: usize = 4;
 const REMOTE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// 识别模型输入是 3x48x320，宽度超出会让整行被压扁；长行按这个宽高比切块。
+const MAX_LINE_RATIO: f32 = 6.0;
+
 #[derive(Clone, Debug, Default)]
 pub struct OcrText {
     pub text: String,
     pub elapsed_secs: f64,
-    /// 每个检测框的文本和位置。远端接口只回文本，所以可能是空的。
+    /// 每个文本块的文字和位置。远端接口只回文本，所以可能是空的。
     pub regions: Vec<OcrRegion>,
-    /// 后处理（例如点阵字库复核）产生的说明，由 UI 写详细日志。
+    /// 归一化、分行、回退等处理产生的说明，由 UI 写详细日志。
     pub notes: Vec<String>,
+    /// 本次用的行布局（分行路径算过时才有值），供调试预览使用。
+    pub layout: Option<crate::text_layout::RowLayout>,
+    /// 每一行归一化后的文本，与 `layout.rows` 下标一一对应。
+    pub row_texts: Vec<String>,
 }
 
 /// 一个 OCR 检测框：内容、置信度、在原图（送 OCR 的那张图）里的矩形，
@@ -77,10 +92,10 @@ struct LocalJob {
     image: RgbImage,
     /// 测试任务不参与正式识别的合并与结果回写。
     test: bool,
-    /// 高召回检测：降低检测阈值，宁可多出噪声框也别漏字。
+    /// 高召回检测：降低检测阈值，宁可多出噪声框也别漏字（只影响兜底的检测路径）。
     high_recall: bool,
-    /// 坐标复核用的点阵字库；为空则只靠 OCR 文本。
-    font_lib: Option<std::sync::Arc<crate::font_lib::GlyphLib>>,
+    /// 检测路径送模型前的放大倍数（分行路径不需要，识别模型自己会归一化行高）。
+    upscale: u32,
 }
 
 /// 常驻线程：收到第一张截图时才加载模型，远端模式不占用模型内存。
@@ -94,6 +109,7 @@ impl LocalWorker {
         thread::spawn(move || {
             let mut engine_normal = None;
             let mut engine_recall = None;
+            let mut rows_engine: Option<RowsEngine> = None;
             let mut pending: std::collections::VecDeque<LocalJob> =
                 std::collections::VecDeque::new();
             loop {
@@ -115,6 +131,27 @@ impl LocalWorker {
                     }
                 }
                 let result = (|| {
+                    // 1) 分行路径：投影分行 → 每行 rec-only 识别。
+                    let layout = crate::text_layout::rows(
+                        &job.image,
+                        crate::text_layout::RowConfig::default(),
+                    );
+                    if layout.reliable {
+                        if rows_engine.is_none() {
+                            rows_engine = Some(RowsEngine::new()?);
+                        }
+                        let mut ocr = rows_engine
+                            .as_ref()
+                            .expect("initialized rows engine")
+                            .recognize(&job.image, &layout)?;
+                        for note in &layout.notes {
+                            ocr.notes.push(format!("分行：{note}"));
+                        }
+                        ocr.layout = Some(layout);
+                        return Ok(ocr);
+                    }
+
+                    // 2) 兜底：行分割不可信时回退到「检测 + 识别」。
                     let slot = if job.high_recall {
                         &mut engine_recall
                     } else {
@@ -123,33 +160,19 @@ impl LocalWorker {
                     if slot.is_none() {
                         *slot = Some(LocalEngine::new(job.high_recall)?);
                     }
+                    let image = upscale(&job.image, job.upscale);
                     let mut ocr = slot
                         .as_ref()
                         .expect("initialized engine")
-                        .recognize(&job.image)?;
-                    // 点阵字库复核：OCR 负责「这段文字大概是什么」，字库负责
-                    // 「这几个数字到底是几」。字库读不确信时不改任何东西。
-                    if let Some(lib) = &job.font_lib {
-                        let corrected = crate::coord_fix::correct_with_report(
-                            &job.image,
-                            &ocr.text,
-                            &ocr.regions,
-                            lib,
-                            crate::coord_fix::DEFAULT_MATCH,
-                            crate::coord_fix::DEFAULT_PADDING,
-                        );
-                        for fix in &corrected.fixes {
-                            ocr.notes.push(format!(
-                                "字库复核坐标 {} → {}",
-                                fix.before, fix.after
-                            ));
-                        }
-                        ocr.notes.push(format!(
-                            "字库复核：{}",
-                            corrected.report.summary()
-                        ));
-                        ocr.text = corrected.text;
+                        .recognize(&image)?;
+                    ocr.notes.push(format!(
+                        "行分割不可信（{} 行），已回退检测模型",
+                        layout.rows.len()
+                    ));
+                    for note in &layout.notes {
+                        ocr.notes.push(format!("分行：{note}"));
                     }
+                    ocr.layout = Some(layout);
                     Ok(ocr)
                 })();
                 let event = if job.test {
@@ -174,7 +197,7 @@ impl LocalWorker {
         generation: u64,
         image: RgbImage,
         high_recall: bool,
-        font_lib: Option<std::sync::Arc<crate::font_lib::GlyphLib>>,
+        upscale: u32,
     ) -> Result<(), String> {
         self.sender
             .send(LocalJob {
@@ -182,21 +205,20 @@ impl LocalWorker {
                 image,
                 test: false,
                 high_recall,
-                font_lib,
+                upscale,
             })
             .map_err(|_| "本地识别线程已退出，请重启程序".to_string())
     }
 
     /// 取点窗口的「测试 OCR」：不占用正式识别的 generation。
-    /// 测试结果保持原文，不做字库复核，方便看出 OCR 本身错在哪里。
-    pub fn submit_test(&self, image: RgbImage) -> Result<(), String> {
+    pub fn submit_test(&self, image: RgbImage, upscale: u32) -> Result<(), String> {
         self.sender
             .send(LocalJob {
                 generation: 0,
                 image,
                 test: true,
                 high_recall: false,
-                font_lib: None,
+                upscale,
             })
             .map_err(|_| "本地识别线程已退出，请重启程序".to_string())
     }
@@ -257,23 +279,151 @@ impl LocalEngine {
             elapsed_secs: started.elapsed().as_secs_f64(),
             regions,
             notes: Vec::new(),
+            layout: None,
+            row_texts: Vec::new(),
         })
     }
 }
 
-/// 一次性本地识别（不经过后台线程）。
-/// 给命令行工具（`font-tool capture` 自动建库）和测试用；主程序走后台线程，用不到。
-#[allow(dead_code)]
-pub fn recognize_panel(image: &RgbImage, high_recall: bool) -> Result<OcrText, String> {
-    LocalEngine::new(high_recall)?.recognize(image)
+/// 分行路径的识别引擎：只用识别模型（rec-only），不跑检测。
+///
+/// 行位置由 `text_layout` 的投影给出，这里负责：行图 → 长行切块 → 批量识别
+/// → 文本归一化 → 拼成 `OcrText`。
+struct RowsEngine {
+    rec: TextRecognitionPredictor,
+}
+
+impl RowsEngine {
+    fn new() -> Result<Self, String> {
+        let session = OrtSessionConfig::default().with_intra_threads(LOCAL_INTRA_THREADS);
+        let rec = TextRecognitionPredictor::builder()
+            .dict_path(bundled_model(LOCAL_DICT))
+            .with_ort_config(session)
+            .build(bundled_model(LOCAL_REC_MODEL))
+            .map_err(|err| format!("加载本地识别模型失败：{err}"))?;
+        Ok(Self { rec })
+    }
+
+    fn recognize(
+        &self,
+        image: &RgbImage,
+        layout: &crate::text_layout::RowLayout,
+    ) -> Result<OcrText, String> {
+        let started = Instant::now();
+        let row_images =
+            crate::text_layout::row_images(image, layout, crate::text_layout::RowConfig::default());
+
+        // 每行按宽高比切块，拼成一个批次送一次识别（比逐行调用快很多）。
+        let mut batch: Vec<RgbImage> = Vec::new();
+        let mut chunk_counts: Vec<usize> = Vec::with_capacity(row_images.len());
+        for row in &row_images {
+            let gray = image::imageops::grayscale(row);
+            let spans = crate::text_layout::chunks(&gray, MAX_LINE_RATIO);
+            chunk_counts.push(spans.len());
+            for (x0, x1) in spans {
+                let width = x1.saturating_sub(x0).max(1);
+                batch.push(image::imageops::crop_imm(row, x0, 0, width, row.height()).to_image());
+            }
+        }
+
+        if batch.is_empty() {
+            return Ok(OcrText {
+                elapsed_secs: started.elapsed().as_secs_f64(),
+                ..Default::default()
+            });
+        }
+        let chunk_total = batch.len();
+        let result = self
+            .rec
+            .predict(batch)
+            .map_err(|err| format!("本地识别推理失败：{err}"))?;
+
+        // 按行拼回文本（识别结果与输入顺序一一对应；防御性处理长度不一致）。
+        let mut raw_rows: Vec<String> = vec![String::new(); row_images.len()];
+        let mut scores: Vec<Vec<f32>> = vec![Vec::new(); row_images.len()];
+        let mut cursor = 0usize;
+        for (row_index, count) in chunk_counts.iter().enumerate() {
+            for _ in 0..*count {
+                if let Some(text) = result.texts.get(cursor) {
+                    raw_rows[row_index].push_str(text);
+                }
+                if let Some(score) = result.scores.get(cursor) {
+                    scores[row_index].push(*score);
+                }
+                cursor += 1;
+            }
+        }
+
+        let mut ocr = OcrText {
+            elapsed_secs: 0.0,
+            notes: Vec::new(),
+            layout: Some(layout.clone()),
+            row_texts: Vec::with_capacity(row_images.len()),
+            ..Default::default()
+        };
+        if result.texts.len() != chunk_total {
+            ocr.notes.push(format!(
+                "识别结果数量异常：{} 块输入，{} 条输出",
+                chunk_total,
+                result.texts.len()
+            ));
+        }
+
+        for (row_index, raw) in raw_rows.iter().enumerate() {
+            let normalized =
+                crate::ocr_normalize::snap_confusables(&crate::ocr_normalize::normalize(raw));
+            let text = normalized.trim().to_string();
+            ocr.row_texts.push(text.clone());
+            if text.is_empty() {
+                continue;
+            }
+            let Some(row) = layout.rows.get(row_index) else {
+                continue;
+            };
+            if !ocr.text.is_empty() {
+                ocr.text.push('\n');
+            }
+            let start = ocr.text.chars().count();
+            ocr.text.push_str(&text);
+            let end = start + text.chars().count();
+            let score = if scores[row_index].is_empty() {
+                0.0
+            } else {
+                scores[row_index].iter().sum::<f32>() / scores[row_index].len() as f32
+            };
+            ocr.regions.push(OcrRegion {
+                text,
+                score,
+                left: row.rect.x0 as f32,
+                top: row.rect.y0 as f32,
+                right: row.rect.x1 as f32,
+                bottom: row.rect.y1 as f32,
+                range: start..end,
+            });
+        }
+        ocr.elapsed_secs = started.elapsed().as_secs_f64();
+        Ok(ocr)
+    }
+}
+
+/// 检测路径送模型前的放大（分行路径不需要：识别模型自己会把行高归一化到 48）。
+fn upscale(image: &RgbImage, factor: u32) -> RgbImage {
+    let factor = factor.clamp(1, 3);
+    if factor <= 1 {
+        return image.clone();
+    }
+    image::imageops::resize(
+        image,
+        image.width() * factor,
+        image.height() * factor,
+        image::imageops::FilterType::Lanczos3,
+    )
 }
 
 /// 把检测框按位置整理成文本行：同一行的文字按 x 排序，行与行按 y 排序。
 ///
 /// `all_text()` 按检测顺序返回，遇到两个任务条目、或者倾斜/换行时顺序可能乱掉。
 /// 用检测框重新排一次，后续解析拿到的就是「从左到右、从上到下」的文本。
-///
-/// 同时返回每个检测框的坐标和在文本中的字符区间，供点阵字库复核使用。
 /// 一个检测框的文本和位置（组装成文本行时的中间结构）。
 struct OcrItem {
     text: String,
@@ -415,12 +565,12 @@ pub fn remote_recognize(
     let data = response_body
         .read_to_vec()
         .map_err(|err| format!("读取远程响应失败：{err}"))?;
-    // 远端接口只回文本，没有检测框，因此不做字库复核（`regions` 为空）。
+    // 远端接口只回文本，没有行位置，所以 `regions` 为空。
     Ok(OcrText {
-        text: extract_ocr_text(&data),
+        text: crate::ocr_normalize::normalize(&extract_ocr_text(&data)),
         elapsed_secs: started.elapsed().as_secs_f64(),
         regions: Vec::new(),
-        notes: Vec::new(),
+        ..Default::default()
     })
 }
 

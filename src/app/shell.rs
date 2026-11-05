@@ -371,6 +371,14 @@ impl MhxyApp {
             self.show_flight_flags_window = !self.show_flight_flags_window;
             ui.close();
         }
+        if ui
+            .selectable_label(self.show_rows_debug, "行分割调试…")
+            .on_hover_text("把任务面板按行切开的效果画出来，确认每一行切得对不对")
+            .clicked()
+        {
+            self.toggle_rows_debug();
+            ui.close();
+        }
     }
 
     pub(super) fn help_menu_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -1193,6 +1201,23 @@ impl eframe::App for MhxyApp {
                     }
                 },
             );
+        }
+        // 行分割调试：普通浮窗即可（调试用，不需要独立视口和置顶同步）。
+        if self.show_rows_debug {
+            let mut open = true;
+            egui::Window::new("行分割调试")
+                .id(egui::Id::new("rows_debug_window"))
+                .open(&mut open)
+                .default_size([760.0, 720.0])
+                .default_pos([120.0, 80.0])
+                .resizable(true)
+                .show(&ctx.clone(), |ui| {
+                    ui.set_min_width(560.0);
+                    self.rows_debug_window_ui(ui);
+                });
+            if !open {
+                self.show_rows_debug = false;
+            }
         }
     }
 

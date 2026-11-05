@@ -5,15 +5,14 @@
 mod app;
 mod capture;
 mod config;
-mod coord_fix;
 mod core;
 mod flight_flags;
-mod font_lib;
 mod gate;
 mod hotkey;
 mod meditation;
 mod ocr;
-mod preprocess;
+mod ocr_normalize;
+mod text_layout;
 mod theme;
 mod update;
 

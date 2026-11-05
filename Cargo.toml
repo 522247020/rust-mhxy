@@ -4,28 +4,11 @@ version = "0.2.19"
 edition = "2021"
 description = "梦幻西游抓鬼/鬼王任务坐标辅助（Rust + egui）"
 license = "MIT"
-# 有多个 bin：不加这行 `cargo run` 会报「无法确定要运行哪个」。
-# 字库工具用 `cargo run --bin font-tool` / `font-studio` / `font-pick`。
 default-run = "rust-mhxy"
 
 [[bin]]
 name = "rust-mhxy"
 path = "src/main.rs"
-
-# 字库调试工具：建库 / 在截图上直接读字，不启动 UI。
-[[bin]]
-name = "font-tool"
-path = "src/bin/font_tool.rs"
-
-# 字库采集的图形界面：选窗口 / 框区域 / 看切字 / 逐个检查字模。
-[[bin]]
-name = "font-studio"
-path = "src/bin/font_studio.rs"
-
-# 完全手动的字库工具：不跑 OCR，自己拖框圈字 + 填标签。
-[[bin]]
-name = "font-pick"
-path = "src/bin/font_pick.rs"
 
 [dependencies]
 eframe = { version = "0.36", default-features = false, features = [

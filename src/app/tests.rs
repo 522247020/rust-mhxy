@@ -491,7 +491,6 @@ fn advanced_settings_hold_low_frequency_controls() {
     app.config.ocr_mode = "remote".into();
     app.config.api_url = "http://127.0.0.1:8008".into();
     app.config.color_gate_enabled = true;
-    app.config.preprocess_mode = "binary".into();
     let ctx = app.ctx.clone();
     let mut output = ctx.run_ui(
         egui::RawInput {
@@ -1280,6 +1279,7 @@ fn map_window_sizes_itself_to_the_map_image() {
         elapsed_secs: 0.1,
         regions: Vec::new(),
         notes: Vec::new(),
+        ..Default::default()
     });
     // 模拟旧版本存下来的固定 560×460 布局：升级后应自动贴合图片大小，
     // 但仍保留原来的位置。
@@ -1328,6 +1328,7 @@ fn map_window_builder_geometry_stays_frozen_after_manual_resize() {
         elapsed_secs: 0.1,
         regions: Vec::new(),
         notes: Vec::new(),
+        ..Default::default()
     });
     app.set_map_window(true);
     let mut output = ctx.run_ui(input(), |ui| app.ui(ui, &mut frame));
@@ -1441,6 +1442,7 @@ fn result(generation: u64) -> OcrEvent {
             elapsed_secs: 0.25,
             regions: Vec::new(),
             notes: Vec::new(),
+            ..Default::default()
         }),
     }
 }
@@ -1454,6 +1456,7 @@ fn switching_windows_discards_inflight_results_and_previous_coordinates() {
         elapsed_secs: 0.1,
         regions: Vec::new(),
         notes: Vec::new(),
+        ..Default::default()
     });
     assert!(app.tasks["抓鬼"].location.is_some());
     app.busy = true;
@@ -1498,41 +1501,6 @@ fn remote_test_feedback_is_available_with_simple_logging() {
     let text = std::fs::read_to_string(&app.log_path).unwrap_or_default();
     assert!(text.contains("连接超时"), "日志应直接写入磁盘：{text:?}");
     let _ = std::fs::remove_file(&app.log_path);
-}
-
-#[test]
-fn region_window_renders_all_preprocess_modes() {
-    let mut app = app();
-    app.show_region_window = true;
-    app.config.preprocess_mode = "color".into();
-    app.config.preprocess_color = [240, 210, 120];
-    app.update_preview(image::RgbImage::from_pixel(
-        320,
-        240,
-        image::Rgb([24, 24, 24]),
-    ));
-    let ctx = app.ctx.clone();
-    for mode in [
-        "off",
-        "gray",
-        "binary",
-        "color",
-        "color,binary",
-        "gray,binary",
-        "binary,invert",
-    ] {
-        app.config.preprocess_mode = mode.into();
-        app.refresh_preprocess_preview();
-        let mut output = ctx.run_ui(
-            egui::RawInput {
-                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 700.0))),
-                ..Default::default()
-            },
-            |ui| app.region_window_ui(ui),
-        );
-        assert!(!output.shapes.is_empty(), "预处理模式 {mode} 渲染失败");
-        output.textures_delta.clear();
-    }
 }
 
 #[test]
@@ -1621,6 +1589,7 @@ fn panel_test_result_is_formatted_for_region_window() {
                 elapsed_secs: 0.2,
                 regions: Vec::new(),
                 notes: Vec::new(),
+                ..Default::default()
             }),
         })
         .unwrap();
@@ -1645,167 +1614,6 @@ fn panel_test_result_is_formatted_for_region_window() {
         .unwrap();
     app.poll_events();
     assert_eq!(app.ocr_test_result, Some(Err("模型加载失败".to_string())));
-}
-
-#[test]
-fn region_window_uses_left_right_layout() {
-    fn mesh_bounds(shape: &egui::Shape, texture: egui::TextureId) -> Option<Rect> {
-        match shape {
-            egui::Shape::Mesh(mesh) if mesh.texture_id == texture => Some(mesh.calc_bounds()),
-            egui::Shape::Vec(shapes) => shapes.iter().find_map(|shape| mesh_bounds(shape, texture)),
-            _ => None,
-        }
-    }
-    let mut app = app();
-    app.show_region_window = true;
-    app.config.preprocess_mode = "binary".into();
-    app.config.extra_region_enabled = true;
-    app.update_preview(image::RgbImage::from_pixel(
-        640,
-        360,
-        image::Rgb([20, 20, 20]),
-    ));
-    let ctx = app.ctx.clone();
-    let mut output = ctx.run_ui(
-        egui::RawInput {
-            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, 820.0))),
-            ..Default::default()
-        },
-        |ui| app.region_window_ui(ui),
-    );
-    let preview_id = app.preview_texture.as_ref().expect("预览纹理").id();
-    let preprocess_id = app.preprocess_preview.as_ref().expect("预处理预览").id();
-    let extra_preview_id = app
-        .preprocess_preview_extra
-        .as_ref()
-        .expect("备用区域预处理预览")
-        .id();
-    let preview = output
-        .shapes
-        .iter()
-        .find_map(|shape| mesh_bounds(&shape.shape, preview_id))
-        .expect("识别区域预览未绘制");
-    let preprocess = output
-        .shapes
-        .iter()
-        .find_map(|shape| mesh_bounds(&shape.shape, preprocess_id))
-        .expect("预处理预览未绘制");
-    assert!(preview.min.x >= 300.0, "识别区域预览应在右侧：{preview:?}");
-    assert!(
-        preprocess.min.x >= 300.0,
-        "预处理预览应在右侧：{preprocess:?}"
-    );
-    assert!(
-        preprocess.min.y > preview.max.y,
-        "预处理预览应在识别区域预览下方：preview={preview:?} preprocess={preprocess:?}"
-    );
-    let extra_preprocess = output
-        .shapes
-        .iter()
-        .find_map(|shape| mesh_bounds(&shape.shape, extra_preview_id))
-        .expect("备用区域预处理预览未绘制");
-    assert!(
-        preprocess.min.x < extra_preprocess.min.x,
-        "主区域在左、备用区域在右：main={preprocess:?} extra={extra_preprocess:?}"
-    );
-    assert!(
-        preprocess.min.y < extra_preprocess.max.y && extra_preprocess.min.y < preprocess.max.y,
-        "两张预处理预览应左右排列：main={preprocess:?} extra={extra_preprocess:?}"
-    );
-
-    // 文字位置：截图范围、门控设置在上排左侧；识别预处理在分隔线下方。
-    fn text_pos(shapes: &[egui::epaint::ClippedShape], needle: &str) -> Option<egui::Pos2> {
-        fn walk(shape: &egui::Shape, needle: &str) -> Option<egui::Pos2> {
-            match shape {
-                egui::Shape::Text(text) => text.galley.text().contains(needle).then_some(text.pos),
-                egui::Shape::Vec(shapes) => shapes.iter().find_map(|shape| walk(shape, needle)),
-                _ => None,
-            }
-        }
-        shapes.iter().find_map(|shape| walk(&shape.shape, needle))
-    }
-    let scope = text_pos(&output.shapes, "截图范围").expect("缺少截图范围标题");
-    let extra_region = text_pos(&output.shapes, "备用区域").expect("缺少备用区域标题");
-    let gate = text_pos(&output.shapes, "图色门控设置").expect("缺少门控标题");
-    let preprocess_title = text_pos(&output.shapes, "识别预处理").expect("缺少预处理标题");
-    let preview_title = text_pos(&output.shapes, "识别区域预览").expect("缺少预览标题");
-    assert!(
-        scope.y < extra_region.y && extra_region.y < gate.y,
-        "顺序应为 截图范围 → 备用区域 → 门控设置：{scope:?} {extra_region:?} {gate:?}"
-    );
-    let main_region = text_pos(&output.shapes, "主区域").expect("缺少主区域标题");
-    let enable_extra = text_pos(&output.shapes, "启用备用区域").expect("缺少启用备用区域");
-    let main_preprocess = text_pos(&output.shapes, "主区域预处理").expect("缺少主区域预处理");
-    let extra_preprocess = text_pos(&output.shapes, "备用区域预处理").expect("缺少备用区域预处理");
-    assert!(
-        main_region.y < extra_region.y && extra_region.y < enable_extra.y,
-        "截图范围内顺序应为 主区域 → 备用区域 → 启用备用区域"
-    );
-    assert!(
-        main_preprocess.y > gate.y && main_preprocess.y < extra_preprocess.y,
-        "预处理应为 主区域在上、备用区域在下，且在门控设置之后：{main_preprocess:?} {extra_preprocess:?}"
-    );
-    assert!(
-        preprocess_title.y > gate.y,
-        "识别预处理应在分隔线下方、门控设置之后"
-    );
-    assert!(
-        preview_title.x > scope.x + 120.0,
-        "识别区域预览标题应在右侧列"
-    );
-    output.textures_delta.clear();
-}
-
-#[test]
-fn preprocess_settings_are_independent_per_region() {
-    let mut app = app();
-    app.config.preprocess_mode = "binary".into();
-    app.config.extra_preprocess_mode = "color".into();
-    app.config.extra_preprocess_color = [1, 2, 3];
-    app.config.extra_region_enabled = true;
-    app.show_region_window = true;
-    app.update_preview(image::RgbImage::from_pixel(
-        200,
-        100,
-        image::Rgb([30, 30, 30]),
-    ));
-    assert_eq!(app.preprocess_pipeline_for(false).config_value(), "binary");
-    assert_eq!(app.preprocess_pipeline_for(true).config_value(), "color");
-    assert!(app.preprocess_preview.is_some(), "主区域预览应生成");
-    assert!(app.preprocess_preview_extra.is_some(), "备用区域预览应生成");
-
-    // 修改主区域设置不影响备用区域。
-    app.config.preprocess_mode = "gray".into();
-    app.refresh_preprocess_preview();
-    assert_eq!(app.preprocess_pipeline_for(true).config_value(), "color");
-}
-
-#[test]
-fn preprocess_preview_tracks_settings() {
-    let mut app = app();
-    app.show_region_window = true;
-    app.config.preprocess_mode = "binary".into();
-    app.update_preview(image::RgbImage::from_pixel(
-        60,
-        40,
-        image::Rgb([10, 10, 10]),
-    ));
-    assert!(
-        app.preprocess_preview.is_some(),
-        "取点窗口打开时应生成预处理预览"
-    );
-    let first = app.preprocess_preview.as_ref().map(|texture| texture.id());
-    app.config.preprocess_mode = "gray".into();
-    app.refresh_preprocess_preview();
-    assert_eq!(
-        app.preprocess_preview.as_ref().map(|texture| texture.id()),
-        first,
-        "切换模式应复用同一纹理"
-    );
-
-    app.show_region_window = false;
-    app.release_preview();
-    assert!(app.preprocess_preview.is_none(), "关闭取点窗口后释放预览");
 }
 
 #[test]
@@ -1863,6 +1671,7 @@ fn failed_recognition_keeps_previous_map_and_bounds() {
         elapsed_secs: 0.1,
         regions: Vec::new(),
         notes: Vec::new(),
+        ..Default::default()
     };
     for width in [700.0, 320.0] {
         let mut expected = None;
@@ -1875,6 +1684,7 @@ fn failed_recognition_keeps_previous_map_and_bounds() {
                     elapsed_secs: 0.1,
                     regions: Vec::new(),
                     notes: Vec::new(),
+                    ..Default::default()
                 });
             }
             let mut output = ctx.run_ui(
@@ -1932,15 +1742,12 @@ fn renders_in_light_theme() {
 #[test]
 fn profiles_apply_save_and_delete() {
     let mut app = app();
-    app.config.preprocess_mode = "binary".into();
     app.config.color_gate_enabled = true;
     app.save_active_profile();
 
-    app.config.preprocess_mode = "off".into();
     app.config.color_gate_enabled = false;
     let name = app.config.active_profile.clone();
     app.apply_profile(&name);
-    assert_eq!(app.config.preprocess_mode, "binary");
     assert!(app.config.color_gate_enabled);
 
     app.profile_name_edit = "测试方案".into();
@@ -2175,6 +1982,7 @@ fn renders_local_remote_and_map_layouts_at_supported_sizes() {
                 elapsed_secs: 0.1,
                 regions: Vec::new(),
                 notes: Vec::new(),
+                ..Default::default()
             });
         }
         let mut output = ctx.run_ui(
@@ -2209,38 +2017,121 @@ fn renders_local_remote_and_map_layouts_at_supported_sizes() {
     assert_eq!(app.map_textures.len(), 2);
 }
 
-/// 点阵字库：加载失败要能报出来，关掉之后既不清空已有结果也不报错；
-/// 复核产生的说明要写进详细日志，方便事后核对「是不是字库改坏了」。
+/// 行分割调试窗口：拿到合成面板后应算出两行，并把行框 / 投影画出来。
 #[test]
-fn font_lib_status_and_notes_are_reported() {
+fn rows_debug_preview_shows_projection_rows() {
     let mut app = app();
-    app.config.log_level = "detailed".into();
-    app.log_path =
-        std::env::temp_dir().join(format!("rust-mhxy-fontlib-log-{}.log", std::process::id()));
-    let _ = std::fs::remove_file(&app.log_path);
+    // 两行「方块字」，行间留足空隙，确保投影能切开。
+    let panel = two_line_panel();
+    app.show_rows_debug = true;
+    app.set_rows_debug_panel(panel);
+    let layout = app.rows_debug_layout.clone().expect("应算出分行结果");
+    assert_eq!(layout.rows.len(), 2, "两行应切成两条带：{layout:?}");
+    assert!(layout.reliable, "规整的两行应判可信");
 
-    app.config.font_lib_enabled = true;
-    app.config.font_lib_path = "definitely-missing-fontlib.json".into();
-    app.reload_font_lib();
-    assert!(app.font_lib.is_none());
-    let error = app.font_lib_error.clone().unwrap_or_default();
-    assert!(error.contains("fontlib"), "错误信息要指出路径：{error:?}");
+    let ctx = app.ctx.clone();
+    let mut output = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 700.0))),
+            ..Default::default()
+        },
+        |ui| app.rows_debug_window_ui(ui),
+    );
+    let texts = collect_texts(&output.shapes);
+    assert!(
+        texts.iter().any(|text| text.contains("行数 2")),
+        "应显示行数统计：{texts:?}"
+    );
+    assert!(app.rows_debug_texture.is_some(), "预览纹理应在渲染后建立");
+    output.textures_delta.clear();
+}
 
-    app.config.font_lib_enabled = false;
-    app.reload_font_lib();
-    assert!(app.font_lib.is_none());
-    assert!(app.font_lib_error.is_none(), "关掉后不该继续报错");
+/// 归一化 + 混淆字符还原之后，解析器要能认出坐标和地图名。
+#[test]
+fn normalized_row_text_still_parses_tasks() {
+    let app = app();
+    let raw = "抓鬼 长寿村 ７９，２Ｇ 附近"; // 全角数字 + 字母 G 混淆
+    let normalized = crate::ocr_normalize::snap_confusables(&crate::ocr_normalize::normalize(raw));
+    assert_eq!(normalized, "抓鬼 长寿村 79,26 附近");
+    let tasks = crate::core::parse_tasks(
+        &normalized,
+        &app.maps,
+        crate::core::TaskFilter::KEYWORD_TASKS,
+    );
+    let task = tasks.first().expect("应解析出抓鬼任务");
+    assert_eq!(task.map_name, "长寿村");
+    assert_eq!((task.x, task.y), (79, 26));
+}
 
+/// 最近一次识别的行布局要留给侧边栏展示。
+#[test]
+fn apply_ocr_remembers_row_layout() {
+    let mut app = app();
+    let layout = crate::text_layout::rows(&two_line_panel(), Default::default());
     app.apply_ocr(&OcrText {
-        text: "抓鬼 长寿村 79,26".into(),
+        text: "抓鬼 长寿村 12,34".into(),
         elapsed_secs: 0.1,
         regions: Vec::new(),
-        notes: vec!["字库复核坐标 79,2G → 79,26".into()],
+        notes: Vec::new(),
+        layout: Some(layout),
+        row_texts: vec!["抓鬼 长寿村 12,34".into()],
     });
-    let text = std::fs::read_to_string(&app.log_path).unwrap_or_default();
-    assert!(
-        text.contains("字库复核坐标 79,2G → 79,26"),
-        "复核说明要写进详细日志：{text:?}"
+    let remembered = app.last_ocr_layout.as_ref().expect("应保留行布局");
+    assert_eq!(remembered.rows.len(), 2);
+}
+
+/// 两行方块字的面板：每行 12 个 8×12 的实心块，行间留 16px 空隙。
+fn two_line_panel() -> image::RgbImage {
+    let mut image = image::RgbImage::from_pixel(160, 80, image::Rgb([20, 24, 30]));
+    for row in 0..2 {
+        let top = 12 + row * 40;
+        for index in 0..12u32 {
+            let left = 8 + index * 12;
+            for y in top..top + 14 {
+                for x in left..left + 8 {
+                    image.put_pixel(x, y, image::Rgb([240, 240, 240]));
+                }
+            }
+        }
+    }
+    image
+}
+
+/// 「更多 → 工具」里要有行分割调试入口，点击按钮能切换开关。
+#[test]
+fn tools_menu_exposes_rows_debug_entry() {
+    let mut app = app();
+    let ctx = app.ctx.clone();
+    let mut output = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(600.0, 600.0))),
+            ..Default::default()
+        },
+        |ui| app.tools_menu_ui(ui, &ctx.clone()),
     );
-    let _ = std::fs::remove_file(&app.log_path);
+    let texts = collect_texts(&output.shapes);
+    output.textures_delta.clear();
+    assert!(
+        texts.iter().any(|text| text == "行分割调试…"),
+        "工具菜单应提供行分割调试入口：{texts:?}"
+    );
+}
+
+/// 没有选窗口时打开调试窗口只给提示，不崩；重复调用就是开关。
+#[test]
+fn toggle_rows_debug_flags_and_explains_missing_window() {
+    let mut app = app();
+    assert!(!app.show_rows_debug);
+    app.toggle_rows_debug();
+    assert!(app.show_rows_debug);
+    assert!(
+        app.rows_debug_message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("游戏窗口"),
+        "没有选窗口时应提示先选窗口：{:?}",
+        app.rows_debug_message
+    );
+    app.toggle_rows_debug();
+    assert!(!app.show_rows_debug, "再点一次应关闭");
 }

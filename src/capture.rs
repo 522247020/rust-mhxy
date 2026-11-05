@@ -107,8 +107,7 @@ pub fn client_rect(handle: i64) -> Option<(i32, i32, u32, u32)> {
     imp::client_rect(handle)
 }
 
-/// 整个屏幕（主屏，像素）。取点 / 调识别区域时用，看到的就是用户看到的。
-/// 目前只有 `font-tool` 用，主程序不开这条路径。
+/// 整个屏幕（主屏，像素）。调试分行 / 取点时用，看到的就是用户看到的。
 #[allow(dead_code)]
 pub fn capture_desktop() -> Result<RgbImage, String> {
     imp::capture_desktop()
@@ -231,11 +230,6 @@ mod imp {
         let width = width.clamp(1, full_w as i32 - x as i32) as u32;
         let height = height.clamp(1, full_h as i32 - y as i32) as u32;
         Ok(image::imageops::crop_imm(&full, x, y, width, height).to_image())
-    }
-
-    pub fn client_rect(_handle: i64) -> Option<(i32, i32, u32, u32)> {
-        // 非 Windows 开发环境下拿不到客户区原点，只能给窗口位置。
-        None
     }
 
     pub fn capture_desktop() -> Result<RgbImage, String> {

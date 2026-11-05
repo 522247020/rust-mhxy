@@ -10,16 +10,12 @@
   "ocr/interval_seconds": 5,
   // 实时模式：true 时不等间隔，上一轮 OCR 一结束就继续下一轮（持续截图 + OCR）
   "ocr/realtime": false,
-  // 送 OCR 前把截图放大几倍（1~3）。任务栏文字较小时提高检测召回。
+  // 回退到检测模型时把截图放大几倍（1~3）。分行识别不需要放大。
   "ocr/upscale": 2,
   // 高召回检测：降低 PP-OCR 检测阈值，减少漏字；代价是可能多出噪声框。
   "ocr/high_recall": true,
   // 多帧投票：地图取最近几帧众数、坐标取中位数，抑制单帧错认导致的跳动。
   "ocr/vote_frames": true,
-  // 点阵字库复核坐标：用 16x24 模板重读 OCR 认到的坐标数字（需先用 font-tool 建库）。
-  "ocr/font_lib": false,
-  // 字库路径；留空用 assets/fontlib.json，相对路径也相对 assets 目录。
-  "ocr/font_lib_path": "",
   // 识别触发方式："auto" 按间隔自动识别；"manual" 按快捷键手动触发一次
   "ocr/trigger": "auto",
   // 手动模式的快捷键，例如 F8、Ctrl+F8；Windows 下全局生效
@@ -30,14 +26,6 @@
   "ocr/extra_task_region": "0.70,0.71,0.99,0.90",
   // 是否启用第二个截图区域
   "ocr/extra_region_enabled": false,
-  // OCR 前的预处理，可叠加，按固定顺序执行：颜色提取 → 灰度 → 二值化 → 反色
-  // "off" 关闭；可组合，如 "binary"、"gray,binary"、"color,binary"、"binary,invert"
-  // 颜色提取输出黑字白底；二值化把文字判成白色时再加 "invert"
-  "ocr/preprocess": "off",
-  // 颜色提取时保留的文字颜色（十六进制），默认 234, 255, 101 即 #eaff65
-  "ocr/preprocess_color": "#eaff65",
-  // 颜色提取时的颜色容差（每通道 0~255）
-  "ocr/preprocess_tolerance": 24,
 
   // ---- 远端 PP-OCR ----
   // 请求格式："multipart"（POST /ocr，表单字段 file）/"raw"（POST /ocr/raw，原始字节）
@@ -135,7 +123,6 @@
   // 识别区域窗口里三个分组的折叠状态（true = 展开）
   "window/region/scope_open": true,
   "window/region/gate_open": true,
-  "window/region/preprocess_open": true,
   // 窗口置顶
   "window/coordinate/on_top": false
 }

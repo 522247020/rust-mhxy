@@ -122,10 +122,6 @@ def package(binary: Path, output: Path, models: Path, ort_cache: Path, version: 
     shutil.copy2(ROOT / "config.example.json", stage)
     shutil.copy2(ROOT / "LICENSE", stage)
     shutil.copy2(ROOT / "assets" / "maps.json", stage / "assets")
-    # 点阵字库是可选的：存在才随包（配合 config.json 里的 "ocr/font_lib" 开关）。
-    fontlib = ROOT / "assets" / "fontlib.json"
-    if fontlib.exists():
-        shutil.copy2(fontlib, stage / "assets" / "fontlib.json")
     shutil.copytree(ROOT / "assets" / "maps", stage / "assets" / "maps", ignore=shutil.ignore_patterns(".gitkeep"))
     for name in MODEL_HASHES:
         shutil.copy2(models / name, stage / "assets" / "models" / name)

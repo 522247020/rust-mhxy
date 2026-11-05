@@ -64,17 +64,8 @@ impl MhxyApp {
         self.config.color_gate_mode = profile.gate_mode;
         self.config.color_gate_tolerance = profile.gate_tolerance;
         self.config.color_gate_points = profile.gate_points;
-        self.config.preprocess_mode = profile.preprocess_mode;
-        self.config.preprocess_color = profile.preprocess_color;
-        self.config.preprocess_tolerance = profile.preprocess_tolerance;
-        self.config.extra_preprocess_mode = profile.extra_preprocess_mode;
-        self.config.extra_preprocess_color = profile.extra_preprocess_color;
-        self.config.extra_preprocess_tolerance = profile.extra_preprocess_tolerance;
-        self.preprocess_color_edit = gate::to_hex(self.config.preprocess_color);
-        self.extra_preprocess_color_edit = gate::to_hex(self.config.extra_preprocess_color);
         self.invalidate_scan();
         self.check_gate();
-        self.refresh_preprocess_preview();
         self.persist();
         self.log_detail(format!("切换识别方案：{name}"));
     }
@@ -709,96 +700,43 @@ impl MhxyApp {
             }
             if self.config.ocr_mode == "local" {
                 ui.add_space(4.0);
-                if ui
-                    .checkbox(&mut self.config.font_lib_enabled, "点阵字库复核坐标")
-                    .on_hover_text(
-                        "用 16x24 点阵模板重读 OCR 认到的坐标数字；需要先用 font-tool 建库，且只对本地识别生效",
-                    )
-                    .changed()
-                {
-                    self.reload_font_lib();
-                    self.invalidate_scan();
-                    self.persist();
-                }
-                if self.config.font_lib_enabled {
-                    ui.horizontal(|ui| {
-                        ui.label("字库");
-                        let response = ui.add(
-                            egui::TextEdit::singleline(&mut self.config.font_lib_path)
-                                .hint_text("默认 assets/fontlib.json")
-                                .desired_width(150.0),
+                match &self.last_ocr_layout {
+                    Some(layout) => {
+                        let source = match layout.source {
+                            crate::text_layout::RowSource::Projection => "投影",
+                            crate::text_layout::RowSource::Cluster => "聚类兜底",
+                        };
+                        let color = if layout.reliable {
+                            theme::jade()
+                        } else {
+                            theme::gold()
+                        };
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "分行识别：{} 行｜行高 {}px｜{}｜{}",
+                                layout.rows.len(),
+                                layout.line_height,
+                                source,
+                                if layout.reliable {
+                                    "走分行路径"
+                                } else {
+                                    "回退检测模型"
+                                }
+                            ))
+                            .small()
+                            .color(color),
                         );
-                        if response.lost_focus() {
-                            self.reload_font_lib();
-                            self.persist();
-                        }
-                        if ui
-                            .button("重新加载")
-                            .on_hover_text("改了字库文件后点这里重新读取")
-                            .clicked()
-                        {
-                            self.reload_font_lib();
-                        }
-                    });
-                    match (&self.font_lib, &self.font_lib_error) {
-                        (Some(lib), _) => {
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "已加载 {} 个字模（{}x{}）",
-                                    lib.len(),
-                                    lib.cell_w,
-                                    lib.cell_h
-                                ))
-                                .small()
-                                .color(theme::jade()),
-                            );
-                            // 累计统计：直接回答「字库到底在不在用」。
-                            let totals = crate::coord_fix::totals();
-                            let last = crate::coord_fix::last_frame();
-                            let all = totals.report();
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "累计：{} 帧｜坐标段 {}｜确认 {}（成功率 {}）",
-                                    totals.frames,
-                                    all.candidates,
-                                    all.matched,
-                                    all.match_rate()
-                                ))
-                                .small()
-                                .weak(),
-                            );
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "　　　一致 {}（{}）｜改写 {}（改写率 {}）",
-                                    all.agreed,
-                                    all.agree_rate(),
-                                    all.fixes,
-                                    all.fix_rate()
-                                ))
-                                .small()
-                                .weak(),
-                            );
-                            let hint = if totals.frames == 0 {
-                                "还没跑过识别：按一次识别（或快捷键）后这里会动".to_string()
-                            } else if totals.candidates == 0 {
-                                "跑过识别，但画面里没有带坐标的任务行".to_string()
-                            } else {
-                                format!("上一帧：{}", last.summary())
-                            };
-                            ui.label(egui::RichText::new(hint).small().weak());
-                            if ui
-                                .small_button("统计清零")
-                                .on_hover_text("重新开始累计，方便确认本次测试期间到底用了几次")
-                                .clicked()
-                            {
-                                crate::coord_fix::reset_totals();
-                            }
-                        }
-                        (None, Some(err)) => {
-                            ui.label(egui::RichText::new(err).small().color(theme::red()));
-                        }
-                        (None, None) => {}
                     }
+                    None => {
+                        ui.label(egui::RichText::new("分行识别：还没跑过识别").small().weak());
+                    }
+                }
+                if ui
+                    .button("行分割调试…")
+                    .on_hover_text("画出每一行的切分范围和投影曲线，确认切得对不对")
+                    .clicked()
+                {
+                    self.toggle_rows_debug();
                 }
             }
         });
@@ -814,7 +752,7 @@ impl MhxyApp {
             |ui| {
                 self.profile_ui(ui);
                 ui.label(
-                    egui::RichText::new("方案保存识别区域、图色门控和预处理设置。")
+                    egui::RichText::new("方案保存识别区域和图色门控设置。")
                         .small()
                         .weak(),
                 );

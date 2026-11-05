@@ -11,9 +11,6 @@ use std::path::{Path, PathBuf};
 
 pub const CONFIG_FILE_NAME: &str = "config.json";
 pub const CONFIG_PATH_ENV: &str = "MHXY_CONFIG_PATH";
-/// 预处理默认文字颜色：RGB u8 (234, 255, 101)，即 #eaff65。
-pub const DEFAULT_PREPROCESS_COLOR: [u8; 3] = [234, 255, 101];
-
 /// 可保存的识别方案：识别区域 + 图色门控 + 预处理设置，方便一键切换。
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -45,18 +42,6 @@ pub struct Profile {
     pub gate_tolerance: u8,
     #[serde(deserialize_with = "de_points")]
     pub gate_points: Vec<ColorPoint>,
-    #[serde(deserialize_with = "de_profile_preprocess_mode")]
-    pub preprocess_mode: String,
-    #[serde(with = "profile_color_serde")]
-    pub preprocess_color: [u8; 3],
-    #[serde(deserialize_with = "de_profile_preprocess_tolerance")]
-    pub preprocess_tolerance: u8,
-    #[serde(deserialize_with = "de_profile_preprocess_mode")]
-    pub extra_preprocess_mode: String,
-    #[serde(with = "profile_color_serde")]
-    pub extra_preprocess_color: [u8; 3],
-    #[serde(deserialize_with = "de_profile_preprocess_tolerance")]
-    pub extra_preprocess_tolerance: u8,
 }
 
 impl Default for Profile {
@@ -71,12 +56,6 @@ impl Default for Profile {
             gate_mode: "all".to_string(),
             gate_tolerance: 12,
             gate_points: Vec::new(),
-            preprocess_mode: "off".to_string(),
-            preprocess_color: DEFAULT_PREPROCESS_COLOR,
-            preprocess_tolerance: 24,
-            extra_preprocess_mode: "off".to_string(),
-            extra_preprocess_color: DEFAULT_PREPROCESS_COLOR,
-            extra_preprocess_tolerance: 24,
         }
     }
 }
@@ -94,12 +73,6 @@ impl Profile {
             gate_mode: config.color_gate_mode.clone(),
             gate_tolerance: config.color_gate_tolerance,
             gate_points: config.color_gate_points.clone(),
-            preprocess_mode: config.preprocess_mode.clone(),
-            preprocess_color: config.preprocess_color,
-            preprocess_tolerance: config.preprocess_tolerance,
-            extra_preprocess_mode: config.extra_preprocess_mode.clone(),
-            extra_preprocess_color: config.extra_preprocess_color,
-            extra_preprocess_tolerance: config.extra_preprocess_tolerance,
         }
     }
 
@@ -110,8 +83,6 @@ impl Profile {
         } else {
             "all".to_string()
         };
-        self.preprocess_mode = canonical_preprocess_mode(&self.preprocess_mode, false);
-        self.extra_preprocess_mode = canonical_preprocess_mode(&self.extra_preprocess_mode, false);
     }
 }
 
@@ -177,12 +148,6 @@ pub struct Config {
     /// 多帧投票：地图取最近几帧众数、坐标取中位数。
     #[serde(rename = "ocr/vote_frames")]
     pub ocr_vote_frames: bool,
-    /// 点阵字库复核坐标：用模板重读 OCR 认到的坐标数字（需先用 font-tool 建库）。
-    #[serde(rename = "ocr/font_lib")]
-    pub font_lib_enabled: bool,
-    /// 字库路径；留空用 `assets/fontlib.json`，相对路径相对 assets 目录。
-    #[serde(rename = "ocr/font_lib_path")]
-    pub font_lib_path: String,
     /// 按分辨率保存的识别区域：键是 "1920x1080"，值是 "0.65,0.23,0.98,0.50"。
     #[serde(rename = "ocr/region_presets", deserialize_with = "de_region_presets")]
     pub region_presets: std::collections::BTreeMap<String, String>,
@@ -226,22 +191,6 @@ pub struct Config {
     pub color_gate_tolerance: u8,
     #[serde(rename = "color_gate/points", deserialize_with = "de_points")]
     pub color_gate_points: Vec<ColorPoint>,
-    /// OCR 前预处理：off / gray / binary / color。
-    #[serde(rename = "ocr/preprocess")]
-    pub preprocess_mode: String,
-    /// 按颜色提取时保留的文字颜色。
-    #[serde(rename = "ocr/preprocess_color", with = "preprocess_color_serde")]
-    pub preprocess_color: [u8; 3],
-    /// 按颜色提取时的颜色容差。
-    #[serde(rename = "ocr/preprocess_tolerance")]
-    pub preprocess_tolerance: u8,
-    /// 备用区域独立的预处理设置。
-    #[serde(rename = "ocr/extra_preprocess")]
-    pub extra_preprocess_mode: String,
-    #[serde(rename = "ocr/extra_preprocess_color", with = "preprocess_color_serde")]
-    pub extra_preprocess_color: [u8; 3],
-    #[serde(rename = "ocr/extra_preprocess_tolerance")]
-    pub extra_preprocess_tolerance: u8,
     /// 界面主题：system（跟随系统）/ light / dark。
     #[serde(rename = "window/theme")]
     pub theme: String,
@@ -316,8 +265,6 @@ pub struct Config {
     pub region_scope_open: bool,
     #[serde(rename = "window/region/gate_open")]
     pub region_gate_open: bool,
-    #[serde(rename = "window/region/preprocess_open")]
-    pub region_preprocess_open: bool,
     #[serde(rename = "window/coordinate/on_top")]
     pub on_top: bool,
 }
@@ -332,8 +279,6 @@ impl Default for Config {
             ocr_upscale: 2,
             ocr_high_recall: true,
             ocr_vote_frames: true,
-            font_lib_enabled: false,
-            font_lib_path: String::new(),
             region_presets: std::collections::BTreeMap::new(),
             extra_task_region: DEFAULT_EXTRA_REGION,
             extra_region_enabled: false,
@@ -355,12 +300,6 @@ impl Default for Config {
             color_gate_mode: "all".into(),
             color_gate_tolerance: 12,
             color_gate_points: Vec::new(),
-            preprocess_mode: "off".into(),
-            preprocess_color: DEFAULT_PREPROCESS_COLOR,
-            preprocess_tolerance: 24,
-            extra_preprocess_mode: "off".into(),
-            extra_preprocess_color: DEFAULT_PREPROCESS_COLOR,
-            extra_preprocess_tolerance: 24,
             theme: "system".into(),
             // 新用户默认收起「高级设置」，侧栏只留常用项。
             sidebar_folded: "advanced".to_string(),
@@ -384,7 +323,6 @@ impl Default for Config {
             update_manifest_url: crate::update::DEFAULT_MANIFEST_URL.to_string(),
             region_scope_open: true,
             region_gate_open: true,
-            region_preprocess_open: true,
             on_top: true,
             profiles: Vec::new(),
             active_profile: String::new(),
@@ -467,8 +405,6 @@ impl Config {
         } else {
             "all".to_string()
         };
-        self.preprocess_mode = canonical_preprocess_mode(&self.preprocess_mode, true);
-        self.extra_preprocess_mode = canonical_preprocess_mode(&self.extra_preprocess_mode, false);
         self.theme = match self.theme.as_str() {
             "light" => "light".to_string(),
             "dark" => "dark".to_string(),
@@ -516,17 +452,6 @@ pub(crate) fn region_to_string(region: TaskRegion) -> String {
     format!("{},{},{},{}", region.0, region.1, region.2, region.3)
 }
 
-fn canonical_preprocess_mode(value: &str, strict: bool) -> String {
-    match value {
-        "gray" | "grayscale" => "gray".to_string(),
-        "binary" | "binarize" => "binary".to_string(),
-        "color" => "color".to_string(),
-        "off" => "off".to_string(),
-        other if !strict => other.to_string(),
-        _ => "off".to_string(),
-    }
-}
-
 fn bool_from_value(value: &Value) -> Option<bool> {
     match value {
         Value::Bool(value) => Some(*value),
@@ -536,14 +461,6 @@ fn bool_from_value(value: &Value) -> Option<bool> {
         }
         Value::Number(value) => value.as_i64().map(|value| value != 0),
         _ => None,
-    }
-}
-
-fn legacy_string(value: Option<&Value>, default: &str) -> String {
-    match value {
-        Some(Value::String(value)) => value.clone(),
-        Some(Value::Number(value)) => value.to_string(),
-        _ => default.to_string(),
     }
 }
 
@@ -581,55 +498,6 @@ fn fill_ghost_king_high_chance(map: &mut Map<String, Value>) {
     }
 }
 
-/// 旧配置的备用区域预处理会继承主区域；把继承结果先补成显式值。
-fn fill_extra_preprocess(map: &mut Map<String, Value>) {
-    let primary_mode =
-        canonical_preprocess_mode(&legacy_string(map.get("ocr/preprocess"), "off"), true);
-    let primary_color = parse_hex(&legacy_string(
-        map.get("ocr/preprocess_color"),
-        &to_hex(DEFAULT_PREPROCESS_COLOR),
-    ))
-    .unwrap_or(DEFAULT_PREPROCESS_COLOR);
-    let primary_tolerance = map
-        .get("ocr/preprocess_tolerance")
-        .and_then(Value::as_u64)
-        .map(|value| value.min(255) as u8)
-        .unwrap_or(24);
-
-    let extra_mode_is_scalar = matches!(
-        map.get("ocr/extra_preprocess"),
-        Some(Value::String(_) | Value::Number(_))
-    );
-    if !extra_mode_is_scalar {
-        map.insert(
-            "ocr/extra_preprocess".to_string(),
-            Value::String(primary_mode),
-        );
-    }
-
-    let extra_color = match map.get("ocr/extra_preprocess_color") {
-        Some(Value::String(value)) => parse_hex(value).unwrap_or(primary_color),
-        Some(Value::Number(value)) => parse_hex(&value.to_string()).unwrap_or(primary_color),
-        _ => primary_color,
-    };
-    map.insert(
-        "ocr/extra_preprocess_color".to_string(),
-        Value::String(to_hex(extra_color)),
-    );
-
-    let extra_tolerance = match map.get("ocr/extra_preprocess_tolerance") {
-        Some(Value::Number(value)) => value
-            .as_u64()
-            .map(|value| value.min(255) as u8)
-            .unwrap_or(primary_tolerance),
-        _ => primary_tolerance,
-    };
-    map.insert(
-        "ocr/extra_preprocess_tolerance".to_string(),
-        Value::Number(extra_tolerance.into()),
-    );
-}
-
 const STRING_KEYS: &[&str] = &[
     "ocr/mode",
     "api/format",
@@ -639,8 +507,6 @@ const STRING_KEYS: &[&str] = &[
     "ocr/hotkey",
     "log/level",
     "color_gate/mode",
-    "ocr/preprocess",
-    "ocr/extra_preprocess",
     "window/theme",
     "window/sidebar/folded",
     "meditation/hotkey",
@@ -669,7 +535,6 @@ const BOOL_KEYS: &[&str] = &[
     "update/enabled",
     "window/region/scope_open",
     "window/region/gate_open",
-    "window/region/preprocess_open",
     "window/coordinate/on_top",
 ];
 
@@ -680,11 +545,7 @@ const U32_KEYS: &[&str] = &[
     "meditation/font_px",
 ];
 
-const U8_KEYS: &[&str] = &[
-    "color_gate/tolerance",
-    "ocr/preprocess_tolerance",
-    "ocr/extra_preprocess_tolerance",
-];
+const U8_KEYS: &[&str] = &["color_gate/tolerance"];
 
 fn coerce_string(map: &mut Map<String, Value>, key: &str) {
     let replacement = match map.get(key) {
@@ -772,7 +633,6 @@ fn prepare_flat_values(map: &mut Map<String, Value>) {
     resolve_bool_alias(map, "task/option/通用", "task/option/降妖伏魔");
     resolve_bool_alias(map, "meditation/enabled", "meditation/visible");
     fill_ghost_king_high_chance(map);
-    fill_extra_preprocess(map);
     for key in STRING_KEYS {
         coerce_string(map, key);
     }
@@ -851,47 +711,6 @@ mod optional_region_serde {
     {
         let value = Value::deserialize(deserializer)?;
         Ok(value.as_str().and_then(parse_region))
-    }
-}
-
-mod preprocess_color_serde {
-    use super::*;
-
-    pub fn serialize<S>(color: &[u8; 3], serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(&to_hex(*color))
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 3], D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = Value::deserialize(deserializer)?;
-        Ok(color_from_value(&value).unwrap_or(DEFAULT_PREPROCESS_COLOR))
-    }
-}
-
-mod profile_color_serde {
-    use super::*;
-
-    pub fn serialize<S>(color: &[u8; 3], serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(&to_hex(*color))
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 3], D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = Value::deserialize(deserializer)?;
-        Ok(value
-            .as_str()
-            .and_then(parse_hex)
-            .unwrap_or(DEFAULT_PREPROCESS_COLOR))
     }
 }
 
@@ -1087,28 +906,6 @@ where
         .unwrap_or(12))
 }
 
-fn de_profile_preprocess_mode<'de, D>(deserializer: D) -> Result<String, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let value = Value::deserialize(deserializer)?;
-    Ok(canonical_preprocess_mode(
-        value.as_str().unwrap_or("off"),
-        false,
-    ))
-}
-
-fn de_profile_preprocess_tolerance<'de, D>(deserializer: D) -> Result<u8, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let value = Value::deserialize(deserializer)?;
-    Ok(value
-        .as_u64()
-        .map(|value| value.min(255) as u8)
-        .unwrap_or(24))
-}
-
 fn point_from_value(value: &Value) -> Option<ColorPoint> {
     let object = value.as_object()?;
     let x = object.get("x")?.as_i64()? as i32;
@@ -1216,21 +1013,6 @@ pub fn assets_dir() -> PathBuf {
     PathBuf::from(".")
 }
 
-/// 点阵字库的实际路径：配置为空时用 `assets/fontlib.json`，
-/// 相对路径也相对 assets 目录（和模型放在一起，方便随包分发）。
-pub fn font_lib_path(config: &Config) -> PathBuf {
-    let raw = config.font_lib_path.trim();
-    if raw.is_empty() {
-        return assets_dir().join("fontlib.json");
-    }
-    let path = PathBuf::from(raw);
-    if path.is_absolute() {
-        path
-    } else {
-        assets_dir().join(path)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1312,53 +1094,6 @@ mod tests {
     }
 
     #[test]
-    fn round_trips_profiles() {
-        let dir = std::env::temp_dir().join("rust-mhxy-config-profile-test");
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("config.json");
-        let mut config = Config {
-            active_profile: "抓鬼".into(),
-            color_gate_enabled: true,
-            preprocess_mode: "binary".into(),
-            ..Default::default()
-        };
-        let profile = Config::profile_from_current(&config);
-        config.profiles.push(profile);
-        config.save(&path).unwrap();
-        let loaded = Config::load(&path);
-        assert_eq!(loaded.active_profile, "抓鬼");
-        let saved = loaded
-            .profiles
-            .iter()
-            .find(|profile| profile.name == "抓鬼")
-            .expect("方案应被保存");
-        assert!(saved.gate_enabled);
-        assert_eq!(saved.preprocess_mode, "binary");
-        assert_eq!(loaded.profiles[0].name, "默认");
-    }
-
-    #[test]
-    fn round_trips_extra_preprocess_settings() {
-        let dir = std::env::temp_dir().join("rust-mhxy-config-extra-preprocess-test");
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("config.json");
-        Config {
-            preprocess_mode: "binary".into(),
-            extra_preprocess_mode: "color".into(),
-            extra_preprocess_color: [9, 8, 7],
-            extra_preprocess_tolerance: 33,
-            ..Default::default()
-        }
-        .save(&path)
-        .unwrap();
-        let loaded = Config::load(&path);
-        assert_eq!(loaded.preprocess_mode, "binary");
-        assert_eq!(loaded.extra_preprocess_mode, "color");
-        assert_eq!(loaded.extra_preprocess_color, [9, 8, 7]);
-        assert_eq!(loaded.extra_preprocess_tolerance, 33);
-    }
-
-    #[test]
     fn round_trips_theme_setting() {
         let dir = std::env::temp_dir().join("rust-mhxy-config-theme-test");
         let _ = std::fs::create_dir_all(&dir);
@@ -1418,51 +1153,6 @@ mod tests {
     }
 
     #[test]
-    fn round_trips_region_fold_state() {
-        let dir = std::env::temp_dir().join("rust-mhxy-config-fold-test");
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("config.json");
-        Config {
-            region_scope_open: false,
-            region_gate_open: false,
-            region_preprocess_open: true,
-            ..Default::default()
-        }
-        .save(&path)
-        .unwrap();
-        let loaded = Config::load(&path);
-        assert!(!loaded.region_scope_open);
-        assert!(!loaded.region_gate_open);
-        assert!(loaded.region_preprocess_open);
-    }
-
-    #[test]
-    fn default_preprocess_color_is_eaff65() {
-        let config = Config::default();
-        assert_eq!(config.preprocess_color, [234, 255, 101]);
-        assert_eq!(to_hex(config.preprocess_color), "#eaff65");
-    }
-
-    #[test]
-    fn round_trips_preprocess_settings() {
-        let dir = std::env::temp_dir().join("rust-mhxy-config-preprocess-test");
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("config.json");
-        Config {
-            preprocess_mode: "color".into(),
-            preprocess_color: [0xd4, 0xa0, 0x17],
-            preprocess_tolerance: 31,
-            ..Default::default()
-        }
-        .save(&path)
-        .unwrap();
-        let loaded = Config::load(&path);
-        assert_eq!(loaded.preprocess_mode, "color");
-        assert_eq!(loaded.preprocess_color, [0xd4, 0xa0, 0x17]);
-        assert_eq!(loaded.preprocess_tolerance, 31);
-    }
-
-    #[test]
     fn new_generic_key_wins_over_legacy_alias() {
         let dir = std::env::temp_dir().join("rust-mhxy-config-legacy-alias-test");
         let _ = std::fs::create_dir_all(&dir);
@@ -1514,99 +1204,6 @@ mod tests {
         assert_eq!(loaded.theme, "light");
         assert!(loaded.meditation_enabled);
         assert!(loaded.ghost_king_high_chance);
-    }
-
-    #[test]
-    fn legacy_extra_preprocess_inherits_primary() {
-        let dir = std::env::temp_dir().join("rust-mhxy-config-extra-inherit-test");
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("config.json");
-        std::fs::write(
-            &path,
-            r##"{
-                "ocr/preprocess": "binary",
-                "ocr/preprocess_color": "#123456",
-                "ocr/preprocess_tolerance": 33,
-                "ocr/extra_preprocess_color": "#zzzzzz",
-            }"##,
-        )
-        .unwrap();
-        let loaded = Config::load(&path);
-        assert_eq!(loaded.preprocess_mode, "binary");
-        assert_eq!(loaded.extra_preprocess_mode, "binary");
-        assert_eq!(loaded.extra_preprocess_color, [0x12, 0x34, 0x56]);
-        assert_eq!(loaded.extra_preprocess_tolerance, 33);
-    }
-
-    #[test]
-    fn missing_profile_fields_use_defaults() {
-        let dir = std::env::temp_dir().join("rust-mhxy-config-profile-defaults-test");
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("config.json");
-        std::fs::write(
-            &path,
-            r#"{
-                "profiles/items": [{ "name": "旧方案", "gate_enabled": true }],
-            }"#,
-        )
-        .unwrap();
-        let loaded = Config::load(&path);
-        // 没有 profiles/active 时回退到第一个方案。
-        assert_eq!(loaded.active_profile, "旧方案");
-        assert_eq!(loaded.profiles.len(), 1);
-        let profile = &loaded.profiles[0];
-        assert!(profile.gate_enabled);
-        assert_eq!(profile.task_region, None);
-        assert_eq!(profile.extra_task_region, None);
-        assert_eq!(profile.extra_region_enabled, None);
-        assert_eq!(profile.gate_interval_ms, 300);
-        assert_eq!(profile.gate_mode, "all");
-        assert_eq!(profile.gate_tolerance, 12);
-        assert!(profile.gate_points.is_empty());
-        assert_eq!(profile.preprocess_mode, "off");
-        assert_eq!(profile.preprocess_color, DEFAULT_PREPROCESS_COLOR);
-        assert_eq!(profile.preprocess_tolerance, 24);
-        assert_eq!(profile.extra_preprocess_mode, "off");
-        assert_eq!(profile.extra_preprocess_color, DEFAULT_PREPROCESS_COLOR);
-        assert_eq!(profile.extra_preprocess_tolerance, 24);
-        // 旧版 load 对缺失的侧栏折叠字段使用空字符串，而不是 Config::default。
-        assert_eq!(loaded.sidebar_folded, "");
-    }
-
-    #[test]
-    fn creates_default_profile_from_loaded_settings() {
-        let dir = std::env::temp_dir().join("rust-mhxy-config-default-profile-test");
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("config.json");
-        std::fs::write(
-            &path,
-            r##"{
-                "color_gate/enabled": true,
-                "color_gate/interval_ms": 777,
-                "color_gate/points": [{ "x": 1, "y": 2, "color": "#112233" }],
-                "ocr/preprocess": "color",
-                "ocr/region_presets": {
-                    "ok": "0.1,0.1,0.9,0.9",
-                    "bad": "0.9,0.1,0.2,0.9",
-                },
-            }"##,
-        )
-        .unwrap();
-        let loaded = Config::load(&path);
-        assert_eq!(loaded.region_presets.len(), 1);
-        assert_eq!(
-            loaded.region_presets.get("ok").map(String::as_str),
-            Some("0.1,0.1,0.9,0.9")
-        );
-        assert_eq!(loaded.profiles.len(), 1);
-        let profile = &loaded.profiles[0];
-        assert_eq!(profile.name, "默认");
-        assert_eq!(loaded.active_profile, "默认");
-        assert!(profile.gate_enabled);
-        assert_eq!(profile.gate_interval_ms, 777);
-        assert_eq!(profile.gate_points.len(), 1);
-        assert_eq!(profile.preprocess_mode, "color");
-        assert_eq!(profile.extra_preprocess_mode, "color");
     }
 
     #[test]
@@ -1725,20 +1322,12 @@ mod tests {
             "meditation/opacity",
             "meditation/position",
             "meditation/text_color",
-            "ocr/extra_preprocess",
-            "ocr/extra_preprocess_color",
-            "ocr/extra_preprocess_tolerance",
             "ocr/extra_region_enabled",
             "ocr/extra_task_region",
-            "ocr/font_lib",
-            "ocr/font_lib_path",
             "ocr/high_recall",
             "ocr/hotkey",
             "ocr/interval_seconds",
             "ocr/mode",
-            "ocr/preprocess",
-            "ocr/preprocess_color",
-            "ocr/preprocess_tolerance",
             "ocr/realtime",
             "ocr/region_presets",
             "ocr/task_region",
@@ -1757,7 +1346,6 @@ mod tests {
             "update/manifest_url",
             "window/coordinate/on_top",
             "window/region/gate_open",
-            "window/region/preprocess_open",
             "window/region/scope_open",
             "window/sidebar/folded",
             "window/sidebar_expanded",
@@ -1768,7 +1356,6 @@ mod tests {
 
         assert_eq!(value["ocr/task_region"], "0.7,0.24,0.99,0.7");
         assert_eq!(value["ocr/extra_task_region"], "0.7,0.71,0.99,0.9");
-        assert_eq!(value["ocr/preprocess_color"], "#eaff65");
         assert_eq!(value["meditation/text_color"], "#ffffff");
         assert_eq!(value["meditation/position"], "12,57");
         assert_eq!(value["map_window/layouts"]["抓鬼"], "40,51,520,481");
@@ -1784,9 +1371,111 @@ mod tests {
             value["profiles/items"][0]["task_region"],
             "0.7,0.24,0.99,0.7"
         );
-        assert_eq!(value["profiles/items"][0]["preprocess_color"], "#eaff65");
         assert!(!object.contains_key("ocr"));
         assert!(!object.contains_key("task/option/降妖伏魔"));
         assert!(!text.contains("\"ocr\": {"));
+    }
+
+    #[test]
+    fn round_trips_profiles() {
+        let dir = std::env::temp_dir().join("rust-mhxy-config-profile-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("config.json");
+        let mut config = Config {
+            active_profile: "抓鬼".into(),
+            color_gate_enabled: true,
+            ..Default::default()
+        };
+        let profile = Config::profile_from_current(&config);
+        config.profiles.push(profile);
+        config.save(&path).unwrap();
+        let loaded = Config::load(&path);
+        assert_eq!(loaded.active_profile, "抓鬼");
+        let saved = loaded
+            .profiles
+            .iter()
+            .find(|profile| profile.name == "抓鬼")
+            .expect("方案应被保存");
+        assert!(saved.gate_enabled);
+        assert_eq!(loaded.profiles[0].name, "默认");
+    }
+
+    #[test]
+    fn round_trips_region_fold_state() {
+        let dir = std::env::temp_dir().join("rust-mhxy-config-fold-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("config.json");
+        Config {
+            region_scope_open: false,
+            region_gate_open: false,
+            ..Default::default()
+        }
+        .save(&path)
+        .unwrap();
+        let loaded = Config::load(&path);
+        assert!(!loaded.region_scope_open);
+        assert!(!loaded.region_gate_open);
+    }
+
+    #[test]
+    fn missing_profile_fields_use_defaults() {
+        let dir = std::env::temp_dir().join("rust-mhxy-config-profile-defaults-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("config.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "profiles/items": [{ "name": "旧方案", "gate_enabled": true }],
+            }"#,
+        )
+        .unwrap();
+        let loaded = Config::load(&path);
+        // 没有 profiles/active 时回退到第一个方案。
+        assert_eq!(loaded.active_profile, "旧方案");
+        assert_eq!(loaded.profiles.len(), 1);
+        let profile = &loaded.profiles[0];
+        assert!(profile.gate_enabled);
+        assert_eq!(profile.task_region, None);
+        assert_eq!(profile.extra_task_region, None);
+        assert_eq!(profile.extra_region_enabled, None);
+        assert_eq!(profile.gate_interval_ms, 300);
+        assert_eq!(profile.gate_mode, "all");
+        assert_eq!(profile.gate_tolerance, 12);
+        assert!(profile.gate_points.is_empty());
+        // 旧版 load 对缺失的侧栏折叠字段使用空字符串，而不是 Config::default。
+        assert_eq!(loaded.sidebar_folded, "");
+    }
+
+    #[test]
+    fn creates_default_profile_from_loaded_settings() {
+        let dir = std::env::temp_dir().join("rust-mhxy-config-default-profile-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("config.json");
+        std::fs::write(
+            &path,
+            r##"{
+                "color_gate/enabled": true,
+                "color_gate/interval_ms": 777,
+                "color_gate/points": [{ "x": 1, "y": 2, "color": "#112233" }],
+                "ocr/region_presets": {
+                    "ok": "0.1,0.1,0.9,0.9",
+                    "bad": "0.9,0.1,0.2,0.9",
+                },
+            }"##,
+        )
+        .unwrap();
+        let loaded = Config::load(&path);
+        assert_eq!(loaded.region_presets.len(), 1);
+        assert_eq!(
+            loaded.region_presets.get("ok").map(String::as_str),
+            Some("0.1,0.1,0.9,0.9")
+        );
+        assert_eq!(loaded.profiles.len(), 1);
+        let profile = &loaded.profiles[0];
+        assert_eq!(profile.name, "默认");
+        assert_eq!(loaded.active_profile, "默认");
+        assert!(profile.gate_enabled);
+        assert_eq!(profile.gate_interval_ms, 777);
+        assert_eq!(profile.gate_points.len(), 1);
     }
 }

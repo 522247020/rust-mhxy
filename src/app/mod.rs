@@ -11,7 +11,6 @@ use crate::gate::{self, ColorPoint, GateMode};
 use crate::hotkey::{self, GlobalHotkey, Hotkey};
 use crate::meditation::{MeditationTimer, State as MeditationState};
 use crate::ocr::{self, LocalWorker, OcrEvent, OcrText};
-use crate::preprocess;
 use crate::theme;
 use crate::update::UpdateInfo;
 use egui::{pos2, vec2, Align2, Color32, CornerRadius, FontId, Rect, Sense, TextureHandle, Vec2};
@@ -28,6 +27,7 @@ mod flight;
 mod map_window;
 mod meditation;
 mod region;
+mod rows_debug;
 mod shell;
 mod sidebar;
 mod task;
@@ -145,17 +145,29 @@ pub struct MhxyApp {
     map_texture_failed: HashSet<String>,
     preview_image: Option<image::RgbImage>,
     preview_texture: Option<TextureHandle>,
-    /// 预处理后的任务区域缩略图（只在取点窗口打开时存在）。
-    preprocess_preview: Option<TextureHandle>,
-    preprocess_preview_extra: Option<TextureHandle>,
-    /// 预处理设置当前编辑主区域（false）还是备用区域（true）。
-    preprocess_target_extra: bool,
+    /// 行分割调试窗口：开关、最近一帧面板、分行结果和缩略图纹理。
+    show_rows_debug: bool,
+    rows_debug_panel: Option<image::RgbImage>,
+    rows_debug_layout: Option<crate::text_layout::RowLayout>,
+    rows_debug_row_texts: Vec<String>,
+    rows_debug_texture: Option<TextureHandle>,
+    rows_debug_thumbnail: Option<Vec<Option<TextureHandle>>>,
+    /// 缓存的二值图 / 投影曲线 / 行裁图，避免每帧重算 Otsu。
+    rows_debug_binary: Option<image::GrayImage>,
+    rows_debug_profile: Vec<u32>,
+    rows_debug_rows: Vec<image::RgbImage>,
+    /// 面板每次更换就 +1：纹理列表靠它判断要不要重传。
+    rows_debug_revision: u64,
+    rows_debug_preview_revision: Option<u64>,
+    rows_debug_thumb_revision: Option<u64>,
+    rows_debug_show_binary: bool,
+    rows_debug_message: Option<String>,
+    /// 最近一次识别用的行布局，侧边栏直接展示「几行、走哪条路」。
+    last_ocr_layout: Option<crate::text_layout::RowLayout>,
     client_size: Option<(u32, u32)>,
     region_window_pos: Option<egui::Pos2>,
     show_region_window: bool,
     pick_points: bool,
-    /// 开启后点击预览取的是“文字颜色”而不是图色点位。
-    pick_text_color: bool,
     /// 取点窗口「测试 OCR」的状态与结果。
     ocr_test_running: bool,
     ocr_test_result: Option<Result<String, String>>,
@@ -172,10 +184,6 @@ pub struct MhxyApp {
     /// 不同步的话主窗口置顶时会把取点窗口整个压住。
     applied_region_on_top: Option<bool>,
     remote_feedback: Option<Result<String, String>>,
-    /// 点阵字库（坐标复核用）：启用且加载成功时才有值。
-    font_lib: Option<Arc<crate::font_lib::GlyphLib>>,
-    /// 字库加载失败的原因，侧边栏直接展示。
-    font_lib_error: Option<String>,
     notice: Option<String>,
     show_help: bool,
     last_ocr_secs: Option<f64>,
@@ -185,9 +193,6 @@ pub struct MhxyApp {
     last_window_refresh: Instant,
     api_url_edit: String,
     api_token_edit: String,
-    /// 预处理文字颜色的十六进制输入框。
-    preprocess_color_edit: String,
-    extra_preprocess_color_edit: String,
     update_tx: Sender<UpdateEvent>,
     update_rx: Receiver<UpdateEvent>,
     update_phase: UpdatePhase,
@@ -324,7 +329,6 @@ impl MhxyApp {
         let config_path = crate::config::default_config_path();
         let config = Config::load(&config_path);
         let mut app = Self::from_config(config, config_path, cc.egui_ctx.clone());
-        app.reload_font_lib();
         app.refresh_windows(true);
         app
     }
@@ -366,8 +370,6 @@ impl MhxyApp {
         let mut app = Self {
             api_url_edit: config.api_url.clone(),
             api_token_edit: config.api_token.clone(),
-            preprocess_color_edit: gate::to_hex(config.preprocess_color),
-            extra_preprocess_color_edit: gate::to_hex(config.extra_preprocess_color),
             update_tx: update_tx.clone(),
             update_rx,
             update_phase: UpdatePhase::Idle,
@@ -403,14 +405,25 @@ impl MhxyApp {
             map_texture_failed: HashSet::new(),
             preview_image: None,
             preview_texture: None,
-            preprocess_preview: None,
-            preprocess_preview_extra: None,
-            preprocess_target_extra: false,
+            show_rows_debug: false,
+            rows_debug_panel: None,
+            rows_debug_layout: None,
+            rows_debug_row_texts: Vec::new(),
+            rows_debug_texture: None,
+            rows_debug_thumbnail: None,
+            rows_debug_binary: None,
+            rows_debug_profile: Vec::new(),
+            rows_debug_rows: Vec::new(),
+            rows_debug_revision: 0,
+            rows_debug_preview_revision: None,
+            rows_debug_thumb_revision: None,
+            rows_debug_show_binary: false,
+            rows_debug_message: None,
+            last_ocr_layout: None,
             client_size: None,
             region_window_pos: None,
             show_region_window: false,
             pick_points: true,
-            pick_text_color: false,
             ocr_test_running: false,
             ocr_test_result: None,
             gate_active: true,
@@ -422,8 +435,6 @@ impl MhxyApp {
             app_window_in_foreground: false,
             applied_region_on_top: None,
             remote_feedback: None,
-            font_lib: None,
-            font_lib_error: None,
             notice: None,
             show_help: false,
             last_ocr_secs: None,
@@ -616,63 +627,12 @@ impl MhxyApp {
             ));
         }
         self.preview_image = Some(image);
-        self.refresh_preprocess_preview();
     }
 
     /// 关闭取点工具后释放截图和纹理。
     fn release_preview(&mut self) {
         self.preview_image = None;
         self.preview_texture = None;
-        self.preprocess_preview = None;
-        self.preprocess_preview_extra = None;
-    }
-
-    /// 用当前截图和预处理设置生成小预览，方便在取点窗口里确认效果。
-    fn refresh_preprocess_preview(&mut self) {
-        let Some(full) = self.preview_image.as_ref() else {
-            self.preprocess_preview = None;
-            self.preprocess_preview_extra = None;
-            return;
-        };
-        let main = capture::crop_task_region(full, self.config.task_region);
-        let main = preprocess::apply(
-            main,
-            self.preprocess_pipeline_for(false),
-            self.config.preprocess_color,
-            self.config.preprocess_tolerance,
-        );
-        let main_color = to_color_image(&main);
-        if let Some(texture) = &mut self.preprocess_preview {
-            texture.set(main_color, egui::TextureOptions::LINEAR);
-        } else {
-            self.preprocess_preview = Some(self.ctx.load_texture(
-                "preprocess_preview_main",
-                main_color,
-                egui::TextureOptions::LINEAR,
-            ));
-        }
-
-        if self.config.extra_region_enabled {
-            let extra = capture::crop_task_region(full, self.config.extra_task_region);
-            let extra = preprocess::apply(
-                extra,
-                self.preprocess_pipeline_for(true),
-                self.config.extra_preprocess_color,
-                self.config.extra_preprocess_tolerance,
-            );
-            let extra_color = to_color_image(&extra);
-            if let Some(texture) = &mut self.preprocess_preview_extra {
-                texture.set(extra_color, egui::TextureOptions::LINEAR);
-            } else {
-                self.preprocess_preview_extra = Some(self.ctx.load_texture(
-                    "preprocess_preview_extra",
-                    extra_color,
-                    egui::TextureOptions::LINEAR,
-                ));
-            }
-        } else {
-            self.preprocess_preview_extra = None;
-        }
     }
 
     fn set_on_top(&mut self, on: bool, ctx: &egui::Context) {
@@ -993,13 +953,6 @@ impl MhxyApp {
         let region = self.config.task_region;
         let extra_region = self.config.extra_task_region;
         let extra_enabled = self.config.extra_region_enabled;
-        let main_pipeline = self.preprocess_pipeline_for(false);
-        let extra_pipeline = self.preprocess_pipeline_for(true);
-        let main_color = self.config.preprocess_color;
-        let main_tolerance = self.config.preprocess_tolerance;
-        let extra_color = self.config.extra_preprocess_color;
-        let extra_tolerance = self.config.extra_preprocess_tolerance;
-        let upscale = self.config.ocr_upscale;
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
         self.pending_signature = None;
@@ -1010,23 +963,14 @@ impl MhxyApp {
         thread::spawn(move || {
             let result = (|| -> Result<ocr::Captured, String> {
                 let full = capture::capture_client(handle, region)?;
-                // 主区域和备用区域分别预处理，再上下拼接送一次 OCR。
-                let mut panels = vec![preprocess::apply(
-                    capture::crop_task_region(&full, region),
-                    main_pipeline,
-                    main_color,
-                    main_tolerance,
-                )];
+                // 主区域和备用区域各裁一块，上下拼成一张面板。不做预处理也不放大：
+                // 分行用原生分辨率做投影，识别模型自己会把行高归一化到 48；
+                // 只有回退检测模型时才在识别线程里放大。
+                let mut panels = vec![capture::crop_task_region(&full, region)];
                 if extra_enabled {
-                    panels.push(preprocess::apply(
-                        capture::crop_task_region(&full, extra_region),
-                        extra_pipeline,
-                        extra_color,
-                        extra_tolerance,
-                    ));
+                    panels.push(capture::crop_task_region(&full, extra_region));
                 }
-                // 放大后再送 OCR：任务栏文字小的时候，检测模型更容易漏掉。
-                let panel = preprocess::upscale(&capture::stack_images(&panels), upscale);
+                let panel = capture::stack_images(&panels);
                 let signature = hash_image(&panel);
                 Ok(ocr::Captured {
                     full,
@@ -1042,32 +986,6 @@ impl MhxyApp {
             });
             ctx.request_repaint();
         });
-    }
-
-    /// 按当前配置加载点阵字库。关掉或加载失败时清空，后续只靠 OCR 文本。
-    pub(super) fn reload_font_lib(&mut self) {
-        self.font_lib = None;
-        self.font_lib_error = None;
-        if !self.config.font_lib_enabled {
-            return;
-        }
-        let path = crate::config::font_lib_path(&self.config);
-        match crate::font_lib::GlyphLib::load(&path) {
-            Ok(lib) if lib.is_empty() => {
-                self.font_lib_error = Some(format!("字库 {} 里没有字模", path.display()));
-            }
-            Ok(lib) => {
-                self.log_detail(format!(
-                    "点阵字库已加载：{}（{} 个字模，{}x{}）",
-                    path.display(),
-                    lib.len(),
-                    lib.cell_w,
-                    lib.cell_h
-                ));
-                self.font_lib = Some(Arc::new(lib));
-            }
-            Err(err) => self.font_lib_error = Some(err),
-        }
     }
 
     /// 拿到后台线程的截图后，按当前识别方式提交 OCR。
@@ -1093,7 +1011,7 @@ impl MhxyApp {
                 generation,
                 panel,
                 self.config.ocr_high_recall,
-                self.font_lib.clone(),
+                self.config.ocr_upscale,
             ) {
                 self.busy = false;
                 self.notice = Some(err);
@@ -1137,6 +1055,10 @@ impl MhxyApp {
                                 continue;
                             }
                             self.pending_signature = Some(captured.signature);
+                            // 调试窗口开着就跟着最新面板刷新，不用每次手点。
+                            if self.show_rows_debug {
+                                self.set_rows_debug_panel(captured.panel.clone());
+                            }
                             self.start_ocr(generation, captured.panel, &window_title);
                         }
                     }
@@ -1181,6 +1103,7 @@ impl MhxyApp {
                     self.last_signature = self.pending_signature.take();
                     self.last_ocr_secs = Some(text.elapsed_secs);
                     self.notice = None;
+                    self.set_rows_debug_texts(text.layout.as_ref(), &text.row_texts);
                     self.apply_ocr(&text);
                 }
             }
@@ -1219,7 +1142,7 @@ impl MhxyApp {
         });
     }
 
-    /// 取点窗口的「测试 OCR」：用当前截图与预处理设置识别一次，结果只显示在窗口里。
+    /// 取点窗口的「测试 OCR」：用当前截图识别一次，结果只显示在窗口里。
     fn run_panel_test(&mut self) {
         if self.ocr_test_running {
             return;
@@ -1231,21 +1154,14 @@ impl MhxyApp {
             self.ocr_test_result = Some(Err("暂无截图：请打开游戏窗口后点击「更新截图」".into()));
             return;
         };
-        let mut panels = vec![preprocess::apply(
-            capture::crop_task_region(full, self.config.task_region),
-            self.preprocess_pipeline_for(false),
-            self.config.preprocess_color,
-            self.config.preprocess_tolerance,
-        )];
+        let mut panels = vec![capture::crop_task_region(full, self.config.task_region)];
         if self.config.extra_region_enabled {
-            panels.push(preprocess::apply(
-                capture::crop_task_region(full, self.config.extra_task_region),
-                self.preprocess_pipeline_for(true),
-                self.config.extra_preprocess_color,
-                self.config.extra_preprocess_tolerance,
+            panels.push(capture::crop_task_region(
+                full,
+                self.config.extra_task_region,
             ));
         }
-        let panel = preprocess::upscale(&capture::stack_images(&panels), self.config.ocr_upscale);
+        let panel = capture::stack_images(&panels);
         self.ocr_test_running = true;
         self.ocr_test_result = None;
         if self.config.ocr_mode == "remote" {
@@ -1267,14 +1183,15 @@ impl MhxyApp {
                 let _ = sender.send(OcrEvent::PanelTest { result });
                 ctx.request_repaint();
             });
-        } else if let Err(err) = self.worker.submit_test(panel) {
+        } else if let Err(err) = self.worker.submit_test(panel, self.config.ocr_upscale) {
             self.ocr_test_running = false;
             self.ocr_test_result = Some(Err(err));
         }
     }
 
     fn apply_ocr(&mut self, ocr_text: &OcrText) {
-        // 字库复核等后处理结果先进详细日志，再解析任务。
+        self.last_ocr_layout = ocr_text.layout.clone();
+        // 分行、归一化、回退等后处理说明先进详细日志，再解析任务。
         for note in &ocr_text.notes {
             self.log_detail(note.clone());
         }
