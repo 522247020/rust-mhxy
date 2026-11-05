@@ -92,11 +92,73 @@ jobs:
             echo "::warning::作业容器里没有 /cache（container.options 未生效，或被 valid_volumes 过滤；改用 /opt/hostedtoolcache）"
           fi
 
+      - name: Configure mirrors
+        env:
+          # 国内镜像：apt 默认走清华，探测不通就退到阿里云；要固定某个源就只留一个。
+          UBUNTU_MIRROR: https://mirrors.tuna.tsinghua.edu.cn/ubuntu
+          UBUNTU_MIRROR_FALLBACK: https://mirrors.aliyun.com/ubuntu
+        run: |
+          set -eu
+          # 容器里可能是 root，也可能需要 sudo。
+          if [ "$(id -u)" -eq 0 ] || ! command -v sudo >/dev/null 2>&1; then
+            SUDO=""
+          else
+            SUDO="sudo -E"
+          fi
+
+          codename="$(. /etc/os-release 2>/dev/null && echo "${VERSION_CODENAME:-noble}")"
+          chosen=""
+          for base in "${UBUNTU_MIRROR:-}" "${UBUNTU_MIRROR_FALLBACK:-}"; do
+            [ -n "$base" ] || continue
+            echo "探测镜像：$base"
+            if command -v curl >/dev/null 2>&1 &&
+              curl -fsS --max-time 12 -o /dev/null "$base/dists/$codename/InRelease"; then
+              chosen="$base"
+              break
+            fi
+          done
+          if [ -z "$chosen" ]; then
+            echo "::warning::清华/阿里云镜像都探测失败，仍按 $UBUNTU_MIRROR 改源，让 apt 自己报错"
+            chosen="$UBUNTU_MIRROR"
+          fi
+          UBUNTU_MIRROR="$chosen"
+          UBUNTU_PORTS_MIRROR="${chosen%/ubuntu}/ubuntu-ports"
+          echo "::notice::apt 镜像：$UBUNTU_MIRROR（$codename）"
+
+          # Ubuntu 24.04 默认用 deb822 的 .sources，老版本用 sources.list，两种都改。
+          rewrite() {
+            file="$1"
+            [ -f "$file" ] || return 0
+            echo "改源：$file"
+            $SUDO cp -a "$file" "$file.bak"
+            $SUDO sed -i -E \
+              -e 's@https?://(archive|security)\.ubuntu\.com/ubuntu@'"$UBUNTU_MIRROR"'@g' \
+              -e 's@https?://ports\.ubuntu\.com/ubuntu-ports@'"$UBUNTU_PORTS_MIRROR"'@g' \
+              "$file"
+            grep -nE '^(URIs|deb) ' "$file" | head -5 || true
+          }
+          rewrite /etc/apt/sources.list
+          for file in /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list; do
+            [ -f "$file" ] || continue
+            case "$file" in
+              *.bak) continue ;;
+            esac
+            rewrite "$file"
+          done
+          $SUDO apt-get clean
+          # update 不致命：runner 上可能还有别的源（docker 等）连不上，
+          # 只要主仓库索引能拿到，后面的 apt-get install 就能跑。
+          $SUDO apt-get update || echo "::warning::apt-get update 有源失败，已用拿到的旧索引继续"
+
       - name: Set up Rust toolchain
         env:
-          # 国内网络默认走 rsproxy 镜像；需要别的源就改这里。
-          RUSTUP_DIST_SERVER: https://rsproxy.cn
-          RUSTUP_UPDATE_ROOT: https://rsproxy.cn/rustup
+          # 国内镜像：rustup 与 crates.io 都走清华；连不上时改成 rsproxy：
+          #   RUSTUP_DIST_SERVER=https://rsproxy.cn
+          #   RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup
+          #   CARGO_REGISTRY_INDEX=sparse+https://rsproxy.cn/index/
+          RUSTUP_DIST_SERVER: https://mirrors.tuna.tsinghua.edu.cn/rustup
+          RUSTUP_UPDATE_ROOT: https://mirrors.tuna.tsinghua.edu.cn/rustup/rustup
+          CARGO_REGISTRY_INDEX: sparse+https://mirrors.tuna.tsinghua.edu.cn/crates.io-index/
         run: |
           # 缓存优先级：MHXY_CACHE_DIR > /cache（container.options）> /opt/hostedtoolcache（act_runner 共享卷）> 工作区。
           # act_runner 默认把命名卷 act-toolcache 挂到 /opt/hostedtoolcache，跨任务持久，
@@ -139,6 +201,21 @@ jobs:
           export RUSTUP_HOME="$cache_root/rustup"
           export PATH="$CARGO_HOME/bin:$PATH"
 
+          # crates.io 走国内镜像：CARGO_HOME 是持久化缓存，每次覆盖写入，
+          # 免得上一次留下的源配置跟本次的环境变量对不上。
+          echo "配置 crates.io 镜像：$CARGO_REGISTRY_INDEX"
+          mkdir -p "$CARGO_HOME"
+          {
+            echo '[source.crates-io]'
+            echo 'replace-with = "tuna"'
+            echo
+            echo '[source.tuna]'
+            echo "registry = \"${CARGO_REGISTRY_INDEX}\""
+            echo
+            echo '[net]'
+            echo 'git-fetch-with-cli = true'
+          } > "$CARGO_HOME/config.toml"
+
           python3 --version
           if ! command -v cargo >/dev/null 2>&1; then
             echo "未检测到 Rust，安装 stable（镜像：$RUSTUP_DIST_SERVER，目录：$CARGO_HOME）"
@@ -161,13 +238,22 @@ jobs:
           fi
 
           # cargo-xwin 编译 C 依赖需要 clang；lld-link/llvm-lib 由 rust 的 llvm-tools 提供
+          # 统一 apt 调用：容器里可能是 root，也可能要 sudo；update 有源失败只警告。
+          run_apt() {
+            if [ "$(id -u)" -eq 0 ] || ! command -v sudo >/dev/null 2>&1; then
+              "$@"
+            else
+              sudo -E "$@"
+            fi
+          }
+          apt_install() {
+            run_apt env DEBIAN_FRONTEND=noninteractive apt-get update ||
+              echo "::warning::apt-get update 有源失败，已用现有索引继续"
+            run_apt env DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"
+          }
           if ! command -v clang >/dev/null 2>&1; then
             echo "安装 clang / lld / llvm"
-            if command -v sudo >/dev/null 2>&1; then
-              sudo apt-get update && sudo apt-get install -y clang lld llvm
-            else
-              apt-get update && apt-get install -y clang lld llvm
-            fi
+            apt_install clang lld llvm
           fi
           if ! command -v clang-cl >/dev/null 2>&1; then
             echo "生成 clang-cl 兼容入口"
@@ -189,8 +275,7 @@ jobs:
           cargo clippy --version
           command -v rsync >/dev/null 2>&1 || {
             echo "安装 rsync"
-            (command -v sudo >/dev/null 2>&1 && sudo apt-get update && sudo apt-get install -y rsync) ||
-              (apt-get update && apt-get install -y rsync)
+            apt_install rsync
           }
 
       - name: Prepare Windows SDK
@@ -222,11 +307,14 @@ jobs:
           packages="pkg-config libpipewire-0.3-dev libegl1-mesa-dev libgl1-mesa-dev libgbm-dev libdrm-dev libxkbcommon-dev libwayland-dev libx11-dev libxcb1-dev fonts-wqy-microhei"
           if ! pkg-config --exists libpipewire-0.3 egl gbm 2>/dev/null; then
             echo "安装 Linux 构建依赖"
-            if command -v sudo >/dev/null 2>&1; then
-              sudo apt-get update && sudo apt-get install -y $packages
+            if [ "$(id -u)" -eq 0 ] || ! command -v sudo >/dev/null 2>&1; then
+              run_apt() { "$@"; }
             else
-              apt-get update && apt-get install -y $packages
+              run_apt() { sudo -E "$@"; }
             fi
+            run_apt env DEBIAN_FRONTEND=noninteractive apt-get update ||
+              echo "::warning::apt-get update 有源失败，已用现有索引继续"
+            run_apt env DEBIAN_FRONTEND=noninteractive apt-get install -y $packages
           fi
           pkg-config --modversion libpipewire-0.3 egl gbm
           echo "中文字体：$(fc-match -f '%{file}' 'WenQuanYi Micro Hei' 2>/dev/null || echo 未找到)"
