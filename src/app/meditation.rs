@@ -227,10 +227,19 @@ impl MhxyApp {
                 // 窗口按最长文字定尺寸，每一帧的背景按当前文字收紧并居中。
                 let background =
                     Rect::from_center_size(rect.center(), capsule.min(size)).expand(1.0);
+                // 胶囊圆角 + 细描边：纯黑直角块在游戏画面上太扎眼。
+                let capsule_radius =
+                    CornerRadius::same((background.height() / 2.0).min(16.0) as u8);
                 painter.rect_filled(
                     background,
-                    CornerRadius::ZERO,
+                    capsule_radius,
                     Color32::from_rgba_unmultiplied(0, 0, 0, alpha),
+                );
+                painter.rect_stroke(
+                    background,
+                    capsule_radius,
+                    egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 40)),
+                    egui::StrokeKind::Inside,
                 );
                 let center = rect.center();
                 painter.text(

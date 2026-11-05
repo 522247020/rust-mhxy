@@ -14,6 +14,8 @@ use crate::ocr::{self, LocalWorker, OcrEvent, OcrText};
 use crate::theme;
 use crate::update::UpdateInfo;
 use egui::{pos2, vec2, Align2, Color32, CornerRadius, FontId, Rect, Sense, TextureHandle, Vec2};
+#[cfg(test)]
+use region::sample_image;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -36,10 +38,6 @@ mod update;
 use update::UpdateEvent;
 use update::{UpdatePhase, UPDATE_CHECK_INTERVAL, UPDATE_FLASH_DURATION, UPDATE_WINDOW_SIZE};
 
-use region::REGION_WINDOW_SIZE;
-#[cfg(test)]
-use region::{place_region_window, sample_image};
-
 const TASK_ORDER: [&str; 3] = ["抓鬼", "鬼王", "通用"];
 /// 每次注册全局快捷键都换一个 id：旧监听线程还在退出时，
 /// 复用同一个 id 会撞上「热键已被注册」，导致新快捷键要等重试才生效。
@@ -53,15 +51,6 @@ const NEARBY_RADIUS: f32 = 50.0;
 /// 侧栏展开 / 收起时的最小窗口尺寸。
 const MIN_WINDOW_SIZE_EXPANDED: Vec2 = Vec2::new(760.0, 540.0);
 const MIN_WINDOW_SIZE_COLLAPSED: Vec2 = Vec2::new(460.0, 460.0);
-/// 说明 / 更新窗口的默认尺寸。
-const HELP_WINDOW_SIZE: Vec2 = Vec2::new(560.0, 640.0);
-const FLIGHT_FLAGS_WINDOW_SIZE: Vec2 = Vec2::new(900.0, 760.0);
-/// 高级设置与打坐设置的独立窗口尺寸。
-const ADVANCED_WINDOW_SIZE: Vec2 = Vec2::new(560.0, 640.0);
-const MEDITATION_WINDOW_SIZE: Vec2 = Vec2::new(480.0, 560.0);
-/// 地图浮窗设置独立窗口。
-const MAP_WINDOW_SETTINGS_SIZE: Vec2 = Vec2::new(520.0, 620.0);
-const MAP_WINDOW_SETTINGS_TITLE: &str = "地图浮窗设置";
 #[derive(Default)]
 struct TaskState {
     location: Option<TaskLocation>,
@@ -143,10 +132,11 @@ pub struct MhxyApp {
     tasks: HashMap<&'static str, TaskState>,
     map_textures: HashMap<String, TextureHandle>,
     map_texture_failed: HashSet<String>,
+    /// 说明页里内嵌的截图纹理，按资源名缓存（解码一次就够）。
+    help_textures: HashMap<&'static str, TextureHandle>,
     preview_image: Option<image::RgbImage>,
     preview_texture: Option<TextureHandle>,
     /// 行分割调试窗口：开关、最近一帧面板、分行结果和缩略图纹理。
-    show_rows_debug: bool,
     rows_debug_panel: Option<image::RgbImage>,
     rows_debug_layout: Option<crate::text_layout::RowLayout>,
     rows_debug_row_texts: Vec<String>,
@@ -160,13 +150,16 @@ pub struct MhxyApp {
     rows_debug_revision: u64,
     rows_debug_preview_revision: Option<u64>,
     rows_debug_thumb_revision: Option<u64>,
+    /// 缩略图的缓存是二值还是灰度（跟随「显示二值图」开关）。
+    rows_debug_thumb_binary: bool,
+    /// 行分割调试测试识别是否跑着。
+    rows_debug_test_running: bool,
+
     rows_debug_show_binary: bool,
     rows_debug_message: Option<String>,
     /// 最近一次识别用的行布局，侧边栏直接展示「几行、走哪条路」。
     last_ocr_layout: Option<crate::text_layout::RowLayout>,
     client_size: Option<(u32, u32)>,
-    region_window_pos: Option<egui::Pos2>,
-    show_region_window: bool,
     pick_points: bool,
     /// 取点窗口「测试 OCR」的状态与结果。
     ocr_test_running: bool,
@@ -177,15 +170,13 @@ pub struct MhxyApp {
     testing_remote: bool,
     applied_min_inner_size: Option<Vec2>,
     applied_on_top: Option<bool>,
-    /// 上一帧本进程是否有窗口在前台（主窗口、设置窗口……）。
+    /// 上一帧本进程是否有窗口在前台（主窗口、说明等主区页……）。
     /// 地图浮窗靠它决定要不要让出置顶，免得盖住菜单和滑块。
     app_window_in_foreground: bool,
     /// 取点窗口自己的置顶状态。子视口默认不会被父窗口的置顶带上，
     /// 不同步的话主窗口置顶时会把取点窗口整个压住。
-    applied_region_on_top: Option<bool>,
     remote_feedback: Option<Result<String, String>>,
     notice: Option<String>,
-    show_help: bool,
     last_ocr_secs: Option<f64>,
     config_dirty_since: Option<Instant>,
     save_error: Option<String>,
@@ -207,9 +198,7 @@ pub struct MhxyApp {
     show_update_dialog: bool,
     profile_saving: bool,
     profile_name_edit: String,
-    help_window_pos: Option<egui::Pos2>,
     update_window_pos: Option<egui::Pos2>,
-    applied_help_on_top: Option<bool>,
     applied_update_on_top: Option<bool>,
     started_at: Instant,
     worker: LocalWorker,
@@ -229,6 +218,8 @@ pub struct MhxyApp {
     pending_manual_trigger: bool,
     /// 精简模式：只留地图，隐藏顶部按钮栏、状态栏和侧栏；按 Esc 退出。
     compact: bool,
+    /// 设置栏当前选中的页签（侧栏纵向导轨的一页，只在本次运行内有效，不落盘）。
+    sidebar_tab: &'static str,
     /// 进入精简模式后的提示（按 Esc 退出），到点自动消失。
     compact_hint_until: Option<Instant>,
     /// 当前实际应用的亮色 / 暗色，用于跟随系统主题时即时切换。
@@ -263,26 +254,19 @@ pub struct MhxyApp {
     /// 合成旗点位单独保存在用户本地目录，不进入主配置和更新包。
     flight_flags: FlightFlags,
     flight_flags_path: PathBuf,
-    show_flight_flags_window: bool,
-    /// 高级设置窗口（识别方式、方案、显示、合成旗）。
-    show_advanced_window: bool,
-    advanced_window_pos: Option<egui::Pos2>,
-    applied_advanced_on_top: Option<bool>,
-    /// 打坐计时设置窗口。
-    show_meditation_window: bool,
-    meditation_window_pos: Option<egui::Pos2>,
-    applied_meditation_window_on_top: Option<bool>,
-    /// 地图浮窗设置窗口（每个任务的开关 + 不透明度 / 宽度 / 置顶 / 锁定）。
-    show_map_window_settings: bool,
-    map_window_settings_pos: Option<egui::Pos2>,
-    applied_map_window_settings_on_top: Option<bool>,
-    /// 日志落盘路径（不再在界面里展示）。
+    /// 地图浮窗设置内容（每个任务的开关 + 不透明度 / 宽度 / 置顶 / 锁定），嵌入任务地图页占位下方。
+    /// 日志落盘路径（日志页里展示）。
     log_path: PathBuf,
+    /// 内存里的实时日志（最近行）：日志页直接显示，不用开文件。
+    log_lines: std::collections::VecDeque<String>,
     flight_map_edit: String,
     flight_flag_index: usize,
     flight_flag_name_edit: String,
     flight_feedback: Option<Result<String, String>>,
 }
+
+/// 内存日志环形缓冲上限（行）：避免无限增长。
+const LOG_BUFFER_MAX: usize = 1000;
 
 /// 日志落盘位置：配置目录下的 logs/rust-mhxy.log。
 fn default_log_path(config_path: &std::path::Path) -> PathBuf {
@@ -384,9 +368,7 @@ impl MhxyApp {
             show_update_dialog: false,
             profile_saving: false,
             profile_name_edit: String::new(),
-            help_window_pos: None,
             update_window_pos: None,
-            applied_help_on_top: None,
             applied_update_on_top: None,
             started_at: Instant::now(),
             config,
@@ -403,9 +385,9 @@ impl MhxyApp {
             tasks,
             map_textures: HashMap::new(),
             map_texture_failed: HashSet::new(),
+            help_textures: HashMap::new(),
             preview_image: None,
             preview_texture: None,
-            show_rows_debug: false,
             rows_debug_panel: None,
             rows_debug_layout: None,
             rows_debug_row_texts: Vec::new(),
@@ -417,12 +399,12 @@ impl MhxyApp {
             rows_debug_revision: 0,
             rows_debug_preview_revision: None,
             rows_debug_thumb_revision: None,
+            rows_debug_thumb_binary: false,
+            rows_debug_test_running: false,
             rows_debug_show_binary: false,
             rows_debug_message: None,
             last_ocr_layout: None,
             client_size: None,
-            region_window_pos: None,
-            show_region_window: false,
             pick_points: true,
             ocr_test_running: false,
             ocr_test_result: None,
@@ -433,10 +415,8 @@ impl MhxyApp {
             applied_min_inner_size: None,
             applied_on_top: None,
             app_window_in_foreground: false,
-            applied_region_on_top: None,
             remote_feedback: None,
             notice: None,
-            show_help: false,
             last_ocr_secs: None,
             config_dirty_since: None,
             save_error: None,
@@ -455,6 +435,7 @@ impl MhxyApp {
             last_manual_trigger: None,
             pending_manual_trigger: false,
             compact: false,
+            sidebar_tab: "任务地图",
             compact_hint_until: None,
             applied_light: None,
             meditation: MeditationTimer::new(meditation_duration),
@@ -476,17 +457,8 @@ impl MhxyApp {
             meditation_recording_hotkey: false,
             flight_flags,
             flight_flags_path,
-            show_flight_flags_window: false,
-            show_advanced_window: false,
-            advanced_window_pos: None,
-            applied_advanced_on_top: None,
-            show_meditation_window: false,
-            meditation_window_pos: None,
-            applied_meditation_window_on_top: None,
-            show_map_window_settings: false,
-            map_window_settings_pos: None,
-            applied_map_window_settings_on_top: None,
             log_path,
+            log_lines: std::collections::VecDeque::new(),
             flight_map_edit: SUPPORTED_MAPS[0].to_string(),
             flight_flag_index: 0,
             flight_flag_name_edit: String::new(),
@@ -500,6 +472,8 @@ impl MhxyApp {
         app
     }
 
+    /// 侧栏折叠状态（按 id 存 config.sidebar_folded 逗号串）：折叠区都已改为独立页面，生产路径不再调用，仅测试用。
+    #[cfg(test)]
     fn sidebar_section_open(&self, id: &str) -> bool {
         !self
             .config
@@ -508,6 +482,7 @@ impl MhxyApp {
             .any(|item| item.trim() == id)
     }
 
+    #[cfg(test)]
     fn set_sidebar_section_open(&mut self, id: &str, open: bool) {
         let mut folded: Vec<String> = self
             .config
@@ -613,7 +588,7 @@ impl MhxyApp {
     /// 记录客户区尺寸；仅在打开识别区域窗口时才保留整张截图，避免常驻内存。
     fn update_preview(&mut self, image: image::RgbImage) {
         self.client_size = Some(image.dimensions());
-        if !self.show_region_window {
+        if self.sidebar_tab != "识别区域" {
             return;
         }
         let color = to_color_image(&image);
@@ -674,6 +649,17 @@ impl MhxyApp {
             Err(err) => {
                 self.log_detail(format!("枚举窗口失败：{err}"));
             }
+        }
+    }
+
+    /// 配置里的行分割设置打成一个包，正式识别和测试识别用同一份。
+    fn row_tuning(&self) -> ocr::RowTuning {
+        ocr::RowTuning {
+            mode: ocr::RowMode::from_config(&self.config.ocr_row_mode),
+            height: self.config.ocr_row_height,
+            start: self.config.ocr_row_start,
+            gaps: self.config.ocr_gap_rows.clone(),
+            pad: self.config.ocr_row_pad,
         }
     }
 
@@ -1012,6 +998,7 @@ impl MhxyApp {
                 panel,
                 self.config.ocr_high_recall,
                 self.config.ocr_upscale,
+                self.row_tuning(),
             ) {
                 self.busy = false;
                 self.notice = Some(err);
@@ -1056,7 +1043,7 @@ impl MhxyApp {
                             }
                             self.pending_signature = Some(captured.signature);
                             // 调试窗口开着就跟着最新面板刷新，不用每次手点。
-                            if self.show_rows_debug {
+                            if self.sidebar_tab == "行分割调试" {
                                 self.set_rows_debug_panel(captured.panel.clone());
                             }
                             self.start_ocr(generation, captured.panel, &window_title);
@@ -1082,10 +1069,30 @@ impl MhxyApp {
                 }
                 OcrEvent::PanelTest { result } => {
                     self.ocr_test_running = false;
-                    self.ocr_test_result = Some(match result {
-                        Ok(text) => Ok(self.format_test_result(&text)),
-                        Err(err) => Err(err),
-                    });
+                    self.rows_debug_test_running = false;
+                    match result {
+                        Ok(text) => {
+                            let formatted = self.format_test_result(&text);
+                            self.ocr_test_result = Some(Ok(formatted));
+                            // 行分割调试页的逐行文本跟着测试结果走，设置对不对马上看见。
+                            self.rows_debug_message = Some(format!(
+                                "识别用时 {:.2} 秒｜{}",
+                                text.elapsed_secs,
+                                self.ocr_test_result
+                                    .as_ref()
+                                    .map(|result| match result {
+                                        Ok(message) => message.clone(),
+                                        Err(err) => err.clone(),
+                                    })
+                                    .unwrap_or_default()
+                            ));
+                            self.set_rows_debug_texts(text.layout.as_ref(), &text.row_texts);
+                        }
+                        Err(err) => {
+                            self.ocr_test_result = Some(Err(err.clone()));
+                            self.rows_debug_message = Some(err);
+                        }
+                    }
                     continue;
                 }
             };
@@ -1183,7 +1190,10 @@ impl MhxyApp {
                 let _ = sender.send(OcrEvent::PanelTest { result });
                 ctx.request_repaint();
             });
-        } else if let Err(err) = self.worker.submit_test(panel, self.config.ocr_upscale) {
+        } else if let Err(err) =
+            self.worker
+                .submit_test(panel, self.config.ocr_upscale, self.row_tuning())
+        {
             self.ocr_test_running = false;
             self.ocr_test_result = Some(Err(err));
         }
@@ -1341,3 +1351,24 @@ fn hash_image(image: &image::RgbImage) -> u64 {
 
 #[cfg(test)]
 mod tests;
+
+/// 说明 / 更新窗口在主窗口中间打开，并限制在屏幕内。
+pub(super) fn centered_window_position(ctx: &egui::Context, size: Vec2) -> egui::Pos2 {
+    ctx.input(|input| {
+        let viewport = input.viewport();
+        let monitor = viewport
+            .monitor_size
+            .unwrap_or_else(|| Vec2::new(1920.0, 1080.0));
+        let main = viewport.outer_rect;
+        let x = main
+            .map(|rect| rect.center().x - size.x / 2.0)
+            .unwrap_or(0.0);
+        let y = main
+            .map(|rect| rect.center().y - size.y / 2.0)
+            .unwrap_or(0.0);
+        egui::pos2(
+            x.clamp(0.0, (monitor.x - size.x).max(0.0)),
+            y.clamp(0.0, (monitor.y - size.y).max(0.0)),
+        )
+    })
+}

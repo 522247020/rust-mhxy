@@ -2,193 +2,6 @@
 use super::*;
 
 impl MhxyApp {
-    /// 顶栏唯一的次级入口：一个「更多」菜单收好显示、工具、帮助和设置。
-    pub(super) fn header_more_menu(
-        &mut self,
-        ui: &mut egui::Ui,
-        ctx: &egui::Context,
-        narrow: bool,
-    ) {
-        let (label, color, strong) = match self.update_help_badge(narrow) {
-            Some((badge, color, strong)) => (
-                if narrow {
-                    format!("更多·{badge}")
-                } else {
-                    format!("更多 · {badge}")
-                },
-                color,
-                strong,
-            ),
-            None => ("更多".to_string(), theme::text(), false),
-        };
-        let mut text = egui::RichText::new(label).color(color);
-        if strong {
-            text = text.strong();
-        }
-        ui.scope(|ui| {
-            ui.spacing_mut().interact_size.y = 34.0;
-            ui.menu_button(text, |ui| {
-                ui.set_min_width(240.0);
-                self.more_menu_ui(ui, ctx);
-            })
-            .response
-            .on_hover_text("显示方式、工具、帮助和高级设置都在这一个菜单里");
-        });
-    }
-
-    /// 「更多」菜单：用分组标题收纳次要入口，避免顶栏一排平铺按钮。
-    pub(super) fn more_menu_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.label(egui::RichText::new("显示").small().strong());
-        self.display_mode_ui(ui, ctx);
-        ui.separator();
-        ui.label(egui::RichText::new("工具").small().strong());
-        self.tools_menu_ui(ui, ctx);
-        ui.separator();
-        ui.label(egui::RichText::new("帮助").small().strong());
-        self.help_menu_ui(ui, ctx);
-        ui.separator();
-        ui.label(egui::RichText::new("设置").small().strong());
-        if ui
-            .selectable_label(self.show_advanced_window, "高级设置…")
-            .on_hover_text("识别方式、方案管理、合成旗标注和日志级别")
-            .clicked()
-        {
-            self.show_advanced_window = !self.show_advanced_window;
-            if self.show_advanced_window {
-                self.advanced_window_pos =
-                    Some(centered_window_position(ctx, ADVANCED_WINDOW_SIZE));
-                self.applied_advanced_on_top = None;
-            } else {
-                self.advanced_window_pos = None;
-            }
-            ui.close();
-        }
-    }
-
-    pub(super) fn display_mode_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.set_min_width(240.0);
-        let normal = !self.compact && !self.config.map_window_enabled;
-        if ui.radio(normal, "普通界面").clicked() {
-            self.apply_normal_display();
-            ui.close();
-        }
-        if ui.radio(self.compact, "精简界面").clicked() {
-            self.apply_compact_display();
-            ui.close();
-        }
-        if ui
-            .radio(self.config.map_window_enabled, "地图浮窗")
-            .on_hover_text("每个任务一个无边框浮窗；开关和参数在「浮窗设置」窗口里")
-            .clicked()
-        {
-            self.apply_map_window_display();
-            // 打开模式后直接把设置窗口弹出来，不用再多点一层。
-            if !self.show_map_window_settings {
-                self.toggle_map_window_settings(ctx);
-            }
-        }
-        ui.separator();
-        ui.menu_button("界面主题", |ui| {
-            for (value, label) in [("system", "跟随系统"), ("light", "亮色"), ("dark", "暗色")]
-            {
-                if ui.radio(self.config.theme == value, label).clicked() {
-                    self.config.theme = value.to_string();
-                    self.persist();
-                    ui.close();
-                }
-            }
-        });
-        let mut on_top = self.config.on_top;
-        if ui
-            .checkbox(&mut on_top, "窗口置顶")
-            .on_hover_text("让本窗口始终显示在游戏窗口前面")
-            .changed()
-        {
-            self.set_on_top(on_top, ctx);
-        }
-        // 浮窗参数在独立窗口「地图浮窗设置」里，菜单只留入口。
-        if self.config.map_window_enabled {
-            ui.separator();
-            if ui
-                .selectable_label(self.show_map_window_settings, "浮窗设置…")
-                .on_hover_text("每个任务的浮窗开关，以及不透明度、宽度、置顶、锁定和重置")
-                .clicked()
-            {
-                self.toggle_map_window_settings(ctx);
-                ui.close();
-            }
-        }
-    }
-
-    /// 打开 / 收起「地图浮窗设置」独立窗口。
-    pub(super) fn toggle_map_window_settings(&mut self, ctx: &egui::Context) {
-        self.show_map_window_settings = !self.show_map_window_settings;
-        if self.show_map_window_settings {
-            self.map_window_settings_pos =
-                Some(centered_window_position(ctx, MAP_WINDOW_SETTINGS_SIZE));
-            self.applied_map_window_settings_on_top = None;
-        } else {
-            self.map_window_settings_pos = None;
-        }
-    }
-
-    /// 独立的「地图浮窗设置」窗口：每个任务的开关和所有浮窗参数都在这里。
-    pub(super) fn map_window_settings_window(&mut self, ctx: &egui::Context) {
-        if !self.show_map_window_settings {
-            return;
-        }
-        let on_top = self.config.on_top;
-        let mut builder = egui::ViewportBuilder::default()
-            .with_title(MAP_WINDOW_SETTINGS_TITLE)
-            .with_inner_size(MAP_WINDOW_SETTINGS_SIZE)
-            .with_min_inner_size([420.0, 420.0]);
-        if on_top {
-            builder = builder.with_always_on_top();
-        }
-        if let Some(position) = self.map_window_settings_pos {
-            builder = builder.with_position(position);
-        }
-        ctx.show_viewport_immediate(
-            egui::ViewportId::from_hash_of("map_window_settings"),
-            builder,
-            |ui, _class| {
-                if ui.ctx().viewport_id() == egui::ViewportId::ROOT {
-                    egui::Window::new(MAP_WINDOW_SETTINGS_TITLE)
-                        .default_size(MAP_WINDOW_SETTINGS_SIZE)
-                        .show(ui.ctx(), |ui| self.map_window_settings_controls(ui));
-                    return;
-                }
-                if ui.ctx().input(|input| input.viewport().close_requested()) {
-                    self.show_map_window_settings = false;
-                }
-                if self.applied_map_window_settings_on_top != Some(on_top) {
-                    let level = if on_top {
-                        egui::WindowLevel::AlwaysOnTop
-                    } else {
-                        egui::WindowLevel::Normal
-                    };
-                    ui.ctx()
-                        .send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
-                    self.applied_map_window_settings_on_top = Some(on_top);
-                }
-                egui::Frame::central_panel(ui.style())
-                    .inner_margin(16)
-                    .show(ui, |ui| {
-                        let height = ui.available_height();
-                        egui::ScrollArea::vertical()
-                            .id_salt("map_window_settings_scroll")
-                            .auto_shrink([false, false])
-                            .max_height(height)
-                            .min_scrolled_height(height)
-                            .show(ui, |ui| {
-                                ui.set_min_width(ui.available_width());
-                                self.map_window_settings_controls(ui);
-                            });
-                    });
-            },
-        );
-    }
-
     /// 「地图浮窗设置」窗口的内容：每个任务一行开关 + 宽度，下面是全局参数。
     pub(super) fn map_window_settings_controls(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
@@ -210,7 +23,7 @@ impl MhxyApp {
         if !self.config.map_window_enabled {
             ui.add_space(6.0);
             if ui
-                .button("打开地图浮窗")
+                .add(theme::primary_button("打开地图浮窗"))
                 .on_hover_text("打开后每个任务各弹一个浮窗")
                 .clicked()
             {
@@ -220,7 +33,7 @@ impl MhxyApp {
         }
 
         ui.add_space(8.0);
-        ui.label(egui::RichText::new("每个任务").small().strong());
+        theme::section_label(ui, "每个任务");
         let tasks = self.active_tasks();
         if tasks.is_empty() {
             ui.label(egui::RichText::new("未勾选任务类型").small().weak());
@@ -273,7 +86,7 @@ impl MhxyApp {
         }
 
         ui.add_space(8.0);
-        ui.label(egui::RichText::new("浮窗样式").small().strong());
+        theme::section_label(ui, "浮窗样式");
         let mut opacity = self
             .config
             .map_window_opacity
@@ -307,14 +120,14 @@ impl MhxyApp {
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             if ui
-                .button("重置浮窗位置与大小")
+                .add(theme::secondary_button("重置浮窗位置与大小"))
                 .on_hover_text("所有任务浮窗恢复默认大小，并逐个错开摆回主窗口中间")
                 .clicked()
             {
                 self.reset_map_window_geometry(ui.ctx());
             }
             if ui
-                .button("退出地图浮窗模式")
+                .add(theme::secondary_button("退出地图浮窗模式"))
                 .on_hover_text("关闭浮窗模式，地图回到主窗口")
                 .clicked()
             {
@@ -347,127 +160,6 @@ impl MhxyApp {
         self.set_map_window(true);
     }
 
-    pub(super) fn tools_menu_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        if ui
-            .selectable_label(self.show_meditation_window, "打坐计时")
-            .on_hover_text("打坐倒计时设置：启用开关、时长、悬浮窗样式和快捷键")
-            .clicked()
-        {
-            self.show_meditation_window = !self.show_meditation_window;
-            if self.show_meditation_window {
-                self.meditation_window_pos =
-                    Some(centered_window_position(ctx, MEDITATION_WINDOW_SIZE));
-                self.applied_meditation_window_on_top = None;
-            } else {
-                self.meditation_window_pos = None;
-            }
-            ui.close();
-        }
-        if ui
-            .selectable_label(self.show_flight_flags_window, "合成旗编辑器")
-            .on_hover_text("维护各大地图的飞行点；点位保存在本地")
-            .clicked()
-        {
-            self.show_flight_flags_window = !self.show_flight_flags_window;
-            ui.close();
-        }
-        if ui
-            .selectable_label(self.show_rows_debug, "行分割调试…")
-            .on_hover_text("把任务面板按行切开的效果画出来，确认每一行切得对不对")
-            .clicked()
-        {
-            self.toggle_rows_debug();
-            ui.close();
-        }
-    }
-
-    pub(super) fn help_menu_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        if ui.button("说明").clicked() {
-            let opening = !self.show_help;
-            self.show_help = opening;
-            if opening {
-                self.help_window_pos = Some(centered_window_position(ctx, HELP_WINDOW_SIZE));
-            }
-            ui.close();
-        }
-        ui.separator();
-        let (label, color, enabled, highlight, tooltip) = self.update_menu_entry();
-        let mut text = egui::RichText::new(label).color(color);
-        if highlight {
-            text = text.strong();
-        }
-        if ui
-            .add_enabled(enabled, egui::Button::new(text))
-            .on_hover_text(tooltip)
-            .clicked()
-        {
-            self.handle_update_click(ctx);
-            ui.close();
-        }
-        if self.update_phase == UpdatePhase::Downloaded {
-            ui.label(
-                egui::RichText::new("安装包已就绪，点上面的「重启并更新」完成安装")
-                    .small()
-                    .color(theme::gold()),
-            );
-        }
-    }
-
-    /// 帮助按钮上的更新徽标：只在需要用户注意的阶段出现，状态不藏在菜单里。
-    pub(super) fn update_help_badge(&self, narrow: bool) -> Option<(String, Color32, bool)> {
-        match self.update_phase {
-            UpdatePhase::Available => Some((
-                if narrow {
-                    "更新".to_string()
-                } else {
-                    format!(
-                        "更新 {}",
-                        self.update_info
-                            .as_ref()
-                            .map(|info| info.version.as_str())
-                            .unwrap_or("")
-                    )
-                },
-                theme::gold(),
-                true,
-            )),
-            UpdatePhase::Downloading => Some((
-                if narrow {
-                    format!("{:.0}%", self.update_percent())
-                } else {
-                    format!("下载 {:.0}%", self.update_percent())
-                },
-                theme::gold(),
-                false,
-            )),
-            UpdatePhase::Downloaded => Some((
-                if narrow {
-                    "重启".to_string()
-                } else {
-                    "重启更新".to_string()
-                },
-                theme::gold(),
-                true,
-            )),
-            UpdatePhase::Failed
-                if self
-                    .update_message_at
-                    .is_some_and(|at| at.elapsed() < UPDATE_FLASH_DURATION) =>
-            {
-                Some((
-                    if narrow {
-                        "失败".to_string()
-                    } else {
-                        "更新失败".to_string()
-                    },
-                    theme::red(),
-                    false,
-                ))
-            }
-            _ => None,
-        }
-    }
-
     pub(super) fn update_percent(&self) -> f32 {
         let total = self.update_info.as_ref().map(|info| info.size).unwrap_or(0);
         let downloaded = self.update_progress.load(Ordering::Relaxed);
@@ -478,7 +170,7 @@ impl MhxyApp {
         }
     }
 
-    /// 帮助菜单里的更新项：沿用原来顶栏更新按钮的各阶段文案和点击行为。
+    /// 顶栏检查更新按钮：沿用更新各阶段文案和点击行为。
     pub(super) fn update_menu_entry(&self) -> (String, Color32, bool, bool, String) {
         let percent = self.update_percent();
         let flash_active = self
@@ -676,7 +368,7 @@ impl eframe::App for MhxyApp {
             self.refresh_windows(false);
             self.last_window_refresh = Instant::now();
         }
-        if (self.show_region_window || (self.running && !self.manual_mode()))
+        if (self.sidebar_tab == "识别区域" || (self.running && !self.manual_mode()))
             && self.config.color_gate_enabled
         {
             let gate_interval =
@@ -711,12 +403,24 @@ impl eframe::App for MhxyApp {
             egui::Panel::top("header")
                 .frame(
                     egui::Frame::new()
-                        .fill(theme::surface())
-                        .inner_margin(egui::Margin::symmetric(16, 12)),
+                        // 机身色（最凹陷的底）：顶栏和内容区一眼分开。
+                        .fill(theme::inset())
+                        .stroke(egui::Stroke::new(1.0, theme::border()))
+                        .inner_margin(egui::Margin::symmetric(18, 14)),
                 )
                 .show(ui, |ui| {
                     let narrow = ui.available_width() < 900.0;
                     ui.horizontal(|ui| {
+                        // 标题单行：主标题和副标题放同一行，不撑高顶栏。
+                        ui.horizontal(|ui| {
+                            ui.heading("梦幻西游");
+                            ui.label(
+                                egui::RichText::new("任务坐标辅助")
+                                    .small()
+                                    .color(theme::muted()),
+                            );
+                        });
+                        // 展开 / 折叠紧跟在标题右侧。
                         let sidebar_label = if self.config.sidebar_expanded {
                             if narrow {
                                 "收起"
@@ -729,19 +433,16 @@ impl eframe::App for MhxyApp {
                             "展开设置"
                         };
                         if ui
-                            .add(egui::Button::new(sidebar_label).min_size(vec2(0.0, 34.0)))
+                            .add(theme::secondary_button(sidebar_label).min_size(vec2(0.0, 36.0)))
                             .on_hover_text("显示或隐藏设置侧栏")
                             .clicked()
                         {
                             self.config.sidebar_expanded = !self.config.sidebar_expanded;
                             self.persist();
                         }
-                        ui.heading("梦幻西游");
-                        if !narrow {
-                            ui.label(egui::RichText::new("任务坐标辅助").color(theme::muted()));
-                        }
+                        ui.separator();
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.spacing_mut().item_spacing.x = if narrow { 4.0 } else { 8.0 };
+                            ui.spacing_mut().item_spacing.x = if narrow { 6.0 } else { 10.0 };
                             let full_start = if self.running {
                                 if self.manual_mode() {
                                     "暂停监听"
@@ -769,7 +470,32 @@ impl eframe::App for MhxyApp {
                             {
                                 self.toggle_running();
                             }
-                            self.header_more_menu(ui, &ctx, narrow);
+                            if !narrow {
+                                if self.running {
+                                    theme::status_pill(ui, theme::jade(), "运行中");
+                                } else {
+                                    theme::status_pill(ui, theme::muted(), "已暂停");
+                                }
+                            }
+                            // 检查更新常驻顶栏：跟开始按钮挨着，状态一眼能看见。
+                            let (label, color, enabled, highlight, tooltip) =
+                                self.update_menu_entry();
+                            let mut text = egui::RichText::new(label).color(color);
+                            if highlight {
+                                text = text.strong();
+                            }
+                            let update_button = if highlight {
+                                egui::Button::new(text).fill(theme::gold_tint())
+                            } else {
+                                egui::Button::new(text)
+                            };
+                            if ui
+                                .add_enabled(enabled, update_button)
+                                .on_hover_text(tooltip)
+                                .clicked()
+                            {
+                                self.handle_update_click(&ctx);
+                            }
                         });
                     });
                 });
@@ -778,12 +504,59 @@ impl eframe::App for MhxyApp {
             egui::Panel::bottom("status_bar")
                 .frame(
                     egui::Frame::new()
-                        .fill(theme::surface())
-                        .inner_margin(egui::Margin::symmetric(16, 6)),
+                        .fill(theme::inset())
+                        .stroke(egui::Stroke::new(1.0, theme::border()))
+                        .inner_margin(egui::Margin::symmetric(18, 9)),
                 )
                 .show(ui, |ui| {
+                    // 窗口变窄（收缩）时左右两组文字会撞车：窄于 640 只留运行圆点、
+                    // 版本和右边的保存状态/链接，识别方式、提示和耗时都不画。
+                    let narrow = ui.available_width() < 640.0;
                     ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new(crate::APP_VERSION).small().weak());
+                        ui.colored_label(
+                            if self.running {
+                                theme::jade()
+                            } else {
+                                theme::muted()
+                            },
+                            "●",
+                        );
+                        ui.label(
+                            egui::RichText::new(crate::APP_VERSION)
+                                .small()
+                                .color(theme::text())
+                                .strong(),
+                        );
+                        if narrow {
+                            // 窄窗口：左组只剩圆点+版本，中间信息全省，三组靠右_to_left 推出去。
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    let (text, color) = if self.save_error.is_some() {
+                                        ("配置保存失败", theme::red())
+                                    } else if self.config_dirty_since.is_some() {
+                                        ("正在保存…", theme::muted())
+                                    } else {
+                                        ("设置自动保存", theme::muted())
+                                    };
+                                    ui.label(egui::RichText::new(text).small().color(color))
+                                        .on_hover_text(self.save_error.as_deref().unwrap_or(text));
+                                    ui.separator();
+                                    ui.hyperlink_to(
+                                        egui::RichText::new("发布页").small(),
+                                        crate::update::HOME_URL,
+                                    )
+                                    .on_hover_text(crate::update::HOME_URL);
+                                    ui.separator();
+                                    ui.hyperlink_to(
+                                        egui::RichText::new("GitHub").small(),
+                                        crate::APP_REPO_URL,
+                                    )
+                                    .on_hover_text(crate::APP_REPO_URL);
+                                },
+                            );
+                            return;
+                        }
                         ui.separator();
                         ui.label(
                             egui::RichText::new(if self.config.ocr_mode == "remote" {
@@ -864,21 +637,21 @@ impl eframe::App for MhxyApp {
                 });
         }
         if self.config.sidebar_expanded && !self.compact {
-            // 侧栏最多占可用宽度的一半减一点，保证右侧地图区域不会被挤压。
-            let max_sidebar = (ui.available_width() - 360.0).clamp(240.0, 400.0);
+            // 左侧菜单栏：瘦长一条，只放切换主区的五个入口，不放任何控件。
             egui::Panel::left("controls")
-                .resizable(true)
-                .default_size(320.0f32.min(max_sidebar).max(240.0))
-                .min_size(240.0f32.min(max_sidebar))
-                .max_size(max_sidebar)
+                .resizable(false)
+                .default_size(152.0)
+                .min_size(140.0)
+                .max_size(180.0)
                 .frame(
                     egui::Frame::new()
-                        .fill(theme::background())
-                        .inner_margin(12),
+                        .fill(theme::surface())
+                        .stroke(egui::Stroke::new(1.0, theme::border()))
+                        .inner_margin(10),
                 )
-                .show(ui, |ui| self.controls(ui));
+                .show(ui, |ui| self.sidebar_menu_ui(ui));
         }
-        let central_margin = if self.compact { 0 } else { 12 };
+        let central_margin = if self.compact { 0 } else { 16 };
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
@@ -886,12 +659,113 @@ impl eframe::App for MhxyApp {
                     .inner_margin(central_margin),
             )
             .show(ui, |ui| {
-                if self.config.map_window_enabled {
-                    // 地图已经弹到独立浮窗里，主窗口只留说明和关闭入口。
-                    self.map_window_placeholder(ui);
+                // 精简界面：只要进了精简模式，主区只画地图（地图浮窗开着就是占位说明），
+                // 不论当前在哪个设置页；Esc 退出精简模式后再回到之前的页面。
+                if self.compact {
+                    if self.config.map_window_enabled {
+                        self.map_window_placeholder(ui);
+                    } else {
+                        self.task_area(ui, 255, true);
+                    }
                     return;
                 }
-                self.task_area(ui, 255, true);
+
+                // 主区页（顺序即优先级）：说明 / 打坐计时 / 识别区域 / 合成旗编辑器 / 行分割调试 / 识别方式 / 方案管理
+                match self.sidebar_tab {
+                    "识别区域" => {
+                        self.region_page_ui(ui);
+                        return;
+                    }
+                    "合成旗编辑器" => {
+                        egui::ScrollArea::vertical()
+                            .id_salt("flight_flags_page")
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width().min(640.0));
+                                self.flight_flags_page_ui(ui);
+                            });
+                        return;
+                    }
+                    "行分割调试" => {
+                        egui::ScrollArea::vertical()
+                            .id_salt("rows_debug_page")
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width().min(640.0));
+                                self.rows_debug_page_ui(ui);
+                            });
+                        return;
+                    }
+                    "识别方式" => {
+                        egui::ScrollArea::vertical()
+                            .id_salt("mode_page")
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width().min(640.0));
+                                self.mode_page_ui(ui);
+                            });
+                        return;
+                    }
+                    "方案管理" => {
+                        egui::ScrollArea::vertical()
+                            .id_salt("profiles_page")
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width().min(640.0));
+                                self.profiles_page_ui(ui);
+                            });
+                        return;
+                    }
+                    "日志" => {
+                        egui::ScrollArea::vertical()
+                            .id_salt("log_page")
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width().min(640.0));
+                                self.log_page_ui(ui);
+                            });
+                        return;
+                    }
+                    _ => {}
+                }
+
+                if self.config.map_window_enabled && self.sidebar_tab == "任务地图" {
+                    // 地图已经弹到独立浮窗：任务地图页就地给出说明 + 浮窗设置卡，
+                    // 不再顶栏多一个菜单项。只在任务地图页出，其他页照常走。
+                    egui::ScrollArea::vertical()
+                        .id_salt("map_floating_page")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width().min(640.0));
+                            self.map_window_placeholder(ui);
+                            ui.add_space(12.0);
+                            theme::card_with(theme::surface()).show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                self.map_window_settings_controls(ui);
+                            });
+                        });
+                    return;
+                }
+                if self.sidebar_tab == "说明" {
+                    egui::ScrollArea::vertical()
+                        .id_salt("help_page")
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width().min(640.0));
+                            self.help_page_ui(ui);
+                        });
+                } else if self.sidebar_tab == "打坐计时" {
+                    egui::ScrollArea::vertical()
+                        .id_salt("meditation_page")
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width().min(640.0));
+                            self.meditation_page_ui(ui);
+                        });
+                } else if self.sidebar_tab == "任务地图" {
+                    self.task_area(ui, 255, true);
+                } else {
+                    // 设置页：主区滚动，内宽封顶 640，不让控件拉得太松也不能捅出窗口。
+                    egui::ScrollArea::vertical()
+                        .id_salt("settings_page")
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width().min(640.0));
+                            self.settings_page_ui(ui);
+                        });
+                }
             });
         if self.show_update_dialog {
             let on_top = self.config.on_top;
@@ -942,197 +816,14 @@ impl eframe::App for MhxyApp {
                 },
             );
         }
-        if self.show_help {
-            let on_top = self.config.on_top;
-            let mut builder = egui::ViewportBuilder::default()
-                .with_title("使用说明 · rust-mhxy")
-                .with_inner_size(HELP_WINDOW_SIZE)
-                .with_min_inner_size([420.0, 360.0]);
-            if on_top {
-                builder = builder.with_always_on_top();
-            }
-            if let Some(position) = self.help_window_pos {
-                builder = builder.with_position(position);
-            }
-            ctx.show_viewport_immediate(
-                egui::ViewportId::from_hash_of("help_window"),
-                builder,
-                |ui, _class| {
-                    if ui.ctx().viewport_id() == egui::ViewportId::ROOT {
-                        egui::Window::new("使用说明")
-                            .collapsible(false)
-                            .resizable(true)
-                            .default_width(480.0)
-                            .show(ui.ctx(), |ui| self.help_contents(ui));
-                    } else {
-                        if ui.ctx().input(|input| input.viewport().close_requested()) {
-                            self.show_help = false;
-                        }
-                        if self.applied_help_on_top != Some(on_top) {
-                            let level = if on_top {
-                                egui::WindowLevel::AlwaysOnTop
-                            } else {
-                                egui::WindowLevel::Normal
-                            };
-                            ui.ctx()
-                                .send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
-                            self.applied_help_on_top = Some(on_top);
-                        }
-                        egui::Frame::central_panel(ui.style())
-                            .inner_margin(16)
-                            .show(ui, |ui| {
-                                ui.set_min_size(ui.available_size());
-                                egui::ScrollArea::vertical().show(ui, |ui| self.help_contents(ui));
-                            });
-                    }
-                },
-            );
-        }
-        if self.show_advanced_window {
-            let on_top = self.config.on_top;
-            let mut builder = egui::ViewportBuilder::default()
-                .with_title("高级设置")
-                .with_inner_size(ADVANCED_WINDOW_SIZE)
-                .with_min_inner_size([420.0, 400.0]);
-            if on_top {
-                builder = builder.with_always_on_top();
-            }
-            if let Some(position) = self.advanced_window_pos {
-                builder = builder.with_position(position);
-            }
-            ctx.show_viewport_immediate(
-                egui::ViewportId::from_hash_of("advanced_window"),
-                builder,
-                |ui, _class| {
-                    if ui.ctx().viewport_id() == egui::ViewportId::ROOT {
-                        egui::Window::new("高级设置")
-                            .default_size(ADVANCED_WINDOW_SIZE)
-                            .show(ui.ctx(), |ui| self.advanced_controls(ui));
-                    } else {
-                        if ui.ctx().input(|input| input.viewport().close_requested()) {
-                            self.show_advanced_window = false;
-                        }
-                        if self.applied_advanced_on_top != Some(on_top) {
-                            let level = if on_top {
-                                egui::WindowLevel::AlwaysOnTop
-                            } else {
-                                egui::WindowLevel::Normal
-                            };
-                            ui.ctx()
-                                .send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
-                            self.applied_advanced_on_top = Some(on_top);
-                        }
-                        egui::Frame::central_panel(ui.style())
-                            .inner_margin(16)
-                            .show(ui, |ui| {
-                                let height = ui.available_height();
-                                egui::ScrollArea::vertical()
-                                    .id_salt("advanced_scroll")
-                                    .auto_shrink([false, false])
-                                    .max_height(height)
-                                    .min_scrolled_height(height)
-                                    .show(ui, |ui| {
-                                        ui.set_min_width(ui.available_width());
-                                        self.advanced_controls(ui);
-                                    });
-                            });
-                    }
-                },
-            );
-        }
-        if self.show_meditation_window {
-            let on_top = self.config.on_top;
-            let mut builder = egui::ViewportBuilder::default()
-                .with_title("打坐计时")
-                .with_inner_size(MEDITATION_WINDOW_SIZE)
-                .with_min_inner_size([360.0, 360.0]);
-            if on_top {
-                builder = builder.with_always_on_top();
-            }
-            if let Some(position) = self.meditation_window_pos {
-                builder = builder.with_position(position);
-            }
-            ctx.show_viewport_immediate(
-                egui::ViewportId::from_hash_of("meditation_window"),
-                builder,
-                |ui, _class| {
-                    if ui.ctx().viewport_id() == egui::ViewportId::ROOT {
-                        egui::Window::new("打坐计时")
-                            .default_size(MEDITATION_WINDOW_SIZE)
-                            .show(ui.ctx(), |ui| self.meditation_controls(ui));
-                    } else {
-                        if ui.ctx().input(|input| input.viewport().close_requested()) {
-                            self.show_meditation_window = false;
-                        }
-                        if self.applied_meditation_window_on_top != Some(on_top) {
-                            let level = if on_top {
-                                egui::WindowLevel::AlwaysOnTop
-                            } else {
-                                egui::WindowLevel::Normal
-                            };
-                            ui.ctx()
-                                .send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
-                            self.applied_meditation_window_on_top = Some(on_top);
-                        }
-                        egui::Frame::central_panel(ui.style())
-                            .inner_margin(16)
-                            .show(ui, |ui| {
-                                // 滚动区占满窗口高度：窗口变矮时内容滚动，而不是被裁掉。
-                                let height = ui.available_height();
-                                egui::ScrollArea::vertical()
-                                    .id_salt("meditation_scroll")
-                                    .auto_shrink([false, false])
-                                    .max_height(height)
-                                    .min_scrolled_height(height)
-                                    .show(ui, |ui| {
-                                        ui.set_min_width(ui.available_width());
-                                        self.meditation_controls(ui);
-                                    });
-                            });
-                    }
-                },
-            );
-        }
-        if self.show_flight_flags_window {
-            let mut builder = egui::ViewportBuilder::default()
-                .with_title("合成旗编辑器")
-                .with_inner_size(FLIGHT_FLAGS_WINDOW_SIZE)
-                .with_min_inner_size([680.0, 560.0]);
-            if self.config.on_top {
-                builder = builder.with_always_on_top();
-            }
-            ctx.show_viewport_immediate(
-                egui::ViewportId::from_hash_of("flight_flags_window"),
-                builder,
-                |ui, _class| {
-                    if ui.ctx().viewport_id() == egui::ViewportId::ROOT {
-                        egui::Window::new("合成旗编辑器")
-                            .default_size(FLIGHT_FLAGS_WINDOW_SIZE)
-                            .show(ui.ctx(), |ui| self.flight_flags_editor_ui(ui));
-                    } else {
-                        if ui.ctx().input(|input| input.viewport().close_requested()) {
-                            self.show_flight_flags_window = false;
-                        }
-                        egui::Frame::central_panel(ui.style())
-                            .inner_margin(16)
-                            .show(ui, |ui| {
-                                ui.set_min_size(ui.available_size());
-                                self.flight_flags_editor_ui(ui);
-                            });
-                    }
-                },
-            );
-        }
-        if !self.show_region_window {
+        if self.sidebar_tab != "识别区域" {
             self.release_preview();
         }
         if self.config.meditation_enabled {
             self.meditation_overlay(&ctx);
         }
-        // 「地图浮窗设置」是普通独立窗口，和浮窗本身分开调度。
-        self.map_window_settings_window(&ctx);
         // 地图浮窗：和主窗口同帧调度所有任务窗口，关闭模式后下一帧就不再创建。
-        // 本进程有窗口在前台（主窗口、「地图浮窗设置」、说明……）时，浮窗让出置顶，
+        // 本进程有窗口在前台（主窗口、说明……）时，浮窗让出置顶，
         // 否则置顶浮窗会盖住菜单、下拉框和滑块，点了等于没点。
         self.app_window_in_foreground = ctx.input(|input| input.viewport().focused.unwrap_or(true))
             || borderless::foreground_is_ours();
@@ -1162,87 +853,9 @@ impl eframe::App for MhxyApp {
                 }
             }
         }
-        if self.show_region_window {
-            let on_top = self.config.on_top;
-            let mut builder = egui::ViewportBuilder::default()
-                .with_title("识别区域")
-                .with_inner_size(REGION_WINDOW_SIZE)
-                .with_min_inner_size([720.0, 600.0]);
-            if on_top {
-                // 主窗口置顶时取点窗口也必须置顶，否则会被主窗口整个盖住。
-                builder = builder.with_always_on_top();
-            }
-            // 只在建立窗口时定位，之后用户拖动不会被抢回。
-            if let Some(position) = self.region_window_pos {
-                builder = builder.with_position(position);
-            }
-            ctx.show_viewport_immediate(
-                egui::ViewportId::from_hash_of("region_window"),
-                builder,
-                |ui, _class| {
-                    if ui.ctx().viewport_id() == egui::ViewportId::ROOT {
-                        // 独立视口还没建好，先画在主窗口里（只出现在第一帧）。
-                        egui::Window::new("识别区域")
-                            .default_size([800.0, 640.0])
-                            .show(ui.ctx(), |ui| self.region_window_ui(ui));
-                    } else {
-                        // 跟随「置顶」开关同步取点窗口的层级，开着置顶时它才不会被主窗口压住。
-                        if self.applied_region_on_top != Some(on_top) {
-                            let level = if on_top {
-                                egui::WindowLevel::AlwaysOnTop
-                            } else {
-                                egui::WindowLevel::Normal
-                            };
-                            ui.ctx()
-                                .send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
-                            self.applied_region_on_top = Some(on_top);
-                        }
-                        self.region_window_ui(ui);
-                    }
-                },
-            );
-        }
-        // 行分割调试：普通浮窗即可（调试用，不需要独立视口和置顶同步）。
-        if self.show_rows_debug {
-            let mut open = true;
-            egui::Window::new("行分割调试")
-                .id(egui::Id::new("rows_debug_window"))
-                .open(&mut open)
-                .default_size([760.0, 720.0])
-                .default_pos([120.0, 80.0])
-                .resizable(true)
-                .show(&ctx.clone(), |ui| {
-                    ui.set_min_width(560.0);
-                    self.rows_debug_window_ui(ui);
-                });
-            if !open {
-                self.show_rows_debug = false;
-            }
-        }
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.flush_config();
     }
-}
-
-/// 说明 / 更新窗口在主窗口中间打开，并限制在屏幕内。
-pub(super) fn centered_window_position(ctx: &egui::Context, size: Vec2) -> egui::Pos2 {
-    ctx.input(|input| {
-        let viewport = input.viewport();
-        let monitor = viewport
-            .monitor_size
-            .unwrap_or_else(|| Vec2::new(1920.0, 1080.0));
-        let main = viewport.outer_rect;
-        let x = main
-            .map(|rect| rect.center().x - size.x / 2.0)
-            .unwrap_or(0.0);
-        let y = main
-            .map(|rect| rect.center().y - size.y / 2.0)
-            .unwrap_or(0.0);
-        egui::pos2(
-            x.clamp(0.0, (monitor.x - size.x).max(0.0)),
-            y.clamp(0.0, (monitor.y - size.y).max(0.0)),
-        )
-    })
 }

@@ -160,6 +160,24 @@ const BOLD_CANDIDATES: &[&str] = &[
     "/System/Library/Fonts/PingFang.ttc",
 ];
 
+/// 系统里是否找到了 Fluent 图标字体（Segoe MDL2 Assets）。
+static ICON_FONT_AVAILABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Fluent 图标字体是否可用；没有时界面不画图标，只用文字。
+pub fn has_icon_font() -> bool {
+    ICON_FONT_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Windows 11 UI 字体：拉丁字母和数字优先用它，中文回退到 CJK。
+const UI_CANDIDATES: &[&str] = &[
+    "C:/Windows/Fonts/SegUIVar.ttf",
+    "C:/Windows/Fonts/segoeui.ttf",
+];
+
+/// Fluent 图标字体（Segoe MDL2 Assets）。
+const ICON_CANDIDATES: &[&str] = &["C:/Windows/Fonts/segmdl2.ttf"];
+
 /// egui 自带的字体没有中文字形，这里从系统里找一个 CJK 字体装上。
 fn install_fonts(ctx: &egui::Context) {
     const CANDIDATES: &[&str] = &[
@@ -198,6 +216,35 @@ fn install_fonts(ctx: &egui::Context) {
         .entry(egui::FontFamily::Proportional)
         .or_default()
         .insert(0, "cjk".to_owned());
+    // Windows 11：拉丁字母 / 数字换成 Segoe UI，中文自动回退到 CJK。
+    if let Some(ui_font) = UI_CANDIDATES
+        .iter()
+        .find_map(|path| load_font(std::path::Path::new(path)))
+    {
+        fonts.font_data.insert(
+            "ui".to_owned(),
+            Arc::new(egui::FontData::from_static(ui_font)),
+        );
+        if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+            family.insert(0, "ui".to_owned());
+        }
+    }
+    // Fluent 图标：装成独立字体族 "icons"，按字形编码取用。
+    if let Some(icon_font) = ICON_CANDIDATES
+        .iter()
+        .find_map(|path| load_font(std::path::Path::new(path)))
+    {
+        fonts.font_data.insert(
+            "icons".to_owned(),
+            Arc::new(egui::FontData::from_static(icon_font)),
+        );
+        fonts
+            .families
+            .entry(egui::FontFamily::Name("icons".into()))
+            .or_default()
+            .push("icons".to_owned());
+        ICON_FONT_AVAILABLE.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     fonts
         .families
         .entry(egui::FontFamily::Monospace)

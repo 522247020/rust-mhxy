@@ -142,6 +142,26 @@ pub struct Config {
     /// 送 OCR 前把截图放大几倍（1 = 不放大）。
     #[serde(rename = "ocr/upscale")]
     pub ocr_upscale: u32,
+    /// 行分割手动行高（像素）：0 = 自动估计。游戏字号固定时量一次长期有效，自动估计漂了也能兜底。
+    #[serde(rename = "ocr/row_height")]
+    pub ocr_row_height: u32,
+    /// 行分割策略：`detect`（关闭分行，直接走检测模型，默认）/
+    /// `auto`（自动分行）/ `manual`（手动网格）。
+    /// 手动行高、首行定位、空白行只在 `manual` 下生效。
+    #[serde(rename = "ocr/row_mode")]
+    pub ocr_row_mode: String,
+    /// 行分割首行定位（像素，图片顶部是 0）：手动行高不为 0 时才生效，
+    /// 第一行从这个 Y 开始按行高切，不再从图片顶部起。
+    #[serde(rename = "ocr/row_start")]
+    pub ocr_row_start: u32,
+    /// 行分割空白行（手动网格才生效）：指定行之后加高 H 的空白行，
+    /// 格式 `"5x24,9x30"`（在第几行之后 x 空白高度），后面行从空白行后重新对齐。
+    #[serde(rename = "ocr/gap_rows")]
+    pub ocr_gap_rows: String,
+    /// 行裁图上下留白（百分比）：识别图上下各加行高 × 18% 的留白。
+    /// 0 = 严格按行高切（识别图高 = 行高）。
+    #[serde(rename = "ocr/row_pad")]
+    pub ocr_row_pad: u32,
     /// 高召回检测：降低 PP-OCR 检测阈值，代价是可能多出噪声框。
     #[serde(rename = "ocr/high_recall")]
     pub ocr_high_recall: bool,
@@ -277,6 +297,11 @@ impl Default for Config {
             realtime: false,
             task_region: DEFAULT_TASK_REGION,
             ocr_upscale: 2,
+            ocr_row_mode: "detect".into(),
+            ocr_row_height: 0,
+            ocr_row_start: 0,
+            ocr_gap_rows: String::new(),
+            ocr_row_pad: 18,
             ocr_high_recall: true,
             ocr_vote_frames: true,
             region_presets: std::collections::BTreeMap::new(),
@@ -382,6 +407,15 @@ impl Config {
         };
         self.interval_seconds = self.interval_seconds.clamp(1, 60);
         self.ocr_upscale = self.ocr_upscale.clamp(1, 3);
+        self.ocr_row_height = self.ocr_row_height.clamp(0, 200);
+        // 行分割默认关闭（`detect`）：旧配置里没有这个键、或者写错值，都当关闭。
+        self.ocr_row_mode = match self.ocr_row_mode.as_str() {
+            "auto" => "auto".to_string(),
+            "manual" => "manual".to_string(),
+            _ => "detect".to_string(),
+        };
+        self.ocr_row_start = self.ocr_row_start.clamp(0, 4096);
+        self.ocr_row_pad = self.ocr_row_pad.clamp(0, 50);
         self.region_presets
             .retain(|_, region| parse_region(region).is_some());
         self.api_format = if self.api_format == "raw" {
@@ -1252,6 +1286,43 @@ mod tests {
     }
 
     #[test]
+    fn defaults_are_local_two_x_and_row_split_off() {
+        // 用户默认值：本地 PP-OCR、放大 2x、行分割关闭。
+        let config = Config::default();
+        assert_eq!(config.ocr_mode, "local");
+        assert_eq!(config.ocr_upscale, 2);
+        assert_eq!(config.ocr_row_mode, "detect");
+    }
+
+    #[test]
+    fn row_mode_defaults_to_detect_and_keeps_valid_values() {
+        // 行分割默认关闭：新装和升级都一样，想用分行得自己去识别方式里打开。
+        assert_eq!(Config::default().ocr_row_mode, "detect");
+        let mut config = Config {
+            ocr_row_mode: String::new(),
+            ocr_row_height: 22,
+            ..Default::default()
+        };
+        config.normalize();
+        assert_eq!(config.ocr_row_mode, "detect");
+        // 写好的值原样保留，写错的当关闭。
+        for (raw, expected) in [
+            ("weird", "detect"),
+            ("auto", "auto"),
+            ("manual", "manual"),
+            ("detect", "detect"),
+        ] {
+            let mut config = Config {
+                ocr_row_mode: raw.into(),
+                ocr_row_height: 22,
+                ..Default::default()
+            };
+            config.normalize();
+            assert_eq!(config.ocr_row_mode, expected, "{raw}");
+        }
+    }
+
+    #[test]
     fn save_output_keeps_flat_key_format() {
         let dir = std::env::temp_dir().join("rust-mhxy-config-output-format-test");
         let _ = std::fs::create_dir_all(&dir);
@@ -1330,6 +1401,11 @@ mod tests {
             "ocr/mode",
             "ocr/realtime",
             "ocr/region_presets",
+            "ocr/gap_rows",
+            "ocr/row_pad",
+            "ocr/row_height",
+            "ocr/row_mode",
+            "ocr/row_start",
             "ocr/task_region",
             "ocr/trigger",
             "ocr/upscale",

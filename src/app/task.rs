@@ -22,7 +22,7 @@ impl MhxyApp {
             lines.push(format!("文字：{}", truncate_text(&raw, 240)));
         }
         if tasks.is_empty() {
-            lines.push("未解析到任务（可检查截图区域或预处理）".to_string());
+            lines.push("未解析到任务（可检查截图区域、识别方式或任务类型设置）".to_string());
         }
         for task in tasks {
             lines.push(format!(
@@ -97,14 +97,14 @@ impl MhxyApp {
         if !full_window {
             painter.rect_filled(
                 rect,
-                CornerRadius::same(8),
+                CornerRadius::same(10),
                 theme::inset().gamma_multiply(opacity),
             );
         }
         let image_rect = if full_window {
             rect
         } else {
-            fit_rect(rect.shrink(8.0), texture_size)
+            fit_rect(rect.shrink(10.0), texture_size)
         };
         if image_rect.width() <= 1.0 {
             return;
@@ -116,6 +116,15 @@ impl MhxyApp {
             // 半透明取值：浮窗调低不透明度时地图本身也一起变淡。
             Color32::WHITE.gamma_multiply(opacity),
         );
+        if !full_window {
+            // 地图描一圈细边，和卡片底板分开，边缘更利落。
+            painter.rect_stroke(
+                image_rect,
+                CornerRadius::same(10),
+                egui::Stroke::new(1.0, theme::border().gamma_multiply(opacity)),
+                egui::StrokeKind::Inside,
+            );
+        }
         // 地图浮窗会拉伸到整个窗口，横纵缩放比例可能不同，不能只用一个 scale。
         let scale_x = image_rect.width() / texture_size.x;
         let scale_y = image_rect.height() / texture_size.y;
@@ -127,8 +136,8 @@ impl MhxyApp {
         };
         let (point_x, point_y) = clamp_to_map(definition, location.x as f32, location.y as f32);
 
-        // 高概率格子：相对任务坐标偏移的 50×50 区域。
-        let high_chance_rects: Vec<Rect> = if show_high_chance {
+        // 高概率格子：只有「附近」在任务里（未开眼）才可能出现 —— 没有附近就不画。
+        let high_chance_rects: Vec<Rect> = if show_high_chance && location.nearby {
             high_chance_areas(
                 &definition.name,
                 location.x as f32,
@@ -215,10 +224,9 @@ impl MhxyApp {
 
         for chance in &high_chance_rects {
             // 只显示落在黄色「附近」框内的部分，避免红框超出黄框。
-            let chance = match nearby_area {
-                Some(area) => (*chance).intersect(area),
-                None => *chance,
-            };
+            // 红格的开关门是 `nearby`（见上面），到这里 nearby 一定为 true，
+            // nearby_area 必有值。
+            let chance = nearby_area.map_or(*chance, |area| (*chance).intersect(area));
             if chance.width() <= 0.0 || chance.height() <= 0.0 {
                 continue;
             }
@@ -279,7 +287,7 @@ impl MhxyApp {
             );
             let label = format!("({}, {})", location.x, location.y);
             let galley = painter.layout_no_wrap(label, FontId::proportional(14.0), Color32::WHITE);
-            let label_size = galley.size() + vec2(12.0, 8.0);
+            let label_size = galley.size() + vec2(14.0, 9.0);
             let label_min = pos2(
                 (center.x + 12.0)
                     .clamp(rect.left(), (rect.right() - label_size.x).max(rect.left())),
@@ -287,11 +295,11 @@ impl MhxyApp {
             );
             painter.rect_filled(
                 Rect::from_min_size(label_min, label_size),
-                CornerRadius::same(4),
+                CornerRadius::same(6),
                 Color32::from_black_alpha(220).gamma_multiply(opacity),
             );
             painter.galley(
-                label_min + vec2(6.0, 4.0),
+                label_min + vec2(7.0, 5.0),
                 galley,
                 Color32::WHITE.gamma_multiply(opacity),
             );
@@ -304,11 +312,26 @@ impl MhxyApp {
                 if let Some((game_x, game_y)) =
                     map_coordinate(definition, pixel_x, pixel_y, texture_size.x, texture_size.y)
                 {
-                    painter.text(
-                        image_rect.right_top() + vec2(-8.0, 8.0),
-                        Align2::RIGHT_TOP,
-                        format!("鼠标坐标：{game_x}, {game_y}"),
+                    // 鼠标坐标也带底色，地图花时不糊成一片。
+                    let label = format!("鼠标坐标：{game_x}, {game_y}");
+                    let galley = painter.layout_no_wrap(
+                        label,
                         FontId::proportional(13.0),
+                        Color32::from_rgb(248, 250, 252).gamma_multiply(opacity),
+                    );
+                    let size = galley.size() + vec2(12.0, 7.0);
+                    let min = pos2(
+                        (image_rect.right_top().x - 8.0 - size.x).max(image_rect.left()),
+                        image_rect.top() + 8.0,
+                    );
+                    painter.rect_filled(
+                        Rect::from_min_size(min, size),
+                        CornerRadius::same(6),
+                        Color32::from_black_alpha(200).gamma_multiply(opacity),
+                    );
+                    painter.galley(
+                        min + vec2(6.0, 4.0),
+                        galley,
                         Color32::from_rgb(248, 250, 252).gamma_multiply(opacity),
                     );
                 }
@@ -344,13 +367,13 @@ impl MhxyApp {
                     vec2(rect.width(), height),
                 )
             };
-            let gap = if self.compact || !card { 0.0 } else { 5.0 };
+            let gap = if self.compact || !card { 0.0 } else { 8.0 };
             let mut child = ui.new_child(egui::UiBuilder::new().max_rect(child_rect.shrink(gap)));
             self.task_panel_with(&mut child, task_type, alpha, card, false);
         }
     }
 
-    /// 任务区域只显示地图；地图名称、坐标和识别状态不再单独占一行。
+    /// 任务区域显示地图；主窗口卡片模式下，地图上方带任务徽章 + 地图名 + 坐标的卡片头。
     #[cfg(test)]
     pub(super) fn task_panel(&mut self, ui: &mut egui::Ui, task_type: &str) {
         self.task_panel_with(ui, task_type, 255, true, false);
@@ -373,6 +396,9 @@ impl MhxyApp {
         } else {
             theme::gold()
         };
+        // 卡片头用到的数据：地图名 + 坐标，提前取出（draw 闭包会借用 location）。
+        let map_name = map_index.map(|index| self.maps[index].name.clone());
+        let coord = location.as_ref().map(|loc| (loc.x, loc.y));
         let show_high_chance = match task_type {
             "抓鬼" => self.config.high_chance,
             "鬼王" => self.config.ghost_king_high_chance,
@@ -432,7 +458,45 @@ impl MhxyApp {
             // 精简模式 / 地图浮窗不套任务卡片的边框和背景，地图直接铺满窗口。
             draw(self, ui);
         } else {
-            theme::card().show(ui, |ui| draw(self, ui));
+            theme::card().show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                let area = ui.available_rect_before_wrap();
+                // 卡片头：一枚任务色徽章 + 地图名，右侧等宽坐标。地图退到卡片下半区。
+                // 没有地图名和坐标时（刚打开、还没识别）整行不画，不要「等待识别」占位。
+                if map_name.is_some() || coord.is_some() {
+                    ui.horizontal(|ui| {
+                        if let Some(name) = &map_name {
+                            ui.label(
+                                egui::RichText::new(name.clone())
+                                    .size(15.0)
+                                    .color(theme::text())
+                                    .strong(),
+                            );
+                        }
+                        if let Some((x, y)) = coord {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        egui::RichText::new(format!("({x}, {y})"))
+                                            .monospace()
+                                            .color(theme::muted()),
+                                    );
+                                },
+                            );
+                        }
+                    });
+                    theme::divider(ui);
+                }
+                draw(self, ui);
+                // 卡片顶部一条细强调条：抓鬼青玉、鬼王金，两个面板一眼分开。
+                let painter = ui.painter();
+                painter.rect_filled(
+                    Rect::from_min_size(area.min, vec2(area.width(), 3.0)),
+                    CornerRadius::same(2),
+                    accent.gamma_multiply(0.85).gamma_multiply(opacity),
+                );
+            });
         }
     }
 }

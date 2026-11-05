@@ -98,21 +98,14 @@ fn blend_mode_switching_preserves_normal_alpha_and_additive_markers_are_opaque()
 fn flight_flag_editor_lists_supported_maps_and_local_file() {
     let mut app = app();
     let ctx = app.ctx.clone();
-    let input = egui::RawInput {
-        screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(420.0, 600.0))),
-        ..Default::default()
-    };
-    let mut output = ctx.run_ui(input, |ui| app.flight_flags_ui(ui));
-    let texts = collect_texts(&output.shapes);
+    let mut output = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 760.0))),
+            ..Default::default()
+        },
+        |ui| app.flight_flags_page_ui(ui),
+    );
     output.textures_delta.clear();
-    assert!(
-        texts.iter().any(|text| text == "打开合成旗编辑器"),
-        "侧栏应提供独立编辑窗口入口：{texts:?}"
-    );
-    assert!(
-        texts.iter().any(|text| text.contains("flight_flags.json")),
-        "编辑区应说明独立本地配置文件：{texts:?}"
-    );
 
     let mut output = ctx.run_ui(
         egui::RawInput {
@@ -270,31 +263,24 @@ fn meditation_panel_shows_countdown_and_controls() {
         screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1120.0, 900.0))),
         ..Default::default()
     };
-    // 侧栏不再有打坐分组；顶栏只留一个「更多」菜单，打坐和合成旗在其中的工具分组里。
+    // 侧栏不再有打坐分组；打坐和合成旗入口现在在左侧菜单栏的「窗口」组里。
     let mut output = ctx.run_ui(input(), |ui| app.ui(ui, &mut frame));
     let texts = collect_texts(&output.shapes);
     output.textures_delta.clear();
     assert!(
-        texts.iter().any(|text| text == "更多"),
-        "顶栏应有唯一的更多菜单：{texts:?}"
-    );
-    assert!(
-        !texts.iter().any(|text| text == "工具"),
-        "工具分组只应在更多菜单里：{texts:?}"
+        !texts.iter().any(|text| text == "更多"),
+        "顶栏不应再有更多菜单：{texts:?}"
     );
     assert!(
         !texts.iter().any(|text| text == "启用打坐计时"),
-        "打坐设置不应再出现在侧栏：{texts:?}"
+        "打坐设置不应出现在主界面：{texts:?}"
     );
 
-    // 工具菜单里的两个入口。
-    let mut output = ctx.run_ui(input(), |ui| app.tools_menu_ui(ui, &ctx));
-    let texts = collect_texts(&output.shapes);
-    output.textures_delta.clear();
+    // 菜单栏里的两个窗口入口。
     for expected in ["打坐计时", "合成旗编辑器"] {
         assert!(
             texts.iter().any(|text| text == expected),
-            "工具菜单缺少「{expected}」：{texts:?}"
+            "菜单栏缺少窗口入口「{expected}」：{texts:?}"
         );
     }
 
@@ -319,6 +305,8 @@ fn meditation_panel_shows_countdown_and_controls() {
 #[test]
 fn basic_sidebar_keeps_primary_path_and_hides_advanced_details() {
     let mut app = app();
+    // 主区默认是任务地图；选到「游戏窗口」设置页再检查主路径在场。
+    app.sidebar_tab = "游戏窗口";
     let ctx = app.ctx.clone();
     let mut frame = eframe::Frame::_new_kittest();
     let input = egui::RawInput {
@@ -341,22 +329,20 @@ fn basic_sidebar_keeps_primary_path_and_hides_advanced_details() {
             "基础侧栏缺少「{expected}」：{texts:?}"
         );
     }
-    // 主操作固定在顶栏，次级入口全部收进「更多」，侧栏不重复。
-    for expected in ["开始识别", "更多"] {
+    // 主操作固定在顶栏，次级入口全部在左侧菜单栏。
+    for expected in ["开始识别", "任务地图", "打坐计时"] {
         assert!(
             texts.iter().any(|text| text == expected),
             "顶栏缺少「{expected}」：{texts:?}"
         );
     }
-    // 高级设置、工具菜单内容默认收起，低频项不应出现在首屏。
+    // 高级设置内容默认收起，低频项不应出现在首屏。
     for hidden in [
         "远端 PP-OCR",
         "服务地址",
         "访问令牌（可选）",
         "识别方案",
-        "打坐计时",
         "合成旗标注",
-        "日志",
         "地图浮窗（无边框）",
     ] {
         assert!(
@@ -398,6 +384,8 @@ fn basic_sidebar_keeps_primary_path_and_hides_advanced_details() {
 #[test]
 fn interval_is_only_shown_in_auto_mode() {
     let mut app = app();
+    // 模式相关的控件在「识别模式」页里，默认选中该页再渲染设置栏。
+    app.sidebar_tab = "识别模式";
     let ctx = app.ctx.clone();
     let input = || egui::RawInput {
         screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(420.0, 900.0))),
@@ -405,7 +393,7 @@ fn interval_is_only_shown_in_auto_mode() {
     };
 
     app.config.trigger_mode = "auto".into();
-    let mut output = ctx.run_ui(input(), |ui| app.basic_controls(ui));
+    let mut output = ctx.run_ui(input(), |ui| app.settings_page_ui(ui));
     let texts = collect_texts(&output.shapes);
     output.textures_delta.clear();
     assert!(
@@ -420,7 +408,7 @@ fn interval_is_only_shown_in_auto_mode() {
 
     // 实时模式开启后开关仍然可见（否则关不掉）。
     app.config.realtime = true;
-    let mut output = ctx.run_ui(input(), |ui| app.basic_controls(ui));
+    let mut output = ctx.run_ui(input(), |ui| app.settings_page_ui(ui));
     let texts = collect_texts(&output.shapes);
     output.textures_delta.clear();
     assert!(
@@ -430,7 +418,7 @@ fn interval_is_only_shown_in_auto_mode() {
 
     app.config.realtime = false;
     app.config.trigger_mode = "manual".into();
-    let mut output = ctx.run_ui(input(), |ui| app.basic_controls(ui));
+    let mut output = ctx.run_ui(input(), |ui| app.settings_page_ui(ui));
     let texts = collect_texts(&output.shapes);
     output.textures_delta.clear();
     assert!(
@@ -497,7 +485,7 @@ fn advanced_settings_hold_low_frequency_controls() {
             screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 2600.0))),
             ..Default::default()
         },
-        |ui| app.advanced_controls(ui),
+        |ui| app.mode_page_ui(ui),
     );
     let texts = collect_texts(&output.shapes);
     output.textures_delta.clear();
@@ -508,14 +496,10 @@ fn advanced_settings_hold_low_frequency_controls() {
         "服务地址",
         "访问令牌（可选）",
         "测试连接",
-        "方案管理",
-        "识别方案",
-        "合成旗标注",
-        "打开合成旗编辑器",
     ] {
         assert!(
             texts.iter().any(|text| text.contains(expected)),
-            "高级设置缺少「{expected}」：{texts:?}"
+            "识别方式页缺少「{expected}」：{texts:?}"
         );
     }
     // 识别区域/门控在基础区「设置识别区域」里；打坐有独立窗口，日志不再展示内容。
@@ -529,7 +513,24 @@ fn advanced_settings_hold_low_frequency_controls() {
     ] {
         assert!(
             !texts.iter().any(|text| text.contains(removed)),
-            "高级设置不应再包含「{removed}」：{texts:?}"
+            "识别方式页不应再包含「{removed}」：{texts:?}"
+        );
+    }
+
+    // 方案管理页单独列出。
+    let mut output = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 900.0))),
+            ..Default::default()
+        },
+        |ui| app.profiles_page_ui(ui),
+    );
+    let texts = collect_texts(&output.shapes);
+    output.textures_delta.clear();
+    for expected in ["方案管理", "识别方案"] {
+        assert!(
+            texts.iter().any(|text| text.contains(expected)),
+            "方案管理页缺少「{expected}」：{texts:?}"
         );
     }
 
@@ -540,12 +541,50 @@ fn advanced_settings_hold_low_frequency_controls() {
             screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 900.0))),
             ..Default::default()
         },
-        |ui| app.advanced_controls(ui),
+        |ui| app.mode_page_ui(ui),
     );
     let texts = collect_texts(&output.shapes);
     output.textures_delta.clear();
     assert!(!texts.iter().any(|text| text == "服务地址"));
     assert!(texts.iter().any(|text| text.contains("首次识别时加载模型")));
+}
+
+#[test]
+fn log_page_shows_level_path_and_live_lines() {
+    let mut app = app();
+    app.push_log(true, "启动应用".into());
+    app.push_log(false, "OCR 细节（简单级别下不记）".into());
+    let ctx = app.ctx.clone();
+    let mut output = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 900.0))),
+            ..Default::default()
+        },
+        |ui| app.log_page_ui(ui),
+    );
+    let texts = collect_texts(&output.shapes);
+    output.textures_delta.clear();
+    for expected in ["日志级别", "日志写入", "实时日志", "启动应用"] {
+        assert!(
+            texts.iter().any(|text| text.contains(expected)),
+            "日志页缺少「{expected}」：{texts:?}"
+        );
+    }
+    assert!(
+        !texts
+            .iter()
+            .any(|text| text == "OCR 细节（简单级别下不记）"),
+        "简单级别下详细日志不应进入缓存：{texts:?}"
+    );
+    // 切到详细后，详细日志进缓存。
+    app.config.log_level = "detailed".into();
+    app.push_log(false, "OCR 细节（详细）".into());
+    assert!(
+        app.log_lines
+            .iter()
+            .any(|line| line.contains("OCR 细节（详细）")),
+        "详细日志应进入内存缓存"
+    );
 }
 
 #[test]
@@ -586,6 +625,47 @@ fn profile_saves_and_restores_task_region() {
 }
 
 #[test]
+fn high_chance_grid_drawn_only_when_nearby_text_present() {
+    // 没开眼（文本里有「附近」）→ 开关开时画高概率红格；
+    // 开眼（无「附近」）→ 开关开也不画高概率框。
+    // 测试的当前目录下没有 maps/，换成仓库里的地图图片，让地图真的画出来。
+    let map_image = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/maps/长寿村.png");
+    // 红格填充色就是 render_map 里那个半透明红，提前算好用来在形状里找。
+    let chance_fill = Color32::from_rgba_unmultiplied(255, 40, 40, 48);
+    for (text, expect_red) in [
+        ("钟馗抓鬼（第1个）：去长寿村123,45附近抓僵尸。", true),
+        ("钟馗抓鬼（第10个）：去长寿村123,45处抓僵尸。", false),
+    ] {
+        let mut app = app();
+        app.config.high_chance = true;
+        for map in &mut app.maps {
+            map.image = map_image.clone();
+        }
+        app.apply_ocr(&OcrText {
+            text: text.into(),
+            elapsed_secs: 0.1,
+            regions: Vec::new(),
+            notes: Vec::new(),
+            ..Default::default()
+        });
+        let ctx = app.ctx.clone();
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1120.0, 900.0))),
+                ..Default::default()
+            },
+            |ui| app.task_panel(ui, "抓鬼"),
+        );
+        let has_red = output.shapes.iter().any(
+            |shape| matches!(&shape.shape, egui::Shape::Rect(rect) if rect.fill == chance_fill),
+        );
+        // 先清掉贴图增量，断言失败时不会在析构里再 panic 一次。
+        output.textures_delta.clear();
+        assert_eq!(has_red, expect_red, "文本 {text:?}：高概率框显示与预期不符");
+    }
+}
+
+#[test]
 fn task_panel_has_no_high_chance_checkbox() {
     let mut app = app();
     app.config.high_chance = true;
@@ -604,8 +684,9 @@ fn task_panel_has_no_high_chance_checkbox() {
     );
     output.textures_delta.clear();
 
-    // 高概率开关在基础区「显示与布局」里。
-    let mut output = ctx.run_ui(input, |ui| app.basic_controls(ui));
+    // 高概率开关在基础区「显示与布局」页里。
+    app.sidebar_tab = "显示与布局";
+    let mut output = ctx.run_ui(input, |ui| app.settings_page_ui(ui));
     let texts = collect_texts(&output.shapes);
     output.textures_delta.clear();
     assert!(
@@ -615,12 +696,12 @@ fn task_panel_has_no_high_chance_checkbox() {
 }
 
 #[test]
-fn header_keeps_title_more_and_start_only() {
+fn menu_bar_holds_everything_top_bar_stays_clean() {
     let mut app = app();
     let ctx = app.ctx.clone();
     let mut frame = eframe::Frame::_new_kittest();
     let input = || egui::RawInput {
-        screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1120.0, 800.0))),
+        screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1120.0, 900.0))),
         ..Default::default()
     };
     let mut output = ctx.run_ui(input(), |ui| app.ui(ui, &mut frame));
@@ -631,86 +712,172 @@ fn header_keeps_title_more_and_start_only() {
             .iter()
             .find(|(text, _)| text == needle)
             .map(|(_, pos)| *pos)
-            .unwrap_or_else(|| panic!("顶栏缺少「{needle}」：{positions:?}"))
+            .unwrap_or_else(|| panic!("主界面缺少「{needle}」：{positions:?}"))
     };
     assert!(
         texts.iter().any(|text| text == "梦幻西游"),
         "顶栏应保留应用标题：{texts:?}"
     );
-    let more = find("更多");
     let start = find("开始识别");
+    assert!(start.x > 800.0, "开始识别应固定在顶栏右侧：{start:?}");
     assert!(
-        more.x < start.x,
-        "顶栏右侧应为「更多」+「开始识别」：more={more:?} start={start:?}"
+        !texts.iter().any(|text| text == "更多"),
+        "顶栏不应再有更多菜单：{texts:?}"
     );
-    // 原来的分类按钮和平铺按钮都不再直接占位。
-    for hidden in [
-        "显示方式",
-        "显示",
-        "工具",
-        "设置",
-        "帮助",
-        "检查更新",
-        "说明",
-        "界面主题",
-        "置顶",
-        "精简界面",
-        "地图浮窗",
-        "高级设置",
-        "打坐",
-    ] {
-        assert!(
-            !texts.iter().any(|text| text == hidden),
-            "顶栏不应再直接显示「{hidden}」：{texts:?}"
-        );
-    }
-    output.textures_delta.clear();
-
-    // 「更多」菜单里的分组和条目仍然齐全。
-    let mut output = ctx.run_ui(input(), |ui| app.more_menu_ui(ui, &ctx));
-    let texts = collect_texts(&output.shapes);
-    output.textures_delta.clear();
-    for expected in [
-        "显示",
-        "工具",
-        "帮助",
-        "设置",
-        "普通界面",
-        "精简界面",
-        "地图浮窗",
-        "界面主题",
-        "窗口置顶",
+    // 菜单栏（最左边几十像素内）里所有入口齐全。
+    for entry in [
+        "任务地图",
+        "游戏窗口",
+        "识别模式",
+        "任务类型",
+        "显示与布局",
         "打坐计时",
         "合成旗编辑器",
+        "识别方式",
+        "方案管理",
+        "日志",
+        "行分割调试",
+        "地图浮窗",
+        "窗口置顶",
+        "精简界面",
         "说明",
-        "检查更新",
-        "高级设置…",
     ] {
-        assert!(
-            texts.iter().any(|text| text == expected),
-            "更多菜单缺少「{expected}」：{texts:?}"
-        );
+        let pos = find(entry);
+        assert!(pos.x < 160.0, "「{entry}」应出现在左侧菜单栏：{pos:?}");
     }
+    // 检查更新常驻顶栏。
+    let update = find("检查更新");
+    assert!(
+        update.x > 160.0 && update.y < 100.0,
+        "「检查更新」应出现在顶栏：{update:?}"
+    );
+    // 界面主题是循环按钮，文案带当前主题。
+    assert!(
+        texts.iter().any(|text| text.contains("界面主题")),
+        "菜单栏应有界面主题：{texts:?}"
+    );
+    output.textures_delta.clear();
 
-    // 地图浮窗的参数已搬进独立窗口，菜单里只留入口。
+    // 地图浮窗开启：不新增菜单项，任务地图页就地给出占位说明 + 浮窗设置卡。
     app.config.map_window_enabled = true;
-    let mut output = ctx.run_ui(input(), |ui| app.more_menu_ui(ui, &ctx));
+    app.sidebar_tab = "任务地图";
+    let mut output = ctx.run_ui(input(), |ui| app.ui(ui, &mut frame));
     let texts = collect_texts(&output.shapes);
     output.textures_delta.clear();
     assert!(
-        texts.iter().any(|text| text == "浮窗设置…"),
-        "地图浮窗开启后菜单应提供「浮窗设置…」入口：{texts:?}"
+        !texts.iter().any(|text| text == "地图浮窗设置"),
+        "地图浮窗开启后不应在菜单栏再加一个「地图浮窗设置」入口：{texts:?}"
     );
-    for absent in ["浮窗不透明度", "抓鬼宽度", "重置浮窗位置与大小"] {
+    for present in [
+        "地图已在独立浮窗中显示",
+        "浮窗不透明度",
+        "重置浮窗位置与大小",
+    ] {
         assert!(
-            !texts.iter().any(|text| text == absent),
-            "「{absent}」已经搬到地图浮窗设置窗口，菜单里不再重复：{texts:?}"
+            texts.iter().any(|text| text == present),
+            "任务地图页占位下方应就地给出「{present}」：{texts:?}"
         );
     }
 }
 
+/// 菜单分组：说明排在「页面」组最下面，行分割调试挪到「高级设置」组。
 #[test]
-fn narrow_header_keeps_start_and_more_inside_bounds() {
+fn menu_groups_put_help_last_and_rows_debug_in_advanced() {
+    let mut app = app();
+    let ctx = app.ctx.clone();
+    let mut frame = eframe::Frame::_new_kittest();
+    let mut output = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1120.0, 900.0))),
+            ..Default::default()
+        },
+        |ui| app.ui(ui, &mut frame),
+    );
+    let positions = text_positions(&output.shapes);
+    output.textures_delta.clear();
+    let find = |needle: &str| {
+        positions
+            .iter()
+            .find(|(text, _)| text == needle)
+            .map(|(_, pos)| *pos)
+            .unwrap_or_else(|| panic!("菜单栏缺少「{needle}」：{positions:?}"))
+    };
+    assert!(
+        find("说明").y > find("打坐计时").y,
+        "说明应排在页面组最下面：{:?} / {:?}",
+        find("说明"),
+        find("打坐计时")
+    );
+    assert!(
+        find("行分割调试").y > find("方案管理").y,
+        "行分割调试应在高级设置组里：{:?} / {:?}",
+        find("行分割调试"),
+        find("方案管理")
+    );
+    assert!(
+        find("行分割调试").y > find("说明").y,
+        "高级设置组整体在页面组下面：{:?} / {:?}",
+        find("行分割调试"),
+        find("说明")
+    );
+}
+
+/// 说明页：内容跟上当前界面，并且两张截图各解码一次、之后复用纹理。
+#[test]
+fn help_page_embeds_screenshots_and_current_copy() {
+    let mut app = app();
+    let ctx = app.ctx.clone();
+    // 说明页本身较长（两张截图），视口给足，免得后半段被裁掉。
+    let input = || egui::RawInput {
+        screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 3600.0))),
+        ..Default::default()
+    };
+    let mut output = ctx.run_ui(input(), |ui| app.help_page_ui(ui));
+    let texts = collect_texts(&output.shapes);
+    output.textures_delta.clear();
+    for expected in [
+        "设置截图范围",
+        "设置游戏窗口",
+        "识别方式",
+        "界面",
+        "图色门控",
+    ] {
+        assert!(
+            texts.iter().any(|text| text == expected),
+            "说明页缺少「{expected}」小节：{texts:?}"
+        );
+    }
+    for expected in [
+        "行分割默认关闭",
+        "放大倍数默认 2x",
+        "默认本地 PP-OCR",
+        "行分割调试",
+    ] {
+        assert!(
+            texts.iter().any(|text| text.contains(expected)),
+            "说明页缺少「{expected}」说明：{texts:?}"
+        );
+    }
+    assert_eq!(app.help_textures.len(), 2, "两张截图都该解码成纹理");
+    let ids: Vec<_> = {
+        let mut keys: Vec<_> = app.help_textures.keys().copied().collect();
+        keys.sort_unstable();
+        keys.iter().map(|key| app.help_textures[key].id()).collect()
+    };
+
+    // 再渲染一次：复用缓存，不重新解码。
+    let mut output = ctx.run_ui(input(), |ui| app.help_page_ui(ui));
+    output.textures_delta.clear();
+    let ids_again: Vec<_> = {
+        let mut keys: Vec<_> = app.help_textures.keys().copied().collect();
+        keys.sort_unstable();
+        keys.iter().map(|key| app.help_textures[key].id()).collect()
+    };
+    assert_eq!(ids, ids_again, "第二次进说明页应复用纹理");
+}
+
+#[test]
+fn narrow_header_keeps_start_inside_bounds() {
     fn text_bounds(shapes: &[egui::epaint::ClippedShape], needle: &str) -> Option<Rect> {
         fn walk(shape: &egui::Shape, needle: &str) -> Option<Rect> {
             match shape {
@@ -739,23 +906,18 @@ fn narrow_header_keeps_start_and_more_inside_bounds() {
     };
     let mut output = ctx.run_ui(input(), |ui| app.ui(ui, &mut frame));
     let texts = collect_texts(&output.shapes);
-    for expected in ["开始", "更多"] {
-        assert!(
-            texts.iter().any(|text| text == expected),
-            "窄窗口顶栏缺少「{expected}」：{texts:?}"
-        );
-    }
-    for label in ["开始", "更多"] {
-        let bounds = text_bounds(&output.shapes, label)
-            .unwrap_or_else(|| panic!("窄窗口顶栏没有绘制「{label}」"));
-        assert!(
-            bounds.min.x >= 0.0 && bounds.max.x <= MIN_WINDOW_SIZE_COLLAPSED.x,
-            "「{label}」超出窄窗口：{bounds:?}"
-        );
-    }
+    assert!(
+        texts.iter().any(|text| text == "开始"),
+        "窄窗口顶栏缺少「开始」：{texts:?}"
+    );
+    let bounds = text_bounds(&output.shapes, "开始").expect("窄窗口顶栏没有绘制「开始」");
+    assert!(
+        bounds.min.x >= 0.0 && bounds.max.x <= MIN_WINDOW_SIZE_COLLAPSED.x,
+        "「开始」超出窄窗口：{bounds:?}"
+    );
     output.textures_delta.clear();
 
-    // 更新状态直接写在「更多」按钮上，菜单里仍保留重启入口。
+    // 侧栏收起时更新状态挪到顶栏小按钮上，仍须在窄窗口边界内。
     app.update_info = Some(UpdateInfo {
         version: "v9.9.9".into(),
         notes: "测试".into(),
@@ -767,31 +929,40 @@ fn narrow_header_keeps_start_and_more_inside_bounds() {
     let mut output = ctx.run_ui(input(), |ui| app.ui(ui, &mut frame));
     let texts = collect_texts(&output.shapes);
     assert!(
-        texts.iter().any(|text| text == "更多·重启"),
-        "已下载时窄窗口的更多按钮应直接显示重启状态：{texts:?}"
+        texts.iter().any(|text| text == "重启并更新"),
+        "已下载时顶栏更新小按钮应直接显示重启状态：{texts:?}"
     );
-    let badge = text_bounds(&output.shapes, "更多·重启").expect("窄窗口应绘制更新状态");
+    let badge = text_bounds(&output.shapes, "重启并更新").expect("窄窗口应绘制更新状态");
     assert!(
         badge.min.x >= 0.0 && badge.max.x <= MIN_WINDOW_SIZE_COLLAPSED.x,
         "更新状态不应把窄窗口顶栏挤出边界：{badge:?}"
     );
     output.textures_delta.clear();
 
-    let mut output = ctx.run_ui(input(), |ui| app.help_menu_ui(ui, &ctx));
-    let texts = collect_texts(&output.shapes);
-    assert!(
-        texts.iter().any(|text| text == "重启并更新"),
-        "帮助菜单应保留已下载安装按钮：{texts:?}"
+    // 侧栏展开后更新仍应在顶栏（不再藏菜单栏），且不出界。
+    app.config.sidebar_expanded = true;
+    let mut output = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1120.0, 900.0))),
+            ..Default::default()
+        },
+        |ui| app.ui(ui, &mut frame),
     );
+    let positions = text_positions(&output.shapes);
+    let restart = positions
+        .iter()
+        .find(|(text, _)| text == "重启并更新")
+        .map(|(_, pos)| *pos)
+        .expect("展开侧栏后顶栏应仍有重启入口");
     assert!(
-        texts.iter().any(|text| text.contains("安装包已就绪")),
-        "帮助菜单应提示安装包已就绪：{texts:?}"
+        restart.x > 160.0 && restart.y < 100.0,
+        "「重启并更新」应在顶栏：{restart:?}"
     );
     output.textures_delta.clear();
 }
 
 #[test]
-fn update_status_is_shown_on_more_button() {
+fn update_status_is_shown_on_header_button() {
     let mut app = app();
     app.update_info = Some(UpdateInfo {
         version: "v9.9.9".into(),
@@ -811,8 +982,8 @@ fn update_status_is_shown_on_more_button() {
     let mut output = ctx.run_ui(input(), |ui| app.ui(ui, &mut frame));
     let texts = collect_texts(&output.shapes);
     assert!(
-        texts.iter().any(|text| text == "更多 · 更新 v9.9.9"),
-        "有更新时更多按钮应显示版本：{texts:?}"
+        texts.iter().any(|text| text == "发现新版本 v9.9.9"),
+        "有更新时顶栏应显示版本：{texts:?}"
     );
     output.textures_delta.clear();
 
@@ -821,8 +992,8 @@ fn update_status_is_shown_on_more_button() {
     let mut output = ctx.run_ui(input(), |ui| app.ui(ui, &mut frame));
     let texts = collect_texts(&output.shapes);
     assert!(
-        texts.iter().any(|text| text == "更多 · 下载 50%"),
-        "下载中更多按钮应显示进度：{texts:?}"
+        texts.iter().any(|text| text == "下载 50%"),
+        "下载中顶栏应显示进度：{texts:?}"
     );
     output.textures_delta.clear();
 
@@ -830,8 +1001,8 @@ fn update_status_is_shown_on_more_button() {
     let mut output = ctx.run_ui(input(), |ui| app.ui(ui, &mut frame));
     let texts = collect_texts(&output.shapes);
     assert!(
-        texts.iter().any(|text| text == "更多 · 重启更新"),
-        "已下载时更多按钮应显示重启入口：{texts:?}"
+        texts.iter().any(|text| text == "重启并更新"),
+        "已下载时顶栏应显示重启入口：{texts:?}"
     );
     output.textures_delta.clear();
 }
@@ -879,22 +1050,22 @@ fn sidebar_points_to_map_window_settings_in_header() {
         ..Default::default()
     };
 
-    let mut output = ctx.run_ui(input(), |ui| app.basic_controls(ui));
+    let mut output = ctx.run_ui(input(), |ui| app.settings_page_ui(ui));
     let texts = collect_texts(&output.shapes);
     output.textures_delta.clear();
     assert!(
         !texts.iter().any(|text| text == "地图浮窗（无边框）"),
-        "地图浮窗开关只应在顶栏「更多 → 显示」里：{texts:?}"
+        "地图浮窗开关只应在左侧菜单栏里：{texts:?}"
     );
     assert!(
         texts
             .iter()
-            .any(|text| text.contains("地图浮窗") && text.contains("更多 → 显示")),
-        "侧栏应指向新的浮窗入口：{texts:?}"
+            .any(|text| text.contains("地图浮窗") && text.contains("任务地图页")),
+        "设置页应指向任务地图页下方的浮窗设置卡：{texts:?}"
     );
 
     app.config.map_window_enabled = true;
-    let mut output = ctx.run_ui(input(), |ui| app.basic_controls(ui));
+    let mut output = ctx.run_ui(input(), |ui| app.settings_page_ui(ui));
     let texts = collect_texts(&output.shapes);
     output.textures_delta.clear();
     for control in [
@@ -911,8 +1082,8 @@ fn sidebar_points_to_map_window_settings_in_header() {
     assert!(
         texts
             .iter()
-            .any(|text| text.contains("地图浮窗") && text.contains("更多 → 显示")),
-        "开启浮窗后侧栏仍应指向同一组参数：{texts:?}"
+            .any(|text| text.contains("地图浮窗") && text.contains("任务地图页")),
+        "开启浮窗后设置页仍应指向同一组参数：{texts:?}"
     );
 }
 
@@ -936,12 +1107,27 @@ fn map_window_mode_gives_each_task_its_own_popout() {
         "开启浮窗后主窗口应显示占位说明：{texts:?}"
     );
     assert!(
-        texts.iter().any(|text| text == "浮窗设置…"),
-        "占位区应提供「浮窗设置…」入口：{texts:?}"
+        !texts.iter().any(|text| text == "浮窗设置…"),
+        "占位区不再单独放按钮，设置卡就地在下方：{texts:?}"
+    );
+    assert!(
+        texts.iter().any(|text| text == "浮窗不透明度"),
+        "占位下方应就地给出浮窗设置卡：{texts:?}"
     );
     output.textures_delta.clear();
 
-    // 每个任务的开关搬到了独立的「地图浮窗设置」窗口。
+    // 浮窗设置卡只在任务地图页出现：切到说明页不能被设置卡覆盖。
+    app.sidebar_tab = "说明";
+    let mut output = ctx.run_ui(input(), |ui| app.ui(ui, &mut frame));
+    let texts = collect_texts(&output.shapes);
+    assert!(
+        !texts.iter().any(|text| text == "浮窗不透明度"),
+        "说明页不应被浮窗设置卡覆盖：{texts:?}"
+    );
+    output.textures_delta.clear();
+    app.sidebar_tab = "任务地图";
+
+    // 每个任务的开关在任务地图页占位的下方设置卡里。
     let mut output = ctx.run_ui(input(), |ui| app.map_window_settings_controls(ui));
     let texts = collect_texts(&output.shapes);
     for expected in [
@@ -1393,8 +1579,14 @@ fn compact_mode_hides_chrome_and_esc_restores_it() {
     };
 
     app.compact = true;
+    // 不管当前在哪个设置页，进精简模式主区只画地图。
+    app.sidebar_tab = "行分割调试";
     let mut output = ctx.run_ui(input(), |ui| app.ui(ui, &mut frame));
     let texts = collect_texts(&output.shapes);
+    assert!(
+        !texts.iter().any(|text| text == "行分割调试"),
+        "精简模式主区只画地图，不应显示行分割调试页：{texts:?}"
+    );
     for hidden in [
         "开始识别",
         "更多",
@@ -1419,7 +1611,7 @@ fn compact_mode_hides_chrome_and_esc_restores_it() {
     );
     output.textures_delta.clear();
 
-    // Esc 回到默认界面，顶部按钮和侧栏重新出现。
+    // Esc 回到默认界面，顶部按钮和菜单栏重新出现。
     let mut output = ctx.run_ui(escape_input(), |ui| app.ui(ui, &mut frame));
     assert!(!app.compact, "按 Esc 应退出精简模式");
     let texts = collect_texts(&output.shapes);
@@ -1428,8 +1620,8 @@ fn compact_mode_hides_chrome_and_esc_restores_it() {
         "退出精简模式后应重新出现开始识别按钮：{texts:?}"
     );
     assert!(
-        texts.iter().any(|text| text == "更多"),
-        "退出精简模式后顶栏菜单应恢复：{texts:?}"
+        texts.iter().any(|text| text == "任务地图"),
+        "退出精简模式后菜单栏应恢复：{texts:?}"
     );
     output.textures_delta.clear();
 }
@@ -1619,7 +1811,7 @@ fn panel_test_result_is_formatted_for_region_window() {
 #[test]
 fn preview_updates_reuse_the_existing_texture() {
     let mut app = app();
-    app.show_region_window = true;
+    app.sidebar_tab = "识别区域";
     app.update_preview(image::RgbImage::from_pixel(100, 100, image::Rgb([0, 0, 0])));
     let texture_id = app.preview_texture.as_ref().unwrap().id();
     app.update_preview(image::RgbImage::from_pixel(
@@ -1635,15 +1827,15 @@ fn preview_updates_reuse_the_existing_texture() {
 }
 
 #[test]
-fn preview_is_released_when_region_window_is_closed() {
+fn preview_is_released_outside_region_page() {
     let mut app = app();
-    app.show_region_window = true;
+    app.sidebar_tab = "识别区域";
     app.update_preview(image::RgbImage::from_pixel(64, 64, image::Rgb([1, 2, 3])));
     assert!(app.preview_image.is_some());
     assert!(app.preview_texture.is_some());
     assert_eq!(app.client_size, Some((64, 64)));
 
-    app.show_region_window = false;
+    app.sidebar_tab = "任务地图";
     app.release_preview();
     assert!(app.preview_image.is_none());
     assert!(app.preview_texture.is_none());
@@ -1796,34 +1988,6 @@ fn sidebar_sections_can_collapse() {
 }
 
 #[test]
-fn region_window_stays_on_screen_and_prefers_the_free_side() {
-    let size = vec2(900.0, 700.0);
-    let monitor = vec2(1920.0, 1080.0);
-
-    // 主窗口靠左、右侧放得下：贴主窗口右缘。
-    let left_half = Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 800.0));
-    assert_eq!(
-        place_region_window(left_half, monitor, size),
-        pos2(908.0, 0.0)
-    );
-
-    // 主窗口靠右、右侧放不下但左侧放得下：改放主窗口左侧，两边都不重叠。
-    let right_half = Rect::from_min_size(pos2(1000.0, 0.0), vec2(900.0, 800.0));
-    assert_eq!(
-        place_region_window(right_half, monitor, size),
-        pos2(92.0, 0.0)
-    );
-
-    // 两侧都放不下（默认窗口尺寸 + 1080p 正是这种情况）：贴屏幕右缘，整窗仍在屏内。
-    let wide = Rect::from_min_size(pos2(0.0, 0.0), vec2(1120.0, 800.0));
-    assert_eq!(place_region_window(wide, monitor, size), pos2(1020.0, 0.0));
-
-    // 主窗口贴近屏幕下沿时整体上移，底边不越出屏幕（算上了标题栏高度）。
-    let low = Rect::from_min_size(pos2(0.0, 900.0), vec2(1120.0, 180.0));
-    assert_eq!(place_region_window(low, monitor, size), pos2(1020.0, 348.0));
-}
-
-#[test]
 fn generic_task_panel_follows_config() {
     let mut app = app();
     assert!(app.task_active("抓鬼"), "抓鬼默认开启");
@@ -1857,6 +2021,8 @@ fn long_window_titles_do_not_push_sidebar_controls_out_of_the_card() {
     }
 
     let mut app = app();
+    // 游戏窗口设置页在主区，选到该页再检查控件不被长标题挤出去。
+    app.sidebar_tab = "游戏窗口";
     let ctx = app.ctx.clone();
     let mut frame = eframe::Frame::_new_kittest();
     app.config.sidebar_expanded = true;
@@ -1867,7 +2033,7 @@ fn long_window_titles_do_not_push_sidebar_controls_out_of_the_card() {
             .into(),
     }];
 
-    // 侧栏展开时的最小窗口：此时侧栏取到上限 400，最容易挤掉右侧控件。
+    // 最小窗口：主区最窄，长标题最容易把右侧控件挤掉。
     let mut output = ctx.run_ui(
         egui::RawInput {
             screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(760.0, 540.0))),
@@ -1878,13 +2044,14 @@ fn long_window_titles_do_not_push_sidebar_controls_out_of_the_card() {
     output.textures_delta.clear();
 
     // ComboBox::width() 只是最小宽度，长标题曾把「刷新」整个挤出卡片。
-    // 注意：被挤出侧栏的控件会被 egui 按 clip_rect 剔除，所以「找不到」也算失败。
+    // 控件现在在主区设置页（内宽 640 封顶），长标题不能把它们推出窗口。
+    // 注意：被挤出可视区的控件会被 egui 按 clip_rect 剔除，所以「找不到」也算失败。
     for control in ["刷新", "设置识别区域"] {
         let bounds = text_bounds(&output.shapes, control)
-            .unwrap_or_else(|| panic!("「{control}」没有绘制在侧栏可见区域内"));
+            .unwrap_or_else(|| panic!("「{control}」没有绘制在窗口可见区域内"));
         assert!(
-            bounds.max.x <= 400.0,
-            "「{control}」超出了侧栏右缘：{bounds:?}"
+            bounds.max.x <= 760.0,
+            "「{control}」超出了窗口右缘：{bounds:?}"
         );
     }
 }
@@ -1998,7 +2165,7 @@ fn renders_local_remote_and_map_layouts_at_supported_sizes() {
             .iter()
             .all(|shape| shape.clip_rect.is_finite()));
         if sidebar {
-            // 地图必须在侧栏右侧绘制，不能被侧栏区域覆盖。
+            // 地图必须在菜单栏右侧绘制，不能被菜单栏区域覆盖。
             for texture in app.map_textures.values().map(|handle| handle.id()) {
                 if let Some(bounds) = output
                     .shapes
@@ -2006,8 +2173,8 @@ fn renders_local_remote_and_map_layouts_at_supported_sizes() {
                     .find_map(|shape| map_bounds(&shape.shape, texture))
                 {
                     assert!(
-                        bounds.min.x >= 240.0,
-                        "地图绘到了侧栏区域：{bounds:?}（窗口 {size:?}）"
+                        bounds.min.x >= 160.0,
+                        "地图绘到了菜单栏区域：{bounds:?}（窗口 {size:?}）"
                     );
                 }
             }
@@ -2023,7 +2190,7 @@ fn rows_debug_preview_shows_projection_rows() {
     let mut app = app();
     // 两行「方块字」，行间留足空隙，确保投影能切开。
     let panel = two_line_panel();
-    app.show_rows_debug = true;
+    app.sidebar_tab = "行分割调试";
     app.set_rows_debug_panel(panel);
     let layout = app.rows_debug_layout.clone().expect("应算出分行结果");
     assert_eq!(layout.rows.len(), 2, "两行应切成两条带：{layout:?}");
@@ -2047,6 +2214,135 @@ fn rows_debug_preview_shows_projection_rows() {
 }
 
 /// 归一化 + 混淆字符还原之后，解析器要能认出坐标和地图名。
+#[test]
+fn manual_row_height_reaches_rows_layout() {
+    let mut app = app();
+    app.config.ocr_row_mode = "manual".into();
+    app.config.ocr_row_height = 22;
+    let panel = two_line_panel();
+    app.set_rows_debug_panel(panel);
+    let layout = app.rows_debug_layout.clone().expect("应有分行结果");
+    assert_eq!(layout.line_height, 22, "notes: {:?}", layout.notes);
+    assert!(
+        layout.notes.iter().any(|note| note.contains("手动网格")),
+        "应走手动网格：{:?}",
+        layout.notes
+    );
+
+    // 调试页出现手动行高控件。
+    let ctx = app.ctx.clone();
+    let mut output = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 900.0))),
+            ..Default::default()
+        },
+        |ui| app.rows_debug_window_ui(ui),
+    );
+    let texts = collect_texts(&output.shapes);
+    output.textures_delta.clear();
+    for expected in ["行高", "自动", "手动", "首行定位"] {
+        assert!(
+            texts.iter().any(|text| text.contains(expected)),
+            "行分割调试页缺少「{expected}」：{texts:?}"
+        );
+    }
+}
+
+#[test]
+fn gap_rows_are_shown_and_inserted() {
+    let mut app = app();
+    app.config.ocr_row_mode = "manual".into();
+    app.config.ocr_row_height = 22;
+    app.config.ocr_gap_rows = "1x40".to_string();
+    app.set_rows_debug_panel(two_line_panel());
+    let layout = app.rows_debug_layout.clone().expect("应有分行结果");
+    let blank = layout.rows.iter().find(|row| row.ink == 0);
+    assert!(
+        blank.is_some(),
+        "空白行应被插入：{:?}",
+        layout
+            .rows
+            .iter()
+            .map(|row| (row.rect.y0, row.ink))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        blank.map(|row| row.rect.y1 - row.rect.y0),
+        Some(40),
+        "空白行高是配置里的"
+    );
+
+    // 调试页出现空白行编辑器。
+    let ctx = app.ctx.clone();
+    let mut output = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 900.0))),
+            ..Default::default()
+        },
+        |ui| app.rows_debug_window_ui(ui),
+    );
+    let texts = collect_texts(&output.shapes);
+    output.textures_delta.clear();
+    for expected in ["空白行", "添加空白行", "第", "之后 ·"] {
+        assert!(
+            texts.iter().any(|text| text.contains(expected)),
+            "行分割调试页缺少「{expected}」：{texts:?}"
+        );
+    }
+}
+
+#[test]
+fn rows_debug_test_needs_a_panel_first() {
+    let mut app = app();
+    app.test_rows_debug_ocr();
+    assert!(!app.rows_debug_test_running);
+    assert!(
+        app.rows_debug_message
+            .as_deref()
+            .is_some_and(|message| message.contains("先抓一帧")),
+        "没面板时测试应提示先抓一帧：{:?}",
+        app.rows_debug_message
+    );
+}
+
+#[test]
+fn rows_debug_test_submits_and_panel_result_fills_texts() {
+    let mut app = app();
+    app.set_rows_debug_panel(two_line_panel());
+    let layout = app.rows_debug_layout.clone().expect("应有分行结果");
+
+    app.test_rows_debug_ocr();
+    assert!(app.rows_debug_test_running, "点了测试后应在跑");
+
+    // 模拟工人线程回了一次 PanelTest：行分割调试的逐行文本跟它走。
+    app.sender
+        .send(crate::ocr::OcrEvent::PanelTest {
+            result: Ok(crate::ocr::OcrText {
+                text: "第一行 第二行".into(),
+                elapsed_secs: 0.05,
+                regions: Vec::new(),
+                notes: Vec::new(),
+                layout: Some(layout),
+                row_texts: vec!["第一行".into(), "第二行".into()],
+            }),
+        })
+        .expect("测试通道应可写");
+    app.poll_events();
+    assert!(!app.rows_debug_test_running, "有结果后测试状态应清空");
+    assert_eq!(
+        app.rows_debug_row_texts,
+        vec!["第一行".to_string(), "第二行".to_string()],
+        "逐行文本应写回调试预览"
+    );
+    assert!(
+        app.rows_debug_message
+            .as_deref()
+            .is_some_and(|message| message.contains("识别用时")),
+        "应显示这次测试的用时：{:?}",
+        app.rows_debug_message
+    );
+}
+
 #[test]
 fn normalized_row_text_still_parses_tasks() {
     let app = app();
@@ -2081,6 +2377,65 @@ fn apply_ocr_remembers_row_layout() {
 }
 
 /// 两行方块字的面板：每行 12 个 8×12 的实心块，行间留 16px 空隙。
+#[test]
+fn auto_row_mode_ignores_manual_height() {
+    let mut app = app();
+    app.config.ocr_row_mode = "auto".into();
+    app.config.ocr_row_height = 22;
+    app.set_rows_debug_panel(two_line_panel());
+    let layout = app.rows_debug_layout.clone().expect("应有分行结果");
+    assert!(
+        !layout.notes.iter().any(|note| note.contains("手动网格")),
+        "自动分行不该用手动网格：{:?}",
+        layout.notes
+    );
+}
+
+/// 识别方式页：行分割三档开关 + 手动网格缺行高时的提示。
+#[test]
+fn mode_page_exposes_row_split_switch() {
+    let mut app = app();
+    app.config.ocr_row_mode = "manual".into();
+    assert_eq!(app.row_tuning().mode, crate::ocr::RowMode::Manual);
+
+    let ctx = app.ctx.clone();
+    let mut output = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 900.0))),
+            ..Default::default()
+        },
+        |ui| app.mode_page_ui(ui),
+    );
+    let texts = collect_texts(&output.shapes);
+    output.textures_delta.clear();
+    for expected in ["行分割", "自动分行", "手动网格", "关闭"] {
+        assert!(
+            texts.iter().any(|text| text == expected),
+            "识别方式页缺少「{expected}」：{texts:?}"
+        );
+    }
+    assert!(
+        texts.iter().any(|text| text.contains("手动网格还没设行高")),
+        "缺行高时应提示按自动分行：{texts:?}"
+    );
+
+    // 设了行高就不再警告。
+    app.config.ocr_row_height = 22;
+    let mut output = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 900.0))),
+            ..Default::default()
+        },
+        |ui| app.mode_page_ui(ui),
+    );
+    let texts = collect_texts(&output.shapes);
+    output.textures_delta.clear();
+    assert!(
+        !texts.iter().any(|text| text.contains("手动网格还没设行高")),
+        "设了行高就不该再提示：{texts:?}"
+    );
+}
+
 fn two_line_panel() -> image::RgbImage {
     let mut image = image::RgbImage::from_pixel(160, 80, image::Rgb([20, 24, 30]));
     for row in 0..2 {
@@ -2097,33 +2452,34 @@ fn two_line_panel() -> image::RgbImage {
     image
 }
 
-/// 「更多 → 工具」里要有行分割调试入口，点击按钮能切换开关。
+/// 左侧菜单栏「窗口」组里要有行分割调试入口，点击按钮能切换开关。
 #[test]
-fn tools_menu_exposes_rows_debug_entry() {
+fn menu_bar_exposes_rows_debug_entry() {
     let mut app = app();
     let ctx = app.ctx.clone();
+    let mut frame = eframe::Frame::_new_kittest();
     let mut output = ctx.run_ui(
         egui::RawInput {
-            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(600.0, 600.0))),
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1120.0, 900.0))),
             ..Default::default()
         },
-        |ui| app.tools_menu_ui(ui, &ctx.clone()),
+        |ui| app.ui(ui, &mut frame),
     );
     let texts = collect_texts(&output.shapes);
     output.textures_delta.clear();
     assert!(
-        texts.iter().any(|text| text == "行分割调试…"),
-        "工具菜单应提供行分割调试入口：{texts:?}"
+        texts.iter().any(|text| text == "行分割调试"),
+        "菜单栏应提供行分割调试入口：{texts:?}"
     );
 }
 
-/// 没有选窗口时打开调试窗口只给提示，不崩；重复调用就是开关。
+/// 没有选窗口时打开调试页只给提示，不崩；页签随点击切换。
 #[test]
-fn toggle_rows_debug_flags_and_explains_missing_window() {
+fn open_rows_debug_switches_page_and_explains_missing_window() {
     let mut app = app();
-    assert!(!app.show_rows_debug);
-    app.toggle_rows_debug();
-    assert!(app.show_rows_debug);
+    assert_ne!(app.sidebar_tab, "行分割调试");
+    app.open_rows_debug();
+    assert_eq!(app.sidebar_tab, "行分割调试");
     assert!(
         app.rows_debug_message
             .as_deref()
@@ -2132,6 +2488,4 @@ fn toggle_rows_debug_flags_and_explains_missing_window() {
         "没有选窗口时应提示先选窗口：{:?}",
         app.rows_debug_message
     );
-    app.toggle_rows_debug();
-    assert!(!app.show_rows_debug, "再点一次应关闭");
 }

@@ -15,34 +15,28 @@ impl MhxyApp {
         }
     }
 
-    pub(super) fn flight_flags_ui(&mut self, ui: &mut egui::Ui) {
-        let flag_count: usize = SUPPORTED_MAPS
-            .iter()
-            .map(|map| self.flight_flags.flags_for(map).len())
-            .sum();
-        ui.label(
-            egui::RichText::new(format!("已配置 {flag_count} 面合成旗"))
-                .small()
-                .weak(),
-        );
-        if ui
-            .add_sized(
-                [ui.available_width(), 32.0],
-                egui::Button::new(if self.show_flight_flags_window {
-                    "关闭合成旗编辑器"
-                } else {
-                    "打开合成旗编辑器"
-                }),
-            )
-            .clicked()
-        {
-            self.show_flight_flags_window = !self.show_flight_flags_window;
-        }
-        ui.label(
-            egui::RichText::new(format!("本地文件：{}", self.flight_flags_path.display()))
-                .small()
-                .weak(),
-        );
+    /// 合成旗编辑器页（主区）：标题 + 白卡（原独立窗口）。
+    pub(super) fn flight_flags_page_ui(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            if let Some(font) = theme::icon_font() {
+                ui.label(
+                    egui::RichText::new("\u{E7B4}")
+                        .font(font)
+                        .color(theme::jade()),
+                );
+            }
+            ui.label(
+                egui::RichText::new("合成旗编辑器")
+                    .size(20.0)
+                    .color(theme::text())
+                    .strong(),
+            );
+        });
+        theme::divider(ui);
+        theme::card_with(theme::surface()).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            self.flight_flags_editor_ui(ui);
+        });
     }
 
     pub(super) fn flight_flags_editor_ui(&mut self, ui: &mut egui::Ui) {

@@ -334,7 +334,7 @@ fn label_components(gray: &GrayImage, diagonal: bool) -> (Vec<u32>, Vec<Blob>) {
 // ---------------------------------------------------------------- 行配置
 
 /// 投影分行的全部可调参数；默认值针对游戏任务栏的小字号。
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct RowConfig {
     /// 投影阈值 = `ink_ratio * max_ink`，默认 0.05。
     pub ink_ratio: f32,
@@ -346,10 +346,24 @@ pub struct RowConfig {
     pub valley_ratio: f32,
     /// 带高 `< short_ratio * 行高` 视为矮带，默认 0.35。
     pub short_ratio: f32,
-    /// 行裁图上下留白 = `pad_ratio * 行高`，默认 0.18。
+    /// 上下留白 = `pad_ratio * 行高`，默认 0.18 。
+    /// 是给行图「上下拉出白边」的量（白色），不是往邻行多裁像素：
+    /// 行图内容严格是行矩形本身，上下各补 `pad_ratio * 行高` 的白边。
+    /// 识别模型内部会把行图归一化到 48 高，留白只控制字占的比例。
     pub pad_ratio: f32,
     /// 连通域最小面积，默认 4。
     pub min_area: u32,
+    /// 手动行高（像素）：`Some(h)` 时跳过自动估计，直接用 `h` 当行高先验。
+    /// 游戏里文字是固定字号时，量一次就能长期用，自动估计再漂也不影响。
+    pub line_height: Option<u32>,
+    /// 首行定位（像素，图片顶部是 0）：手动行高 + 首行定位一起给定时，
+    /// 走「手动网格」：第一行从这个 Y 开始，每行占一个高为行高的格子。
+    /// `None`（只给行高）时走投影流水线（行高只是先验）。
+    pub first_line_top: Option<u32>,
+    /// 空白行（手动网格才生效）：`(在第几行之后, 高度)`，1-based，
+    /// 比如 `(5, 24)` = 第 5 行之后强制插入一行高 24 像素的空白行，
+    /// 后面的行从空白行下面重新锚定对齐。
+    pub gap_rows: Vec<(usize, u32)>,
 }
 
 impl Default for RowConfig {
@@ -362,8 +376,47 @@ impl Default for RowConfig {
             short_ratio: 0.35,
             pad_ratio: 0.18,
             min_area: 4,
+            line_height: None,
+            first_line_top: None,
+            gap_rows: Vec::new(),
         }
     }
+}
+
+/// 解析空白行配置字符串：`("在几行之后x高度")`，多条用逗号分隔，
+/// 非法条目丢掉；同一行号的高度相加；按行号排序。
+pub fn parse_gap_rows(src: &str) -> Vec<(usize, u32)> {
+    let mut out: Vec<(usize, u32)> = Vec::new();
+    for part in src.split(',') {
+        let part = part.trim();
+        let Some((n, h)) = part.split_once('x') else {
+            continue;
+        };
+        let Ok(after) = n.trim().parse::<usize>() else {
+            continue;
+        };
+        let Ok(height) = h.trim().parse::<u32>() else {
+            continue;
+        };
+        if after == 0 || height == 0 {
+            continue;
+        }
+        if let Some(entry) = out.iter_mut().find(|entry| entry.0 == after) {
+            entry.1 = entry.1.saturating_add(height);
+        } else {
+            out.push((after, height));
+        }
+    }
+    out.sort_by_key(|entry| entry.0);
+    out
+}
+
+/// 序列化空白行（`parse_gap_rows` 的反操作）。
+pub fn serialize_gap_rows(rows: &[(usize, u32)]) -> String {
+    rows.iter()
+        .map(|(after, height)| format!("{after}x{height}"))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// 分行来源：投影主路径，还是校验失败后的连通域聚类兜底。
@@ -418,6 +471,13 @@ pub fn rows(image: &RgbImage, cfg: RowConfig) -> RowLayout {
         return fallback(vec!["空图，没有可分的行".to_string()]);
     }
 
+    // 手动网格：手动行高 + 首行定位一起给了，直接按网格切，不走投影。
+    // 第一行不从图片顶部开始，Y0 与行高（相邻两行起点的距离）都在用户手里，
+    // 调试时拖两个数就能对齐。
+    if let (Some(height), Some(top)) = (cfg.line_height.filter(|h| *h >= 4), cfg.first_line_top) {
+        return manual_grid(image, height, top, &cfg);
+    }
+
     let gray = binary(image);
     let (labels, blobs) = label_components(&gray, true);
     let keep: Vec<bool> = blobs
@@ -454,7 +514,34 @@ pub fn rows(image: &RgbImage, cfg: RowConfig) -> RowLayout {
         &mut notes,
     );
 
-    let line_h = line_height_prior(&bands);
+    let line_h = match cfg.line_height.filter(|h| *h >= 4) {
+        // 手动行高：来路最确切，直接听。
+        Some(manual) => {
+            notes.push(format!("行高已手动指定为 {manual} 像素"));
+            manual
+        }
+        None => {
+            // 自动估计两路候选：
+            // 1. 投影带高（中位数 + MAD 剔除离群）；
+            // 2. 字高候选：连通域高度的 90 分位——中文方块字高度基本就是行高，
+            //    且不受「上下两行粘成一个带」影响。.
+            // 只有「字高候选落在带高的 0.35~0.8 倍」才当真：太小（0.35 倍以下）
+            // 多半是横笔画的碎笔画高度，不代表行高；两个候选差不太多时带高更可信。
+            // 命中时说明上下两行粘成了一个带，带高不可信，改用字高候选，
+            // 这样劈分阈值（split_ratio × 行高）才可能把粘连行劈开。
+            let band_h = line_height_prior(&bands);
+            let component_h = component_height_quantile(&blobs, &keep, 0.9);
+            let ratio = component_h as f32 / band_h.max(1) as f32;
+            if component_h > 0 && (0.35..0.8).contains(&ratio) {
+                notes.push(format!(
+                    "行高估计：投影带高 {band_h} 可疑（可能上下粘连）→ 改用字高候选 {component_h}"
+                ));
+                component_h
+            } else {
+                band_h
+            }
+        }
+    };
 
     // 小间隙合并；保留合并前的 line_h 用于劈分，否则粘连行合并后永远劈不开。
     let before_merge = bands.len();
@@ -553,6 +640,88 @@ pub fn rows(image: &RgbImage, cfg: RowConfig) -> RowLayout {
                 notes,
             }
         }
+    }
+}
+
+/// 手动网格：从 `top` 开始，每行在墨迹顶上自动锚定，行高（间距）`pitch`。
+///
+/// 用户调（首行定位、行高）才开这个模式：
+/// - 第一行从 `top` 往下找第一条墨迹顶，行就落在那里——不从图片顶部开始；
+/// - 后面每行 = 上一行锚点 + `pitch`，再往下找最近的墨迹顶锚定，空格子直接跳过
+///   ——所以任务之间有间隔（比如抓鬼和鬼王中间隔着一段空）也不会跑偏，
+///   网格相位永远在每行的墨迹顶上重新锁定；
+/// - 上下粘连成一条大带时，墨迹不会断：期望位置正好落在带里，照样找到墨迹，
+///   按 `pitch` 把大带等分进下一行。
+fn manual_grid(image: &RgbImage, pitch: u32, top: u32, cfg: &RowConfig) -> RowLayout {
+    let gray = binary(image);
+    let (labels, blobs) = label_components(&gray, true);
+    let keep: Vec<bool> = blobs
+        .iter()
+        .map(|blob| blob.area >= cfg.min_area.max(1))
+        .collect();
+    let width = image.width();
+    let height_img = image.height();
+    let ink = row_ink(&labels, &keep, width, height_img);
+    let mut notes = vec![format!(
+        "手动网格：首行定位 Y0={top}，行高（行间距）{pitch} 像素，每行在墨迹顶上对齐"
+    )];
+    let gap_rows = &cfg.gap_rows;
+    let mut gap_idx = 0;
+    let mut rows = Vec::new();
+    let mut expected = top;
+    while expected < height_img {
+        // 空白行：在第 N 行之后强制塞一行高为 H 的空白，不锚定。
+        if gap_idx < gap_rows.len() && rows.len() == gap_rows[gap_idx].0 {
+            let (_, blank_h) = gap_rows[gap_idx];
+            let blank_y1 = (expected + blank_h).min(height_img);
+            rows.push(Row {
+                rect: Rect {
+                    x0: 0,
+                    y0: expected,
+                    x1: width,
+                    y1: blank_y1,
+                },
+                ink: 0,
+            });
+            notes.push(format!(
+                "第 {} 行之后空白行：高 {blank_h} 像素",
+                gap_rows[gap_idx].0
+            ));
+            expected = blank_y1;
+            gap_idx += 1;
+            continue;
+        }
+        // 从期望位置往下找第一条墨迹顶：间隔在这一行自动跳过。
+        let mut y = expected;
+        while y < height_img && ink[y as usize] == 0 {
+            y += 1;
+        }
+        if y >= height_img {
+            break;
+        }
+        let y1 = (y + pitch).min(height_img);
+        let band = Band { y0: y, y1 };
+        if let (Some((x0, x1)), ink_in_row) = scan_band(&labels, &keep, width, band) {
+            // 噪声小块不进格子：至少是最小连通域面积的 2 倍墨迹。
+            if ink_in_row >= cfg.min_area.max(1) * 2 {
+                rows.push(Row {
+                    rect: Rect { x0, y0: y, x1, y1 },
+                    ink: ink_in_row,
+                });
+            }
+        }
+        expected = y + pitch;
+    }
+    if rows.is_empty() {
+        notes.push("手动网格没有切出任何行（检查首行定位/行高是否对）".to_string());
+    }
+    let reliable = !rows.is_empty();
+    RowLayout {
+        rows,
+        line_height: pitch,
+        source: RowSource::Projection,
+        reliable,
+        notes,
     }
 }
 
@@ -1158,53 +1327,95 @@ fn cluster_layout(
 
 // ---------------------------------------------------------------- 行裁图
 
-/// 按布局裁每行的图片：灰度化 + 1%~99% 分位对比度拉伸 + 按需反相（保证暗字亮底）
-/// + 上下 `pad_ratio * 行高` 留白 + 左右 1~2 像素留白，超出图边界会夹住。
+/// 按布局裁每行的图片：框取背景色的颜色距离灰度 + 1%~99% 分位拉伸 + 反相（暗字亮底）
+/// + 上下 `pad_ratio * 行高` 白边 + 左右 1~2 像素留白，超出图边界会夹住。
 ///
-/// 输出是 `RgbImage`（三通道同值），方便直接喂识别模型。极性判断用行图边框的
-/// 亮度对比整图中位数：边框更暗说明背景暗、字亮，需要反相；两者接近时再看边框
-/// 是否低于中灰，避免纯色小图判反。
+/// 不用亮度灰度：纯红字在亮度里只有 76，黑底上几乎没有对比度（这就是灰度识别瞎的根源）；
+/// 距离灰度把任意颜色文字都拉到高位。背景色按整块中位数估计。
+///
+/// 输出是 `RgbImage`（三通道同值），方便直接喂识别模型。
 pub fn row_images(image: &RgbImage, layout: &RowLayout, cfg: RowConfig) -> Vec<RgbImage> {
     if image.width() == 0 || image.height() == 0 {
         return Vec::new();
     }
+    // 留白是「上下拉出白边」（letterbox），不是往邻行多裁像素：
+    // 行内容严格裁出行矩形本身，上下各补 pad_ratio × 行高的白边。
+    // 识别模型会把行图归一化到 48 高，pad 只决定字在图里占的比例，
+    // 不能把邻行的笔画带进来。
     let pad_y = (cfg.pad_ratio * layout.line_height.max(1) as f32).round() as u32;
     let mut output = Vec::with_capacity(layout.rows.len());
     for row in &layout.rows {
+        // 只裁行矩形本身（上下不扩张，邻行不会进来）；左右各带 2px 上下文是水平的，不会串行。
         let x0 = row.rect.x0.saturating_sub(2);
         let x1 = (row.rect.x1 + 2).min(image.width());
-        let y0 = row.rect.y0.saturating_sub(pad_y);
-        let y1 = (row.rect.y1 + pad_y).min(image.height());
+        let y0 = row.rect.y0;
+        let y1 = row.rect.y1;
         if x1 <= x0 || y1 <= y0 {
             continue;
         }
         let crop = image::imageops::crop_imm(image, x0, y0, x1 - x0, y1 - y0).to_image();
-        let gray = to_luma(&crop);
+        let gray = color_distance_gray(&crop, background_color(&crop));
         let stretched = stretch_percentile(&gray);
-        let border = border_median(&stretched);
-        let median = image_median(&stretched);
-        let invert = if border.abs_diff(median) <= 1 {
-            border < 128
-        } else {
-            border < median
-        };
+        // 距离灰度里背景恒为 0，所以恒定反相：背景 0→白、文字高值→暗，不用再比边框/中位数，
+        // 避免框上沿（贴 Ink 顶）的亮度干扰极性判断。暗字亮底正是模型要的格式。
         let (width, height) = (stretched.width(), stretched.height());
-        output.push(RgbImage::from_fn(width, height, |x, y| {
+        let content = RgbImage::from_fn(width, height, |x, y| {
             let value = stretched.get_pixel(x, y)[0];
-            let value = if invert { 255 - value } else { value };
-            Rgb([value, value, value])
-        }));
+            Rgb([255 - value, 255 - value, 255 - value])
+        });
+        // 上下拉出白边：合成一张白底横长图，内容居中，留白不含邻行像素。
+        let mut canvas = RgbImage::from_pixel(width, height + 2 * pad_y, Rgb([255, 255, 255]));
+        image::imageops::overlay(&mut canvas, &content, 0, pad_y as i64);
+        output.push(canvas);
     }
     output
 }
 
 /// RGB → 灰度，权重用 BT.601 近似（和项目其它地方的 luma 一致）。
-fn to_luma(image: &RgbImage) -> GrayImage {
+/// 背景色估计：边框环（四条边）每通道中位数。
+/// 用整块中位数会被实心色块/密集文字骗成前景，所以只取四边——
+/// 行框上下沿只是墨迹顶部/底部一行，四边合起来背景恒占多数。
+fn background_color(image: &RgbImage) -> [u8; 3] {
+    let (width, height) = (image.width(), image.height());
+    if width == 0 || height == 0 {
+        return [0; 3];
+    }
+    let mut channels: [Vec<u8>; 3] = [
+        Vec::with_capacity((width * 2 + height * 2) as usize),
+        Vec::with_capacity((width * 2 + height * 2) as usize),
+        Vec::with_capacity((width * 2 + height * 2) as usize),
+    ];
+    let mut push = |pixel: &Rgb<u8>| {
+        for channel in 0..3 {
+            channels[channel].push(pixel[channel]);
+        }
+    };
+    for x in 0..width {
+        push(image.get_pixel(x, 0));
+        push(image.get_pixel(x, height - 1));
+    }
+    for y in 0..height {
+        push(image.get_pixel(0, y));
+        push(image.get_pixel(width - 1, y));
+    }
+    let mut bg = [0u8; 3];
+    for channel in 0..3 {
+        bg[channel] = median_u8(&mut channels[channel]);
+    }
+    bg
+}
+
+/// 颜色距离灰度：每个像素与背景色的通道最大差（0 = 背景）。
+/// 纯红字（255,0,0）在亮度灰度里只有 76，深色背景上近乎隐形；
+/// 距离则把任意颜色都拉到高位，还带着边缘抗锯齿渐变，比硬二值更自然。
+fn color_distance_gray(image: &RgbImage, bg: [u8; 3]) -> GrayImage {
     GrayImage::from_fn(image.width(), image.height(), |x, y| {
         let pixel = image.get_pixel(x, y);
-        let value =
-            ((77 * pixel[0] as u32 + 150 * pixel[1] as u32 + 29 * pixel[2] as u32) >> 8) as u8;
-        Luma([value])
+        let distance = (0..3)
+            .map(|channel| pixel[channel].abs_diff(bg[channel]))
+            .max()
+            .unwrap_or(0);
+        Luma([distance])
     })
 }
 
@@ -1543,6 +1754,155 @@ mod tests {
     }
 
     #[test]
+    fn manual_line_height_is_used() {
+        // 只给行高（没有首行定位）时，手动行高作为融合口径进投影流水线。
+        let mut canvas = white_canvas(220, 90);
+        place(&mut canvas, &render("0123", 2, 2), 10, 8);
+        place(&mut canvas, &render("4567", 2, 2), 10, 28);
+
+        // 自动估计通常是 14（7x2 放大），手动指定 20 必须原样生效。
+        let cfg = RowConfig {
+            line_height: Some(20),
+            ..Default::default()
+        };
+        let layout = rows(&canvas, cfg);
+        assert_eq!(layout.line_height, 20, "notes: {:?}", layout.notes);
+        assert!(
+            layout.notes.iter().any(|note| note.contains("已手动指定")),
+            "notes 应说明手动指定：{:?}",
+            layout.notes
+        );
+        assert_eq!(layout.rows.len(), 2, "notes: {:?}", layout.notes);
+    }
+
+    #[test]
+    fn manual_grid_starts_at_first_line_top() {
+        let mut canvas = white_canvas(220, 90);
+        place(&mut canvas, &render("0123", 2, 2), 10, 8);
+        place(&mut canvas, &render("4567", 2, 2), 10, 28);
+
+        // 手动网格：首行定位 8、行高 20 → 网格 [8,28) [28,48)，两行都落在格子里。
+        let cfg = RowConfig {
+            line_height: Some(20),
+            first_line_top: Some(8),
+            ..Default::default()
+        };
+        let layout = rows(&canvas, cfg);
+        assert_eq!(layout.line_height, 20, "notes: {:?}", layout.notes);
+        assert_eq!(layout.rows.len(), 2, "notes: {:?}", layout.notes);
+        assert_eq!(layout.rows[0].rect.y0, 8, "notes: {:?}", layout.notes);
+        assert_eq!(layout.rows[1].rect.y0, 28, "notes: {:?}", layout.notes);
+        assert!(
+            layout.notes.iter().any(|note| note.contains("手动网格")),
+            "notes 应说明走手动网格：{:?}",
+            layout.notes
+        );
+
+        // 首行定位在文字上面时，锚点会自动落在墨迹顶上（不从图片顶部糊切）。
+        let cfg = RowConfig {
+            line_height: Some(20),
+            first_line_top: Some(0),
+            ..Default::default()
+        };
+        let layout = rows(&canvas, cfg);
+        let tops: Vec<u32> = layout.rows.iter().map(|row| row.rect.y0).collect();
+        assert_eq!(tops, [8, 28], "notes: {:?}", layout.notes);
+    }
+
+    #[test]
+    fn manual_grid_skips_gap_between_blocks() {
+        // 抓鬼和鬼王中间隔着一段空：网格只能吃到抓鬼的话，鬼王会丢。
+        let mut canvas = white_canvas(220, 100);
+        place(&mut canvas, &render("0123", 2, 2), 10, 8);
+        place(&mut canvas, &render("4567", 2, 2), 10, 28);
+        place(&mut canvas, &render("89", 2, 2), 10, 70);
+        place(&mut canvas, &render("01", 2, 2), 10, 90);
+
+        let cfg = RowConfig {
+            line_height: Some(20),
+            first_line_top: Some(8),
+            ..Default::default()
+        };
+        let layout = rows(&canvas, cfg);
+        let tops: Vec<u32> = layout.rows.iter().map(|row| row.rect.y0).collect();
+        assert_eq!(
+            tops,
+            [8, 28, 70, 90],
+            "间隔不会让后面块错位：{:?}",
+            layout.notes
+        );
+    }
+
+    #[test]
+    fn manual_grid_gap_row_resets_phase() {
+        // 第 4 行之后是空白带（中间有个小噪点），后面还有一行。
+        // 没有空白行配置的话，噪点会顶掉一行；加空白行后，后面一行重新对齐。
+        let mut canvas = white_canvas(220, 180);
+        place(&mut canvas, &render("0123", 2, 2), 10, 8);
+        place(&mut canvas, &render("4567", 2, 2), 10, 28);
+        place(&mut canvas, &render("89", 2, 2), 10, 48);
+        place(&mut canvas, &render("01", 2, 2), 10, 68);
+        // 空白带里的噪点（2x2）。
+        for y in 104..106 {
+            for x in 10..12 {
+                canvas.put_pixel(x, y, Rgb([20, 20, 20]));
+            }
+        }
+        place(&mut canvas, &render("2345", 2, 2), 10, 128);
+
+        let cfg = RowConfig {
+            line_height: Some(20),
+            first_line_top: Some(8),
+            gap_rows: parse_gap_rows("4x32"),
+            ..Default::default()
+        };
+        let layout = rows(&canvas, cfg);
+        let tops: Vec<u32> = layout.rows.iter().map(|row| row.rect.y0).collect();
+        assert_eq!(
+            tops,
+            [8, 28, 48, 68, 88, 128],
+            "空白行把噪点跳过，后面一行落在 128：{:?}",
+            layout.notes
+        );
+        assert_eq!(layout.rows[4].ink, 0, "第 5 行是人工空白行");
+        assert_eq!(
+            layout.rows[4].rect.y1 - layout.rows[4].rect.y0,
+            32,
+            "空白行高是自己定的"
+        );
+    }
+
+    #[test]
+    fn parse_gap_rows_sorts_and_merges() {
+        assert_eq!(parse_gap_rows(""), []);
+        assert_eq!(parse_gap_rows("5x24"), [(5, 24)]);
+        assert_eq!(parse_gap_rows("9x30,5x24,ok,0x10,5x6"), [(5, 30), (9, 30)]);
+        assert_eq!(serialize_gap_rows(&[(5, 24), (9, 30)]), "5x24,9x30");
+    }
+
+    #[test]
+    fn manual_grid_cuts_fused_band_by_pitch() {
+        // 上下粘连成一条大带（带中间无墨迹断层）时，墨迹不断，网格按 pitch 等分。
+        let mut canvas = white_canvas(220, 60);
+        place(&mut canvas, &render("0123", 2, 2), 10, 8);
+        place(&mut canvas, &render("4567", 2, 2), 10, 22);
+
+        let cfg = RowConfig {
+            line_height: Some(14),
+            first_line_top: Some(8),
+            ..Default::default()
+        };
+        let layout = rows(&canvas, cfg);
+        let tops: Vec<u32> = layout.rows.iter().map(|row| row.rect.y0).collect();
+        assert_eq!(
+            tops,
+            [8, 22],
+            "粘连带也应按 pitch 切出两行：{:?}",
+            layout.notes
+        );
+    }
+
+    #[test]
     fn chunks_cover_wide_row_without_gaps() {
         let mut gray = GrayImage::from_pixel(200, 20, Luma([255]));
         for x in (6..194).step_by(12) {
@@ -1566,13 +1926,44 @@ mod tests {
     }
 
     #[test]
+    fn red_text_on_black_has_strong_contrast_in_row_image() {
+        // 复现用户场景：纯红字在亮度灰度里近乎隐形，距离灰度必须拉满对比度。
+        let mut canvas = image::RgbImage::from_pixel(160, 60, Rgb([10, 10, 15]));
+        for y in 20..34 {
+            for x in 10..150 {
+                canvas.put_pixel(x, y, Rgb([255, 30, 30]));
+            }
+        }
+        let layout = rows(
+            &canvas,
+            RowConfig {
+                line_height: Some(20),
+                first_line_top: Some(0),
+                ..Default::default()
+            },
+        );
+        let images = row_images(&canvas, &layout, RowConfig::default());
+        assert_eq!(images.len(), 1);
+        let image = &images[0];
+        // 反相后应是暗字亮底：背景亮、字暗。
+        // output 坐标系：内容 x0 起点 = 墨迹 x0-2，所以 (1,8) 是左侧 2px 缓冲的背景。
+        let bg_pixel = image.get_pixel(1, 8)[0];
+        let ink_pixel = image.get_pixel(80, 4 + 7)[0];
+        assert!(bg_pixel > 200, "反相后背景应亮，实际 {bg_pixel}");
+        assert!(
+            ink_pixel < 60,
+            "反相后红字应暗（距离拉满），实际 {ink_pixel}"
+        );
+    }
+
+    #[test]
     fn row_images_respect_padding_and_bounds() {
         let mut canvas = white_canvas(220, 90);
         place(&mut canvas, &render("0123", 2, 2), 10, 8);
         place(&mut canvas, &render("4567", 2, 2), 10, 28);
 
         let cfg = RowConfig::default();
-        let layout = rows(&canvas, cfg);
+        let layout = rows(&canvas, cfg.clone());
         assert_eq!(layout.rows.len(), 2);
         let pad_y = (cfg.pad_ratio * layout.line_height as f32).round() as u32;
         let images = row_images(&canvas, &layout, cfg);
@@ -1580,8 +1971,8 @@ mod tests {
         for (row, image) in layout.rows.iter().zip(images.iter()) {
             let expected_width =
                 (row.rect.x1 + 2).min(canvas.width()) - row.rect.x0.saturating_sub(2);
-            let expected_height =
-                (row.rect.y1 + pad_y).min(canvas.height()) - row.rect.y0.saturating_sub(pad_y);
+            // letterbox：上下白边不取邻行像素，高度 = 行高 + 2×pad（不被图边界裁）。
+            let expected_height = (row.rect.y1 - row.rect.y0) + 2 * pad_y;
             assert_eq!(image.width(), expected_width);
             assert_eq!(image.height(), expected_height);
         }
@@ -1602,10 +1993,12 @@ mod tests {
             reliable: true,
             notes: Vec::new(),
         };
-        let images = row_images(&canvas, &edge, cfg);
+        let images = row_images(&canvas, &edge, RowConfig::default());
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].width(), canvas.width());
-        assert_eq!(images[0].height(), canvas.height());
+        // 白边是合成出来的，不是裁出来的：高度 = 行高 + 2×pad，不会越界。
+        let edge_pad_y = (RowConfig::default().pad_ratio * edge.line_height as f32).round() as u32;
+        assert_eq!(images[0].height(), canvas.height() + 2 * edge_pad_y);
     }
 
     #[test]

@@ -87,6 +87,52 @@ pub enum OcrEvent {
     PanelTest { result: Result<OcrText, String> },
 }
 
+/// 行分割（分行识别）的三种走法，对应配置里的 `ocr/row_mode`。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RowMode {
+    /// 自动分行：投影分行 + 校验，不可信时回退检测模型。
+    Auto,
+    /// 手动网格：完全按首行定位 / 行高 / 空白行切，不再做投影估计。
+    Manual,
+    /// 关闭分行：直接走「检测 + 识别」（默认，和旧版一致）。
+    #[default]
+    Detect,
+}
+
+impl RowMode {
+    /// 从配置字符串解析；未知值（含旧配置缺失键的空串）一律当关闭。
+    pub fn from_config(value: &str) -> RowMode {
+        match value {
+            "auto" => RowMode::Auto,
+            "manual" => RowMode::Manual,
+            _ => RowMode::Detect,
+        }
+    }
+
+    pub fn config_value(self) -> &'static str {
+        match self {
+            RowMode::Auto => "auto",
+            RowMode::Manual => "manual",
+            RowMode::Detect => "detect",
+        }
+    }
+}
+
+/// 分行的手动参数包：行高 / 首行定位 / 空白行。
+#[derive(Clone, Debug)]
+pub struct RowTuning {
+    /// 行分割策略：决定下面这些手动参数要不要用。
+    pub mode: RowMode,
+    /// 手动行高（像素，0 = 自动估计）：> 0 时切手动网格。
+    pub height: u32,
+    /// 首行定位（像素，图片顶部是 0）：行高不为 0 时才生效。
+    pub start: u32,
+    /// 空白行配置字符串：`"5x24,9x30"`（手动网格才生效）。
+    pub gaps: String,
+    /// 行裁图上下留白（百分比，0..=50）：识别图上下各加行高 × pad% 的留白。
+    pub pad: u32,
+}
+
 struct LocalJob {
     generation: u64,
     image: RgbImage,
@@ -96,6 +142,7 @@ struct LocalJob {
     high_recall: bool,
     /// 检测路径送模型前的放大倍数（分行路径不需要，识别模型自己会归一化行高）。
     upscale: u32,
+    row: RowTuning,
 }
 
 /// 常驻线程：收到第一张截图时才加载模型，远端模式不占用模型内存。
@@ -131,27 +178,41 @@ impl LocalWorker {
                     }
                 }
                 let result = (|| {
-                    // 1) 分行路径：投影分行 → 每行 rec-only 识别。
-                    let layout = crate::text_layout::rows(
-                        &job.image,
-                        crate::text_layout::RowConfig::default(),
-                    );
-                    if layout.reliable {
-                        if rows_engine.is_none() {
-                            rows_engine = Some(RowsEngine::new()?);
+                    let mode = job.row.mode;
+                    // 手动参数只在手动网格下生效：自动分行要完全靠投影估计。
+                    let manual = mode == RowMode::Manual && job.row.height >= 4;
+                    let cfg = crate::text_layout::RowConfig {
+                        line_height: manual.then_some(job.row.height),
+                        first_line_top: manual.then_some(job.row.start),
+                        gap_rows: if manual {
+                            crate::text_layout::parse_gap_rows(&job.row.gaps)
+                        } else {
+                            Vec::new()
+                        },
+                        pad_ratio: job.row.pad as f32 / 100.0,
+                        ..Default::default()
+                    };
+                    // 1) 分行路径：投影分行 → 每行 rec-only 识别。`detect` 模式整条跳过。
+                    let layout = (mode != RowMode::Detect)
+                        .then(|| crate::text_layout::rows(&job.image, cfg.clone()));
+                    if let Some(layout) = &layout {
+                        if layout.reliable {
+                            if rows_engine.is_none() {
+                                rows_engine = Some(RowsEngine::new()?);
+                            }
+                            let mut ocr = rows_engine
+                                .as_ref()
+                                .expect("initialized rows engine")
+                                .recognize(&job.image, layout, cfg.pad_ratio)?;
+                            for note in &layout.notes {
+                                ocr.notes.push(format!("分行：{note}"));
+                            }
+                            ocr.layout = Some(layout.clone());
+                            return Ok(ocr);
                         }
-                        let mut ocr = rows_engine
-                            .as_ref()
-                            .expect("initialized rows engine")
-                            .recognize(&job.image, &layout)?;
-                        for note in &layout.notes {
-                            ocr.notes.push(format!("分行：{note}"));
-                        }
-                        ocr.layout = Some(layout);
-                        return Ok(ocr);
                     }
 
-                    // 2) 兜底：行分割不可信时回退到「检测 + 识别」。
+                    // 2) 兜底：关闭分行或行分割不可信时走「检测 + 识别」。
                     let slot = if job.high_recall {
                         &mut engine_recall
                     } else {
@@ -165,14 +226,22 @@ impl LocalWorker {
                         .as_ref()
                         .expect("initialized engine")
                         .recognize(&image)?;
-                    ocr.notes.push(format!(
-                        "行分割不可信（{} 行），已回退检测模型",
-                        layout.rows.len()
-                    ));
-                    for note in &layout.notes {
-                        ocr.notes.push(format!("分行：{note}"));
+                    match (&layout, mode) {
+                        (None, _) => ocr.notes.push("行分割已关闭，直接走检测模型".to_string()),
+                        (Some(_), RowMode::Manual) if job.row.height < 4 => ocr
+                            .notes
+                            .push("手动网格还没设行高（≥4px），本次按自动分行".to_string()),
+                        (Some(layout), _) => ocr.notes.push(format!(
+                            "行分割不可信（{} 行），已回退检测模型",
+                            layout.rows.len()
+                        )),
                     }
-                    ocr.layout = Some(layout);
+                    if let Some(layout) = &layout {
+                        for note in &layout.notes {
+                            ocr.notes.push(format!("分行：{note}"));
+                        }
+                    }
+                    ocr.layout = layout;
                     Ok(ocr)
                 })();
                 let event = if job.test {
@@ -198,6 +267,7 @@ impl LocalWorker {
         image: RgbImage,
         high_recall: bool,
         upscale: u32,
+        row: RowTuning,
     ) -> Result<(), String> {
         self.sender
             .send(LocalJob {
@@ -206,12 +276,13 @@ impl LocalWorker {
                 test: false,
                 high_recall,
                 upscale,
+                row,
             })
             .map_err(|_| "本地识别线程已退出，请重启程序".to_string())
     }
 
     /// 取点窗口的「测试 OCR」：不占用正式识别的 generation。
-    pub fn submit_test(&self, image: RgbImage, upscale: u32) -> Result<(), String> {
+    pub fn submit_test(&self, image: RgbImage, upscale: u32, row: RowTuning) -> Result<(), String> {
         self.sender
             .send(LocalJob {
                 generation: 0,
@@ -219,6 +290,7 @@ impl LocalWorker {
                 test: true,
                 high_recall: false,
                 upscale,
+                row,
             })
             .map_err(|_| "本地识别线程已退出，请重启程序".to_string())
     }
@@ -308,10 +380,17 @@ impl RowsEngine {
         &self,
         image: &RgbImage,
         layout: &crate::text_layout::RowLayout,
+        pad_ratio: f32,
     ) -> Result<OcrText, String> {
         let started = Instant::now();
-        let row_images =
-            crate::text_layout::row_images(image, layout, crate::text_layout::RowConfig::default());
+        let row_images = crate::text_layout::row_images(
+            image,
+            layout,
+            crate::text_layout::RowConfig {
+                pad_ratio,
+                ..Default::default()
+            },
+        );
 
         // 每行按宽高比切块，拼成一个批次送一次识别（比逐行调用快很多）。
         let mut batch: Vec<RgbImage> = Vec::new();
@@ -751,6 +830,20 @@ mod tests {
             "hello"
         );
         assert_eq!(extract_ocr_text(b"plain text"), "plain text");
+    }
+
+    #[test]
+    fn row_mode_maps_config_values() {
+        assert_eq!(RowMode::from_config("auto"), RowMode::Auto);
+        assert_eq!(RowMode::from_config("manual"), RowMode::Manual);
+        assert_eq!(RowMode::from_config("detect"), RowMode::Detect);
+        // 缺失键（空串）与写错的值都当关闭：默认就不分行。
+        assert_eq!(RowMode::from_config(""), RowMode::Detect);
+        assert_eq!(RowMode::from_config("garbage"), RowMode::Detect);
+        for mode in [RowMode::Auto, RowMode::Manual, RowMode::Detect] {
+            assert_eq!(RowMode::from_config(mode.config_value()), mode);
+        }
+        assert_eq!(RowMode::default(), RowMode::Detect);
     }
 
     /// 组装规则：同一行按 x 排序用空格连，换行用 \n，并记录每个框的字符区间。

@@ -2,22 +2,6 @@
 use super::*;
 
 impl MhxyApp {
-    pub(super) fn toggle_region_window(&mut self, ctx: &egui::Context) {
-        if self.show_region_window {
-            self.show_region_window = false;
-            self.region_window_pos = None;
-            self.applied_region_on_top = None;
-            self.release_preview();
-        } else {
-            self.show_region_window = true;
-            // 取点窗口优先放在主窗口右侧；右侧不够就放左侧，
-            // 两边都放不下才贴屏幕右缘（此时靠置顶层级保证不被主窗口压住）。
-            self.region_window_pos = Some(region_window_position(ctx, REGION_WINDOW_SIZE));
-            self.applied_region_on_top = None;
-            self.capture_preview_once();
-        }
-    }
-
     /// 画客户区预览：红框主区域、蓝框备用区域、图色点位；点击时返回 (x, y, 颜色)。
     pub(super) fn preview(
         &self,
@@ -114,181 +98,174 @@ impl MhxyApp {
 
     /// 识别区域窗口：
     /// 上排「截图范围 / 图色门控 | 识别区域预览」，分隔线下面是「识别预处理 | 预处理预览」。
-    pub(super) fn region_window_ui(&mut self, ui: &mut egui::Ui) {
-        if ui.ctx().input(|input| input.viewport().close_requested()) {
-            self.show_region_window = false;
-            self.region_window_pos = None;
-            self.release_preview();
-        }
-        egui::Frame::central_panel(ui.style())
-            .inner_margin(16)
-            .show(ui, |ui| {
-                ui.set_min_size(ui.available_size());
-                ui.horizontal_wrapped(|ui| {
-                    ui.heading("识别区域");
-                    if ui.button("更新截图").clicked() {
-                        self.capture_preview_once();
-                    }
-                    if ui
-                        .add_enabled(
-                            !self.ocr_test_running,
-                            egui::Button::new(if self.ocr_test_running {
-                                "识别中…"
-                            } else {
-                                "测试 OCR"
-                            }),
-                        )
-                        .on_hover_text("用当前截图识别一次，不影响正式识别")
-                        .clicked()
-                    {
-                        self.run_panel_test();
-                    }
-                    ui.checkbox(&mut self.pick_points, "点击预览取点");
-                });
-                ui.separator();
-                self.profile_ui(ui);
-                if let Some(message) = &self.notice {
-                    ui.label(egui::RichText::new(message).small().color(theme::gold()));
+    pub(super) fn region_page_ui(&mut self, ui: &mut egui::Ui) {
+        {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    egui::RichText::new("识别区域")
+                        .size(17.0)
+                        .color(theme::text())
+                        .strong(),
+                );
+                if ui.add(theme::secondary_button("更新截图")).clicked() {
+                    self.capture_preview_once();
                 }
-                if self.ocr_test_running {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label(egui::RichText::new("正在识别…").small().weak());
-                    });
-                } else if let Some(result) = self.ocr_test_result.clone() {
-                    let mut clear = false;
-                    egui::Frame::new()
-                        .fill(theme::inset())
-                        .corner_radius(6)
-                        .inner_margin(8)
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.horizontal(|ui| {
-                                ui.label(egui::RichText::new("测试结果").small().strong());
-                                if ui.small_button("清空").clicked() {
-                                    clear = true;
+                if ui
+                    .add_enabled(
+                        !self.ocr_test_running,
+                        theme::primary_button(if self.ocr_test_running {
+                            "识别中…"
+                        } else {
+                            "测试 OCR"
+                        }),
+                    )
+                    .on_hover_text("用当前截图识别一次，不影响正式识别")
+                    .clicked()
+                {
+                    self.run_panel_test();
+                }
+                ui.checkbox(&mut self.pick_points, "点击预览取点");
+            });
+            theme::divider(ui);
+            self.profile_ui(ui);
+            if let Some(message) = &self.notice {
+                ui.label(egui::RichText::new(message).small().color(theme::gold()));
+            }
+            if self.ocr_test_running {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(egui::RichText::new("正在识别…").small().weak());
+                });
+            } else if let Some(result) = self.ocr_test_result.clone() {
+                let mut clear = false;
+                egui::Frame::new()
+                    .fill(theme::inset())
+                    .corner_radius(8)
+                    .inner_margin(10)
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("测试结果").small().strong());
+                            if ui.small_button("清空").clicked() {
+                                clear = true;
+                            }
+                        });
+                        egui::ScrollArea::vertical()
+                            .id_salt("test_result")
+                            .max_height(80.0)
+                            .show(ui, |ui| match &result {
+                                Ok(text) => {
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(text)
+                                                .monospace()
+                                                .size(11.0)
+                                                .color(theme::text()),
+                                        )
+                                        .wrap(),
+                                    );
+                                }
+                                Err(err) => {
+                                    ui.label(egui::RichText::new(err).small().color(theme::red()));
                                 }
                             });
+                    });
+                if clear {
+                    self.ocr_test_result = None;
+                }
+            }
+
+            let total_height = ui.available_height();
+            // 预处理那排已经去掉，剩下的内容占满整个窗口高度。
+            let top_height = total_height.max(240.0);
+            let settings_width = (ui.available_width() * 0.36).clamp(300.0, 430.0);
+
+            // 截图范围 / 图色门控 | 识别区域预览
+            ui.allocate_ui_with_layout(
+                vec2(ui.available_width(), top_height),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    ui.horizontal_top(|ui| {
+                        ui.vertical(|ui| {
+                            ui.set_width(settings_width);
                             egui::ScrollArea::vertical()
-                                .id_salt("test_result")
-                                .max_height(80.0)
-                                .show(ui, |ui| match &result {
-                                    Ok(text) => {
-                                        ui.add(
-                                            egui::Label::new(
-                                                egui::RichText::new(text)
-                                                    .monospace()
-                                                    .size(11.0)
-                                                    .color(theme::text()),
-                                            )
-                                            .wrap(),
-                                        );
+                                .id_salt("region_top_settings")
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    let mut fold_changed = false;
+                                    let scope_open = theme::collapsible_section(
+                                        ui,
+                                        "region_scope",
+                                        "截图范围",
+                                        self.config.region_scope_open,
+                                        |ui| {
+                                            let mut changed = region_fields(
+                                                ui,
+                                                "main",
+                                                "主区域",
+                                                &mut self.config.task_region,
+                                            );
+                                            ui.add_space(6.0);
+                                            ui.label(egui::RichText::new("备用区域").strong());
+                                            changed |= ui
+                                                .checkbox(
+                                                    &mut self.config.extra_region_enabled,
+                                                    "启用备用区域",
+                                                )
+                                                .changed();
+                                            ui.add_enabled_ui(
+                                                self.config.extra_region_enabled,
+                                                |ui| {
+                                                    changed |= region_grid(
+                                                        ui,
+                                                        "extra",
+                                                        &mut self.config.extra_task_region,
+                                                    );
+                                                },
+                                            );
+                                            if changed {
+                                                self.invalidate_scan();
+                                                self.persist();
+                                            }
+                                        },
+                                    );
+                                    if scope_open != self.config.region_scope_open {
+                                        self.config.region_scope_open = scope_open;
+                                        fold_changed = true;
                                     }
-                                    Err(err) => {
-                                        ui.label(
-                                            egui::RichText::new(err).small().color(theme::red()),
-                                        );
+                                    let gate_open = theme::collapsible_section(
+                                        ui,
+                                        "region_gate",
+                                        "图色门控设置",
+                                        self.config.region_gate_open,
+                                        |ui| self.color_gate_ui(ui),
+                                    );
+                                    if gate_open != self.config.region_gate_open {
+                                        self.config.region_gate_open = gate_open;
+                                        fold_changed = true;
+                                    }
+                                    if fold_changed {
+                                        self.persist();
                                     }
                                 });
                         });
-                    if clear {
-                        self.ocr_test_result = None;
-                    }
-                }
-
-                let total_height = ui.available_height();
-                // 预处理那排已经去掉，剩下的内容占满整个窗口高度。
-                let top_height = total_height.max(240.0);
-                let settings_width = (ui.available_width() * 0.36).clamp(300.0, 430.0);
-
-                // 截图范围 / 图色门控 | 识别区域预览
-                ui.allocate_ui_with_layout(
-                    vec2(ui.available_width(), top_height),
-                    egui::Layout::top_down(egui::Align::Min),
-                    |ui| {
-                        ui.horizontal_top(|ui| {
-                            ui.vertical(|ui| {
-                                ui.set_width(settings_width);
-                                egui::ScrollArea::vertical()
-                                    .id_salt("region_top_settings")
-                                    .auto_shrink([false, false])
-                                    .show(ui, |ui| {
-                                        let mut fold_changed = false;
-                                        let scope_open = theme::collapsible_section(
-                                            ui,
-                                            "region_scope",
-                                            "截图范围",
-                                            self.config.region_scope_open,
-                                            |ui| {
-                                                let mut changed = region_fields(
-                                                    ui,
-                                                    "main",
-                                                    "主区域",
-                                                    &mut self.config.task_region,
-                                                );
-                                                ui.add_space(6.0);
-                                                ui.label(egui::RichText::new("备用区域").strong());
-                                                changed |= ui
-                                                    .checkbox(
-                                                        &mut self.config.extra_region_enabled,
-                                                        "启用备用区域",
-                                                    )
-                                                    .changed();
-                                                ui.add_enabled_ui(
-                                                    self.config.extra_region_enabled,
-                                                    |ui| {
-                                                        changed |= region_grid(
-                                                            ui,
-                                                            "extra",
-                                                            &mut self.config.extra_task_region,
-                                                        );
-                                                    },
-                                                );
-                                                if changed {
-                                                    self.invalidate_scan();
-                                                    self.persist();
-                                                }
-                                            },
-                                        );
-                                        if scope_open != self.config.region_scope_open {
-                                            self.config.region_scope_open = scope_open;
-                                            fold_changed = true;
-                                        }
-                                        let gate_open = theme::collapsible_section(
-                                            ui,
-                                            "region_gate",
-                                            "图色门控设置",
-                                            self.config.region_gate_open,
-                                            |ui| self.color_gate_ui(ui),
-                                        );
-                                        if gate_open != self.config.region_gate_open {
-                                            self.config.region_gate_open = gate_open;
-                                            fold_changed = true;
-                                        }
-                                        if fold_changed {
-                                            self.persist();
-                                        }
-                                    });
-                            });
-                            ui.separator();
-                            ui.vertical(|ui| {
-                                ui.label(egui::RichText::new("识别区域预览").strong());
-                                ui.label(
-                                    egui::RichText::new(
-                                        "红框=主区域，蓝框=备用区域；点击图片可取点",
-                                    )
+                        ui.separator();
+                        ui.vertical(|ui| {
+                            ui.label(egui::RichText::new("识别区域预览").strong());
+                            ui.label(
+                                egui::RichText::new("红框=主区域，蓝框=备用区域；点击图片可取点")
                                     .small()
                                     .weak(),
-                                );
-                                let preview_height = (ui.available_height() - 8.0).max(120.0);
-                                if let Some((x, y, color)) = self.preview(ui, preview_height) {
-                                    self.apply_preview_click(x, y, color);
-                                }
-                            });
+                            );
+                            let preview_height = (ui.available_height() - 8.0).max(120.0);
+                            if let Some((x, y, color)) = self.preview(ui, preview_height) {
+                                self.apply_preview_click(x, y, color);
+                            }
                         });
-                    },
-                );
-            });
+                    });
+                },
+            );
+        }
     }
 
     pub(super) fn apply_preview_click(&mut self, x: i32, y: i32, color: [u8; 3]) {
@@ -409,7 +386,7 @@ impl MhxyApp {
                         ui.colored_label(color, text);
                     }
                 }
-                if ui.small_button("删除").clicked() {
+                if ui.add(theme::danger_button("删除").small()).clicked() {
                     remove = Some(index);
                 }
             });
@@ -418,7 +395,7 @@ impl MhxyApp {
             points.remove(index);
             changed = true;
         }
-        if ui.button("清空点位").clicked() {
+        if ui.add(theme::secondary_button("清空点位")).clicked() {
             points.clear();
             changed = true;
         }
@@ -526,45 +503,6 @@ fn region_fields(
     ui.label(egui::RichText::new(title).strong());
     region_grid(ui, id, region)
 }
-/// 取点窗口优先放在主窗口右侧，右侧空间不够就改放左侧；两边都放不下时才贴屏幕右缘，
-/// 此时不可避免会和主窗口重叠，靠窗口层级（置顶）保证它显示在主窗口之上。
-fn region_window_position(ctx: &egui::Context, size: Vec2) -> egui::Pos2 {
-    ctx.input(|input| {
-        let viewport = input.viewport();
-        let monitor = viewport
-            .monitor_size
-            .unwrap_or_else(|| Vec2::new(1920.0, 1080.0));
-        match viewport.outer_rect {
-            Some(main) => place_region_window(main, monitor, size),
-            // 拿不到主窗口位置时退化成屏幕右上角，至少保证整窗可见。
-            None => egui::pos2((monitor.x - size.x).max(0.0), 0.0),
-        }
-    })
-}
-
-/// [`region_window_position`] 的纯计算部分：主窗口外框 + 显示器尺寸 → 取点窗口外框左上角。
-pub(super) fn place_region_window(main: Rect, monitor: Vec2, size: Vec2) -> egui::Pos2 {
-    const GAP: f32 = 8.0;
-    // with_position 给的是窗口外框左上角，多留一个标题栏高度，免得下沿出屏。
-    const TITLE_BAR: f32 = 32.0;
-    let outer = size + Vec2::new(0.0, TITLE_BAR);
-    let max_x = (monitor.x - outer.x).max(0.0);
-    let max_y = (monitor.y - outer.y).max(0.0);
-    let right = main.max.x + GAP;
-    let left = main.min.x - GAP - outer.x;
-    let x = if right <= max_x {
-        right
-    } else if left >= 0.0 {
-        left
-    } else {
-        max_x
-    };
-    let y = main.min.y.clamp(0.0, max_y);
-    egui::pos2(x, y)
-}
-
-/// 取点窗口的默认尺寸。
-pub(super) const REGION_WINDOW_SIZE: Vec2 = Vec2::new(1000.0, 820.0);
 
 pub(super) fn sample_image(image: &image::RgbImage, x: i32, y: i32) -> Option<[u8; 3]> {
     if x < 0 || y < 0 || x as u32 >= image.width() || y as u32 >= image.height() {

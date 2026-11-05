@@ -3,7 +3,6 @@
 //! 每个任务类型（抓鬼 / 鬼王 / 通用）都有自己的无边框窗口，可以分别拖动、
 //! 缩放和摆放。透明度、置顶和鼠标穿透在主窗口里统一设置；每个窗口的位置
 //! 和大小在拖动结束后自动写回配置。
-use super::shell::centered_window_position;
 use super::*;
 use crate::config::MapWindowLayout;
 
@@ -834,10 +833,12 @@ impl MhxyApp {
         }
     }
 
-    /// 主窗口里的占位：地图已经弹到浮窗，这里只留说明和设置入口。
+    /// 主窗口里的占位：地图已经弹到浮窗，这里只留说明；设置卡在下方就地排出来。
+    /// 高度固定（不能占满可用空间）：下面还要排浮窗设置卡，滚动到才看得见。
     pub(super) fn map_window_placeholder(&mut self, ui: &mut egui::Ui) {
         let available = ui.available_rect_before_wrap();
-        let (rect, _) = ui.allocate_exact_size(available.size(), Sense::hover());
+        let size = vec2(available.width(), 200.0);
+        let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, CornerRadius::same(8), theme::inset());
         painter.text(
@@ -849,9 +850,7 @@ impl MhxyApp {
         );
         // 提示文字按可用宽度换行，主窗口变窄时不会冲出面板。
         let hint = painter.layout(
-            "每个任务的浮窗开关、不透明度、宽度、置顶和锁定都在「地图浮窗设置」窗口里；\
-             也可以从顶栏「更多 → 显示 → 浮窗设置…」打开"
-                .to_owned(),
+            "浮窗开关、不透明度、宽度、置顶和锁定在下方设置卡里调。".to_owned(),
             FontId::proportional(13.0),
             theme::muted(),
             (rect.width() - 48.0).max(80.0),
@@ -864,16 +863,6 @@ impl MhxyApp {
             hint,
             theme::muted(),
         );
-
-        let button_rect =
-            Rect::from_center_size(rect.center() + vec2(0.0, 40.0), vec2(150.0, 32.0));
-        if ui
-            .put(button_rect, egui::Button::new("浮窗设置…"))
-            .on_hover_text("每个任务的浮窗开关、不透明度、宽度、置顶和锁定")
-            .clicked()
-        {
-            self.toggle_map_window_settings(ui.ctx());
-        }
     }
 }
 
