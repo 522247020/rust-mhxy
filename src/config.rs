@@ -86,23 +86,46 @@ impl Profile {
     }
 }
 
+/// 浮窗缩放比例的合法范围：窗口宽度 = 地图图片宽度 × zoom。
+/// 0 表示旧配置里还没记录过缩放比例，第一次拿到地图时再反推。
+pub const MAP_WINDOW_ZOOM_MIN: f32 = 0.1;
+pub const MAP_WINDOW_ZOOM_MAX: f32 = 8.0;
+
 /// 单个任务地图浮窗的位置与大小（逻辑像素）。
+///
+/// `zoom` 是用户调好的缩放比例（窗口宽度 ÷ 地图图片宽度）。换地图时窗口
+/// 按“新图片 × zoom”重新开，所以同一个任务窗口在所有地图上保持同一缩放级别。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MapWindowLayout {
     pub x: f32,
     pub y: f32,
     pub width: f32,
     pub height: f32,
+    pub zoom: f32,
+}
+
+/// 把缩放比例夹到可用范围；无效值一律当作“还没记录”（0）。
+pub fn clamp_map_window_zoom(zoom: f32) -> f32 {
+    if zoom.is_finite() && zoom > 0.0 {
+        zoom.clamp(MAP_WINDOW_ZOOM_MIN, MAP_WINDOW_ZOOM_MAX)
+    } else {
+        0.0
+    }
 }
 
 impl MapWindowLayout {
-    /// 配置里的紧凑写法：`x,y,宽,高`。
+    /// 配置里的紧凑写法：`x,y,宽,高` 或 `x,y,宽,高,缩放比例`。
     pub fn parse(text: &str) -> Option<Self> {
         let mut parts = text.split(',').map(str::trim);
         let x = parts.next()?.parse::<f32>().ok()?;
         let y = parts.next()?.parse::<f32>().ok()?;
         let width = parts.next()?.parse::<f32>().ok()?;
         let height = parts.next()?.parse::<f32>().ok()?;
+        let zoom = parts
+            .next()
+            .and_then(|text| text.parse::<f32>().ok())
+            .map(clamp_map_window_zoom)
+            .unwrap_or(0.0);
         if parts.next().is_some()
             || !x.is_finite()
             || !y.is_finite()
@@ -116,14 +139,22 @@ impl MapWindowLayout {
             y,
             width,
             height,
+            zoom,
         })
     }
 
     pub fn to_config_string(self) -> String {
-        format!(
-            "{:.0},{:.0},{:.0},{:.0}",
-            self.x, self.y, self.width, self.height
-        )
+        if self.zoom > 0.0 {
+            format!(
+                "{:.0},{:.0},{:.0},{:.0},{:.4}",
+                self.x, self.y, self.width, self.height, self.zoom
+            )
+        } else {
+            format!(
+                "{:.0},{:.0},{:.0},{:.0}",
+                self.x, self.y, self.width, self.height
+            )
+        }
     }
 }
 
@@ -453,6 +484,7 @@ impl Config {
             // 尺寸过小会让浮窗缩成一条线，既看不清也拖不回来。
             layout.width = layout.width.max(160.0);
             layout.height = layout.height.max(120.0);
+            layout.zoom = clamp_map_window_zoom(layout.zoom);
         }
         // 通用任务与抓鬼/鬼王互斥；手改配置或旧配置里同时为真时，以通用任务为准。
         if self.generic_enabled {
@@ -1278,11 +1310,38 @@ mod tests {
                 y: 240.0,
                 width: 160.0,
                 height: 120.0,
+                zoom: 0.0,
             }),
             "过小的浮窗尺寸应被抬到下限"
         );
         assert!(!loaded.map_window_layouts.contains_key("鬼王"));
         assert!(!loaded.map_window_layouts.contains_key("通用"));
+    }
+
+    #[test]
+    fn map_window_layout_keeps_the_zoom_ratio() {
+        // 旧配置只有位置和大小：zoom 当作没记录（0）。
+        let legacy = MapWindowLayout::parse("120,240,520,480").unwrap();
+        assert_eq!(legacy.zoom, 0.0);
+        assert_eq!(legacy.to_config_string(), "120,240,520,480");
+        // 新配置带缩放比例，写回时保留。
+        let with_zoom = MapWindowLayout::parse("120,240,520,480,2.5").unwrap();
+        assert_eq!(with_zoom.zoom, 2.5);
+        assert_eq!(with_zoom.to_config_string(), "120,240,520,480,2.5000");
+        // 越界的缩放比例收敛到可用范围，写坏的当作没记录。
+        assert_eq!(
+            MapWindowLayout::parse("0,0,520,480,99").unwrap().zoom,
+            MAP_WINDOW_ZOOM_MAX
+        );
+        assert_eq!(
+            MapWindowLayout::parse("0,0,520,480,0.001").unwrap().zoom,
+            MAP_WINDOW_ZOOM_MIN
+        );
+        assert_eq!(
+            MapWindowLayout::parse("0,0,520,480,nope").unwrap().zoom,
+            0.0
+        );
+        assert!(MapWindowLayout::parse("0,0,520,480,1,2").is_none());
     }
 
     #[test]
@@ -1341,6 +1400,7 @@ mod tests {
                 y: 50.6,
                 width: 520.2,
                 height: 480.7,
+                zoom: 2.5,
             },
         );
         config.map_window_layouts.insert(
@@ -1350,6 +1410,7 @@ mod tests {
                 y: 300.0,
                 width: 400.0,
                 height: 360.0,
+                zoom: 0.0,
             },
         );
         config
@@ -1434,7 +1495,7 @@ mod tests {
         assert_eq!(value["ocr/extra_task_region"], "0.7,0.71,0.99,0.9");
         assert_eq!(value["meditation/text_color"], "#ffffff");
         assert_eq!(value["meditation/position"], "12,57");
-        assert_eq!(value["map_window/layouts"]["抓鬼"], "40,51,520,481");
+        assert_eq!(value["map_window/layouts"]["抓鬼"], "40,51,520,481,2.5000");
         assert_eq!(value["map_window/layouts"]["鬼王"], "280,300,400,360");
         assert_eq!(value["map_window/opacity"], 0.75);
         assert_eq!(value["window/theme"], "dark");

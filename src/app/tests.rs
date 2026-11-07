@@ -1338,29 +1338,85 @@ fn native_resize_constraints_keep_aspect_and_fixed_anchor() {
 }
 
 #[test]
-fn switching_map_does_not_blow_up_the_window() {
-    let monitor = vec2(1920.0, 1080.0);
-    let current = vec2(560.0, 420.0);
+fn switching_map_keeps_the_window_zoom() {
+    let mut app = app();
+    let ctx = app.ctx.clone();
+    let mut frame = eframe::Frame::_new_kittest();
+    let input = || egui::RawInput {
+        screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1120.0, 800.0))),
+        ..Default::default()
+    };
+    // 单帧识别，免得多帧投票把换地图延后。
+    app.config.ocr_vote_frames = false;
+    app.apply_ocr(&OcrText {
+        text: "抓鬼 长寿村 12,34".into(),
+        elapsed_secs: 0.1,
+        regions: Vec::new(),
+        notes: Vec::new(),
+        ..Default::default()
+    });
+    app.set_map_window(true);
+    let mut output = ctx.run_ui(input(), |ui| app.ui(ui, &mut frame));
+    output.textures_delta.clear();
+    let chunshou = app
+        .config
+        .map_window_layouts
+        .get("抓鬼")
+        .copied()
+        .expect("抓鬼浮窗应有布局");
+    assert_eq!(chunshou.zoom, 1.0, "首次按图片大小开窗，缩放比例应为 1");
 
-    // 碗子山 170×340（0.5:1）：直接保留宽度会算出 1120 高，比屏幕还高，
-    // 下半截跑到屏幕外、边也抓不到。现在只在原窗口盒子里重排。
-    let tall = map_window::resize_for_aspect(current, 170.0 / 340.0, monitor);
-    assert!(tall.y <= monitor.y, "不能超出显示器：{tall:?}");
-    assert!(tall.y <= 480.5, "换高瘦地图时窗口不该被拉高：{tall:?}");
-
-    // 大唐境外 583×108（≈5.4:1）：宽度不变，只是变矮；不能被「最小高度 × 比例」
-    // 反过来把宽度抬到 900px 以上。
-    let aspect = 583.0 / 108.0;
-    let wide = map_window::resize_for_aspect(current, aspect, monitor);
-    assert!(
-        (wide.x - 560.0).abs() < 0.5,
-        "换极宽地图时宽度不该突变：{wide:?}"
+    // 模拟用户把窗口拖大到 2 倍：窗口尺寸和缩放比例一起记下来。
+    app.config.map_window_layouts.insert(
+        "抓鬼".into(),
+        crate::config::MapWindowLayout {
+            width: chunshou.width * 2.0,
+            height: chunshou.height * 2.0,
+            zoom: 2.0,
+            ..chunshou
+        },
     );
-    assert!((wide.y - 560.0 / aspect).abs() < 0.5, "{wide:?}");
 
-    // 普通比例（天宫 420×279）保持原宽度，只按比例调高度。
-    let normal = map_window::resize_for_aspect(current, 420.0 / 279.0, monitor);
-    assert!((normal.x - 560.0).abs() < 0.5, "{normal:?}");
+    // 换到比例完全不同的地图：窗口按同一个 zoom 重新开，位置不动。
+    app.apply_ocr(&OcrText {
+        text: "抓鬼 大唐境外 34,56".into(),
+        elapsed_secs: 0.1,
+        regions: Vec::new(),
+        notes: Vec::new(),
+        ..Default::default()
+    });
+    let mut output = ctx.run_ui(input(), |ui| app.ui(ui, &mut frame));
+    output.textures_delta.clear();
+    let wide = app
+        .config
+        .map_window_layouts
+        .get("抓鬼")
+        .copied()
+        .expect("抓鬼浮窗应有布局");
+    let wide_image = app
+        .maps
+        .iter()
+        .find(|definition| definition.name == "大唐境外")
+        .and_then(|definition| {
+            app.map_textures
+                .get(&definition.image.to_string_lossy().to_string())
+        })
+        .expect("应加载大唐境外地图")
+        .size_vec2();
+    assert_eq!(wide.zoom, 2.0, "换地图不应改变缩放比例");
+    assert!(
+        (wide.width - wide_image.x * 2.0).abs() < 0.5,
+        "窗口宽度应为图片 × 2：{wide:?} / {wide_image:?}"
+    );
+    assert!(
+        (wide.height - wide_image.y * 2.0).abs() < 0.5,
+        "窗口高度应为图片 × 2：{wide:?} / {wide_image:?}"
+    );
+    assert_eq!(
+        (wide.x, wide.y),
+        (chunshou.x, chunshou.y),
+        "换地图不应移动窗口"
+    );
 }
 
 #[test]
@@ -1375,6 +1431,34 @@ fn map_width_limits_never_exceed_the_monitor() {
 }
 
 #[test]
+fn every_map_opens_at_the_same_zoom_ratio() {
+    let monitor = vec2(1920.0, 1080.0);
+    let zoom = 2.0;
+    // 地图比例差很大（长寿村 0.76:1、大唐境外 5.4:1、碗子山 0.5:1），
+    // 但窗口宽 ÷ 图片宽、高 ÷ 图片高都应当等于用户调好的 zoom。
+    for image in [
+        vec2(267.0, 350.0),
+        vec2(583.0, 108.0),
+        vec2(170.0, 340.0),
+        vec2(420.0, 279.0),
+    ] {
+        let window = map_window::zoomed_window_size(image, zoom, monitor);
+        assert!(
+            (window.x / image.x - zoom).abs() < 0.01,
+            "宽度应按同一比例放大：{image:?} -> {window:?}"
+        );
+        assert!(
+            (window.y / image.y - zoom).abs() < 0.01,
+            "高度应按同一比例放大：{image:?} -> {window:?}"
+        );
+    }
+    // 超出显示器时会被夹住，但比例不会反过来被拉变形。
+    let huge = map_window::zoomed_window_size(vec2(170.0, 340.0), 8.0, monitor);
+    assert!(huge.y <= monitor.y, "{huge:?}");
+    assert!((huge.x / huge.y - 0.5).abs() < 0.01, "{huge:?}");
+}
+
+#[test]
 fn resized_map_window_is_pulled_back_on_screen() {
     let monitor = vec2(1920.0, 1080.0);
     let mut layout = crate::config::MapWindowLayout {
@@ -1382,6 +1466,7 @@ fn resized_map_window_is_pulled_back_on_screen() {
         y: 320.0,
         width: 459.0,
         height: 918.0,
+        zoom: 1.0,
     };
     map_window::clamp_layout_on_screen(&mut layout, monitor);
     assert_eq!(layout.x, 300.0);
@@ -1476,6 +1561,7 @@ fn map_window_sizes_itself_to_the_map_image() {
             y: 120.0,
             width: map_window::MAP_WINDOW_SIZE.x,
             height: map_window::MAP_WINDOW_SIZE.y,
+            zoom: 0.0,
         },
     );
     app.set_map_window(true);
@@ -1496,6 +1582,7 @@ fn map_window_sizes_itself_to_the_map_image() {
         (layout.width - texture_size.x).abs() < 0.5 && (layout.height - texture_size.y).abs() < 0.5,
         "浮窗应贴合地图图片：layout={layout:?} texture={texture_size:?}"
     );
+    assert_eq!(layout.zoom, 1.0, "按图片大小开窗时缩放比例为 1");
     assert_eq!((layout.x, layout.y), (100.0, 120.0), "贴合图片时保留原位置");
     output.textures_delta.clear();
 }

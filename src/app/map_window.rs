@@ -1,10 +1,12 @@
 //! 独立地图浮窗（新「地图浮窗」模式）。
 //!
 //! 每个任务类型（抓鬼 / 鬼王 / 通用）都有自己的无边框窗口，可以分别拖动、
-//! 缩放和摆放。透明度、置顶和鼠标穿透在主窗口里统一设置；每个窗口的位置
-//! 和大小在拖动结束后自动写回配置。
+//! 缩放和摆放。透明度、置顶和鼠标穿透在主窗口里统一设置；每个窗口的位置、
+//! 大小和缩放比例在拖动结束后自动写回配置。缩放比例是「窗口宽 ÷ 地图图片宽」，
+//! 换地图时按新图片 × 同一个比例重新开窗，所以同一任务窗口在所有地图上
+//! 保持同样的视觉大小。
 use super::*;
-use crate::config::MapWindowLayout;
+use crate::config::{clamp_map_window_zoom, MapWindowLayout};
 
 /// 单个浮窗的默认尺寸：大约放得下一张地图。
 pub(super) const MAP_WINDOW_SIZE: Vec2 = Vec2::new(560.0, 460.0);
@@ -48,6 +50,8 @@ pub(super) struct MapWindowRuntime {
     sized_to_map: bool,
     /// 当前地图图片的宽高比，用来锁定等比缩放。
     map_aspect: Option<f32>,
+    /// 当前地图图片的逻辑尺寸：按缩放比例算窗口大小时要用。
+    map_image_size: Option<Vec2>,
     /// 上一帧是否处于移动/缩放循环；期间延迟写入最终几何。
     interacting: bool,
     /// 上一帧鼠标是否按在浮窗上，用于首次按下激活窗口。
@@ -111,6 +115,15 @@ impl MhxyApp {
             })
             .filter(|aspect| aspect.is_finite() && *aspect > 0.05)
             .unwrap_or(MAP_WINDOW_SIZE.x / MAP_WINDOW_SIZE.y);
+        // 宽度 ÷ 图片宽度就是缩放比例；换地图时按这个比例重新开窗。
+        let ctx = self.ctx.clone();
+        let image_width = self
+            .map_windows
+            .get(task)
+            .and_then(|runtime| runtime.map_image_size)
+            .map(|size| size.x)
+            .or_else(|| self.task_map_image_size(task, &ctx).map(|size| size.x))
+            .filter(|width| *width > 1.0);
         let monitor = self.ctx.input(|input| {
             input
                 .viewport()
@@ -127,9 +140,13 @@ impl MhxyApp {
                 y: 0.0,
                 width: MAP_WINDOW_SIZE.x,
                 height: MAP_WINDOW_SIZE.y,
+                zoom: 0.0,
             });
         layout.width = size.x;
         layout.height = size.y;
+        if let Some(image_width) = image_width {
+            layout.zoom = clamp_map_window_zoom(size.x / image_width);
+        }
         clamp_layout_on_screen(layout, monitor);
         if let Some(runtime) = self.map_windows.get_mut(task) {
             runtime.spawn_layout = Some(*layout);
@@ -294,6 +311,8 @@ impl MhxyApp {
             y: y.clamp(0.0, (monitor.y - size.y).max(0.0)),
             width: size.x,
             height: size.y,
+            // 按图片像素开窗 = 1:1，已识别到地图时缩放比例就是 1。
+            zoom: if image_size.is_some() { 1.0 } else { 0.0 },
         };
         self.config
             .map_window_layouts
@@ -316,8 +335,9 @@ impl MhxyApp {
             }
             let image_size = image_sizes.get(&task).copied();
             let mut layout = self.ensure_map_window_layout(task, index, ctx, image_size);
-            // 地图图片确定后：首次贴合图片大小；之后保持图片宽高比。
-            // 旧版本存下来的固定 560×460 视为未调整过，迁移时也贴合图片。
+            // 换地图时只换图片，但保留用户调好的缩放比例：
+            // 新窗口 = 新图片 × zoom，所以同一个任务窗口在所有地图上看起来一样大。
+            // 旧版本存下来的固定 560×460 视为未调整过，迁移时按图片大小开窗。
             let mut layout_changed = false;
             {
                 let legacy_default = (layout.width - MAP_WINDOW_SIZE.x).abs() < 1.0
@@ -332,43 +352,46 @@ impl MhxyApp {
                     });
                 if let Some(size) = image_size {
                     let aspect = size.x / size.y.max(1.0);
-                    let aspect_changed = runtime
-                        .map_aspect
-                        .is_none_or(|old| (old - aspect).abs() > 0.005);
-                    if aspect_changed {
+                    let image_changed = runtime
+                        .map_image_size
+                        .is_none_or(|old| (old - size).length() > 0.5);
+                    if image_changed {
                         let monitor = ctx.input(|input| {
                             input
                                 .viewport()
                                 .monitor_size
                                 .unwrap_or_else(|| vec2(1920.0, 1080.0))
                         });
-                        // 第一次拿到地图且窗口还是默认尺寸：直接用图片大小；
-                        // 否则在当前窗口的盒子里按新比例重排，不放大。
-                        let current_aspect = layout.width / layout.height.max(1.0);
+                        runtime.map_image_size = Some(size);
+                        runtime.map_aspect = Some(aspect);
                         if !runtime.sized_to_map && legacy_default {
-                            let size = fit_window_size(size, monitor);
-                            layout.width = size.x;
-                            layout.height = size.y;
-                            layout_changed = true;
-                        } else if (current_aspect - aspect).abs() > 0.005 {
-                            let size = resize_for_aspect(
-                                vec2(layout.width, layout.height),
-                                aspect,
-                                monitor,
-                            );
-                            layout.width = size.x;
-                            layout.height = size.y;
-                            layout_changed = true;
+                            // 第一次拿到地图且窗口还是默认尺寸：按图片大小开窗。
+                            let fitted = fit_window_size(size, monitor);
+                            layout.width = fitted.x;
+                            layout.height = fitted.y;
+                            layout.zoom = 1.0;
+                        } else {
+                            // 旧配置没有 zoom：用当前窗口宽度对新图片反推一次，
+                            // 这样升级后的第一次换地图不会突然变大小。
+                            let zoom = if layout.zoom > 0.0 {
+                                layout.zoom
+                            } else {
+                                clamp_map_window_zoom(layout.width / size.x.max(1.0))
+                            };
+                            let wanted = zoomed_window_size(size, zoom, monitor);
+                            if (vec2(layout.width, layout.height) - wanted).length() > 0.5 {
+                                layout.width = wanted.x;
+                                layout.height = wanted.y;
+                            }
+                            layout.zoom = zoom;
                         }
                         runtime.sized_to_map = true;
-                        runtime.map_aspect = Some(aspect);
-                        if layout_changed {
-                            // 换了比例以后窗口高度可能变化很大（例如 5.4:1 的
-                            // 大唐境外 ↔ 0.5:1 的碗子山），位置也得跟着拉回屏内，
-                            // 否则下半截 / 右边会落到屏幕外，边都抓不到。
-                            clamp_layout_on_screen(&mut layout, monitor);
-                            runtime.spawn_layout = Some(layout);
-                        }
+                        // 位置不动，只把窗口拉回屏内；换了尺寸后边也得抓得到。
+                        clamp_layout_on_screen(&mut layout, monitor);
+                        runtime.spawn_layout = Some(layout);
+                        // 程序化改尺寸期间不反推 zoom（那是用户意图，不是新缩放）。
+                        runtime.pending_size = Some(vec2(layout.width, layout.height));
+                        layout_changed = true;
                     }
                 }
             }
@@ -777,8 +800,11 @@ impl MhxyApp {
                     y: 0.0,
                     width: MAP_WINDOW_SIZE.x,
                     height: MAP_WINDOW_SIZE.y,
+                    zoom: 0.0,
                 });
         let mut changed = false;
+        // 用户自己拖出来的尺寸才是新的缩放比例；程序化改尺寸不反推 zoom。
+        let mut size_from_user = false;
         if let Some([width, height]) = completed {
             if (layout.width - width as f32).abs() > 0.5
                 || (layout.height - height as f32).abs() > 0.5
@@ -786,6 +812,7 @@ impl MhxyApp {
                 layout.width = width as f32;
                 layout.height = height as f32;
                 changed = true;
+                size_from_user = true;
             }
         }
         {
@@ -796,6 +823,21 @@ impl MhxyApp {
                     if let Some(pending) = runtime.pending_size {
                         if (pending - size).length() <= 1.0 {
                             runtime.pending_size = None;
+                            // 程序化改尺寸到位：这个尺寸就是目标尺寸，不反推 zoom。
+                            runtime.last_size = Some(size);
+                        } else if runtime
+                            .last_size
+                            .is_none_or(|last| (last - size).length() > 0.5)
+                        {
+                            // 实际尺寸既不是旧尺寸也不是目标尺寸：系统把窗口夹到
+                            // 最小高度之类了。接受现实，不再等这个 pending。
+                            runtime.pending_size = None;
+                            runtime.last_size = Some(size);
+                            if (vec2(layout.width, layout.height) - size).length() > 0.5 {
+                                layout.width = size.x;
+                                layout.height = size.y;
+                                changed = true;
+                            }
                         }
                     } else if runtime
                         .last_size
@@ -806,6 +848,7 @@ impl MhxyApp {
                             layout.width = size.x;
                             layout.height = size.y;
                             changed = true;
+                            size_from_user = true;
                         }
                     }
                 }
@@ -821,6 +864,15 @@ impl MhxyApp {
                             layout.y = position.y;
                             changed = true;
                         }
+                    }
+                }
+            }
+            if size_from_user {
+                if let Some(image) = runtime.map_image_size.filter(|image| image.x > 1.0) {
+                    let zoom = clamp_map_window_zoom(layout.width / image.x);
+                    if (layout.zoom - zoom).abs() > 0.001 {
+                        layout.zoom = zoom;
+                        changed = true;
                     }
                 }
             }
@@ -899,6 +951,13 @@ fn fit_window_size(size: Vec2, monitor: Vec2) -> Vec2 {
     aspect_size(size.x.max(1.0), size.x / size.y.max(1.0), monitor)
 }
 
+/// 换地图 / 换缩放比例时按「图片 × zoom」算窗口大小。
+/// zoom 是用户拖出来的缩放比例（窗口宽 ÷ 图片宽），所有地图都用同一个。
+pub(super) fn zoomed_window_size(image: Vec2, zoom: f32, monitor: Vec2) -> Vec2 {
+    let zoom = clamp_map_window_zoom(zoom).max(0.01);
+    aspect_size(image.x * zoom, image.x / image.y.max(1.0), monitor)
+}
+
 /// 保持宽高比，把宽度限制在浮窗下限和「显示器的一部分」之间。
 ///
 /// 上限同时受宽度和高度约束：`usable.y * aspect` 保证按比例算出的高度不会
@@ -919,18 +978,6 @@ pub(super) fn aspect_size(width: f32, aspect: f32, monitor: Vec2) -> Vec2 {
         min_width
     };
     vec2(width, (width / aspect).max(1.0))
-}
-
-/// 换地图时按新比例重排窗口：在「当前窗口的盒子」里等比缩放，不会比原来更大。
-///
-/// 直接保留宽度、按新比例算高度会出问题：1.33:1 的长寿村换成 5.4:1 的大唐境外，
-/// 高度只剩 100 多像素；换成 0.5:1 的碗子山，高度直接变成 1120，超过屏幕。
-/// 这里改成取盒子能容纳的最大等比尺寸（宽或高顶到盒子边），再夹到浮窗下限和
-/// 显示器范围内，换地图时窗口只会变窄或变矮，不会突然胀开。
-pub(super) fn resize_for_aspect(current: Vec2, aspect: f32, monitor: Vec2) -> Vec2 {
-    let aspect = aspect.max(0.05);
-    let fitted_width = current.x.min(current.y.max(1.0) * aspect);
-    aspect_size(fitted_width, aspect, monitor)
 }
 
 /// 换地图 / 改宽度后把浮窗拉回屏幕内，不留下半截在屏幕外面。

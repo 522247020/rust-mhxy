@@ -16,9 +16,11 @@ impl MhxyApp {
             }
         });
         ui.label(
-            egui::RichText::new("一个任务一个无边框浮窗：在浮窗空白处拖动，拖边缘或四角等比缩放。")
-                .small()
-                .weak(),
+            egui::RichText::new(
+                "一个任务一个无边框浮窗：在浮窗空白处拖动，拖边缘或四角等比缩放；缩放比例会被记住，换地图时沿用。",
+            )
+            .small()
+            .weak(),
         );
         if !self.config.map_window_enabled {
             ui.add_space(6.0);
@@ -65,7 +67,9 @@ impl MhxyApp {
                                 .range(240.0..=16384.0)
                                 .suffix(" px"),
                         )
-                        .on_hover_text("浮窗宽度（逻辑像素），高度按地图比例自动算")
+                        .on_hover_text(
+                            "浮窗宽度（逻辑像素），高度按地图比例自动算；这个缩放比例换地图时沿用",
+                        )
                         .changed()
                     {
                         self.set_map_window_width(task, width);
