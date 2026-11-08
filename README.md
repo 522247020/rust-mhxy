@@ -528,8 +528,10 @@ python scripts/build-site.py --notes "本次更新内容，一行一条"
 `dist/site/` 里是完整的静态站点，整体上传到 `xyq.mhwy.work` 的站点根目录即可：
 
 ```text
-index.html  style.css  favicon.svg  latest.json  downloads/
+index.html  style.css  favicon.svg  swarm-intro.js  latest.json  downloads/
 ```
+
+下载页第一次打开时会播放一段「多光标重建」开场动画（`site/swarm-intro.js`，每个会话一次，窄屏 / `prefers-reduced-motion` 下自动关闭）。想强制重播，在地址后加 `?swarm=1`，或在控制台执行 `SwarmIntro.play()`；想彻底关闭，在 `<html>` 上加 `data-no-swarm`。
 
 `latest.json` 是应用读取的更新清单（页面源码在 `site/`，由脚本填充版本与校验值）：
 
@@ -720,8 +722,9 @@ scripts/
 config.example.json
 site/
   index.html    # 下载页模板（占位符由 build-site.py 填充）
-  style.css     # 页面样式
-  favicon.svg   # 站点图标
+  style.css      # 页面样式
+  favicon.svg    # 站点图标
+  swarm-intro.js # 下载页开场动画（独立实现）
   notes.txt     # 发布说明，推 v* 标签时由下载站工作流读取
 LICENSE
 ```

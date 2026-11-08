@@ -81,7 +81,7 @@ def main() -> None:
     downloads = output / "downloads"
     downloads.mkdir(parents=True, exist_ok=True)
     shutil.copy2(zip_path, downloads / zip_name)
-    for asset in ("style.css", "favicon.svg"):
+    for asset in ("style.css", "favicon.svg", "swarm-intro.js"):
         shutil.copy2(args.site_dir / asset, output / asset)
 
     template = (args.site_dir / "index.html").read_text(encoding="utf-8")
@@ -124,7 +124,7 @@ def main() -> None:
     print(f"页面：{output / 'index.html'}")
     print()
     print(f"把 {output}/ 里的全部文件上传到站点根目录（{base_url}）：")
-    print("  index.html  style.css  favicon.svg  latest.json  downloads/")
+    print("  index.html  style.css  favicon.svg  swarm-intro.js  latest.json  downloads/")
     print("latest.json 建议设置 Cache-Control: no-cache，安装包可以长缓存。")
 
 
