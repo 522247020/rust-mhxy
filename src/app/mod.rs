@@ -26,6 +26,7 @@ use std::time::{Duration, Instant};
 
 mod borderless;
 mod flight;
+mod keymap;
 mod map_window;
 mod meditation;
 mod region;
@@ -212,6 +213,13 @@ pub struct MhxyApp {
     hotkey_error: Option<String>,
     hotkey_tried_at: Option<Instant>,
     recording_hotkey: bool,
+    /// 全局按键映射：钩子线程、上次尝试的规则签名、错误和重试时间。
+    keymap_listener: Option<crate::keymap::KeymapListener>,
+    keymap_attempted: Option<String>,
+    keymap_error: Option<String>,
+    keymap_tried_at: Option<Instant>,
+    /// 正在录制的映射：`(行号, true = 源按键 / false = 目标按键)`。
+    keymap_recording: Option<(usize, bool)>,
     last_manual_trigger: Option<Instant>,
     /// 识别还没结束时又按了快捷键：记下来，等这一轮结束立刻补一次，
     /// 不再像以前那样直接丢掉（看起来就像快捷键没反应）。
@@ -432,6 +440,11 @@ impl MhxyApp {
             hotkey_error: None,
             hotkey_tried_at: None,
             recording_hotkey: false,
+            keymap_listener: None,
+            keymap_attempted: None,
+            keymap_error: None,
+            keymap_tried_at: None,
+            keymap_recording: None,
             last_manual_trigger: None,
             pending_manual_trigger: false,
             compact: false,

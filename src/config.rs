@@ -158,6 +158,44 @@ impl MapWindowLayout {
     }
 }
 
+/// 键盘按键映射：把一个按键替换成另一个按键（Windows 全局生效）。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct KeyMapping {
+    /// 源按键，如 `F9`、`Tab`。
+    pub from: String,
+    /// 目标按键，如 `Tab`、`F9`。
+    pub to: String,
+    /// 单条映射的开关。
+    pub enabled: bool,
+}
+
+impl Default for KeyMapping {
+    fn default() -> Self {
+        Self {
+            from: String::new(),
+            to: String::new(),
+            enabled: true,
+        }
+    }
+}
+
+/// 新用户和旧配置的默认映射：F9 ↔ Tab。
+pub fn default_key_mappings() -> Vec<KeyMapping> {
+    vec![
+        KeyMapping {
+            from: "F9".to_string(),
+            to: "Tab".to_string(),
+            enabled: true,
+        },
+        KeyMapping {
+            from: "Tab".to_string(),
+            to: "F9".to_string(),
+            enabled: true,
+        },
+    ]
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
@@ -280,6 +318,14 @@ pub struct Config {
     #[serde(rename = "meditation/position", with = "position_serde")]
     pub meditation_position: Option<(f32, f32)>,
 
+    /// 键盘按键映射：把某个键替换成另一个键，仅在 Windows 下全局生效。
+    #[serde(
+        rename = "keymap/items",
+        default = "default_key_mappings",
+        deserialize_with = "de_key_mappings"
+    )]
+    pub key_mappings: Vec<KeyMapping>,
+
     /// 独立地图浮窗：把地图从主窗口里弹出来，每个任务类型一个无边框窗口。
     #[serde(rename = "map_window/enabled")]
     pub map_window_enabled: bool,
@@ -370,6 +416,8 @@ impl Default for Config {
             meditation_enabled: false,
             meditation_bold: false,
             meditation_position: None,
+            // 默认把 F9 和 Tab 互换，方便游戏里用顺手的位置。
+            key_mappings: default_key_mappings(),
             map_window_enabled: false,
             map_window_opacity: 1.0,
             map_window_on_top: true,
@@ -479,6 +527,11 @@ impl Config {
             crate::meditation::clamp_duration(self.meditation_duration_seconds);
         self.meditation_opacity = self.meditation_opacity.clamp(0.0, 1.0);
         self.meditation_font_px = self.meditation_font_px.min(200);
+        self.key_mappings.truncate(32);
+        for mapping in &mut self.key_mappings {
+            mapping.from = mapping.from.trim().to_string();
+            mapping.to = mapping.to.trim().to_string();
+        }
         self.map_window_opacity = self.map_window_opacity.clamp(0.0, 1.0);
         for layout in self.map_window_layouts.values_mut() {
             // 尺寸过小会让浮窗缩成一条线，既看不清也拖不回来。
@@ -914,6 +967,37 @@ where
         .unwrap_or_default())
 }
 
+fn de_key_mappings<'de, D>(deserializer: D) -> Result<Vec<KeyMapping>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    Ok(value
+        .as_array()
+        .map(|items| items.iter().filter_map(key_mapping_from_value).collect())
+        .unwrap_or_default())
+}
+
+fn key_mapping_from_value(value: &Value) -> Option<KeyMapping> {
+    let object = value.as_object()?;
+    Some(KeyMapping {
+        from: object
+            .get("from")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        to: object
+            .get("to")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        enabled: object
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+    })
+}
+
 fn de_profiles<'de, D>(deserializer: D) -> Result<Vec<Profile>, D::Error>
 where
     D: Deserializer<'de>,
@@ -1189,6 +1273,45 @@ mod tests {
     }
 
     #[test]
+    fn keymap_defaults_to_f9_tab_swap_and_round_trips() {
+        let config = Config::default();
+        assert_eq!(config.key_mappings.len(), 2);
+        assert_eq!(config.key_mappings[0].from, "F9");
+        assert_eq!(config.key_mappings[0].to, "Tab");
+        assert_eq!(config.key_mappings[1].from, "Tab");
+        assert_eq!(config.key_mappings[1].to, "F9");
+        assert!(config.key_mappings.iter().all(|mapping| mapping.enabled));
+
+        let dir = std::env::temp_dir().join("rust-mhxy-config-keymap-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("config.json");
+        let mut config = Config::default();
+        config.key_mappings[0].enabled = false;
+        config.key_mappings.push(KeyMapping {
+            from: "F8".into(),
+            to: "Space".into(),
+            enabled: true,
+        });
+        config.save(&path).unwrap();
+        let loaded = Config::load(&path);
+        assert_eq!(loaded.key_mappings, config.key_mappings);
+        assert!(!loaded.key_mappings[0].enabled);
+        assert_eq!(loaded.key_mappings[2].from, "F8");
+    }
+
+    #[test]
+    fn missing_keymap_items_get_defaults_but_explicit_empty_stays_empty() {
+        let dir = std::env::temp_dir().join("rust-mhxy-config-keymap-legacy-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("legacy.json");
+        std::fs::write(&path, r#"{"ocr/mode": "local"}"#).unwrap();
+        assert_eq!(Config::load(&path).key_mappings.len(), 2);
+
+        std::fs::write(&path, r#"{"keymap/items": []}"#).unwrap();
+        assert!(Config::load(&path).key_mappings.is_empty());
+    }
+
+    #[test]
     fn theme_defaults_to_system_and_accepts_old_values() {
         let dir = std::env::temp_dir().join("rust-mhxy-config-theme-legacy-test");
         let _ = std::fs::create_dir_all(&dir);
@@ -1437,6 +1560,7 @@ mod tests {
             "color_gate/mode",
             "color_gate/points",
             "color_gate/tolerance",
+            "keymap/items",
             "log/level",
             "map_window/enabled",
             "map_window/layouts",
@@ -1504,6 +1628,9 @@ mod tests {
             "0.65,0.23,0.98,0.50"
         );
         assert_eq!(value["color_gate/points"][0]["color"], "#d4a017");
+        assert_eq!(value["keymap/items"][0]["from"], "F9");
+        assert_eq!(value["keymap/items"][0]["to"], "Tab");
+        assert_eq!(value["keymap/items"][0]["enabled"], true);
         assert_eq!(
             value["profiles/items"][0]["task_region"],
             "0.7,0.24,0.99,0.7"

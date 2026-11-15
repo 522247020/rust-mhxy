@@ -326,6 +326,7 @@ impl eframe::App for MhxyApp {
         if self.compact
             && !self.recording_hotkey
             && !self.meditation_recording_hotkey
+            && self.keymap_recording.is_none()
             && ctx.input(|i| i.key_pressed(egui::Key::Escape))
         {
             self.compact = false;
@@ -350,9 +351,14 @@ impl eframe::App for MhxyApp {
                 }
             }
         }
+        if self.keymap_recording.is_some() {
+            self.poll_keymap_recording(&ctx);
+        }
         self.sync_hotkey();
         // 打坐计时不依赖识别是否在跑，每帧都同步一次（失败会按 5 秒间隔重试）。
         self.sync_meditation_hotkey();
+        // 按键映射也只依赖配置，不跟识别运行状态绑定。
+        self.sync_keymap();
         // 非 Windows 或全局注册失败（含监听线程已退出）时，窗口聚焦也能用快捷键。
         let hotkey_active = self
             .hotkey_listener
@@ -678,6 +684,15 @@ impl eframe::App for MhxyApp {
                 match self.sidebar_tab {
                     "识别区域" => {
                         self.region_page_ui(ui);
+                        return;
+                    }
+                    "按键映射" => {
+                        egui::ScrollArea::vertical()
+                            .id_salt("keymap_page")
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width().min(640.0));
+                                self.keymap_page_ui(ui);
+                            });
                         return;
                     }
                     "合成旗编辑器" => {

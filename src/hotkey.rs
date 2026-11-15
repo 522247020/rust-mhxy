@@ -84,7 +84,7 @@ impl Hotkey {
         if self.win {
             parts.push("Win".to_string());
         }
-        parts.push(key_name(self.key).to_string());
+        parts.push(key_label(self.key));
         parts.join("+")
     }
 
@@ -127,7 +127,7 @@ impl Key {
     }
 }
 
-fn parse_key(text: &str) -> Result<Key, String> {
+pub fn parse_key(text: &str) -> Result<Key, String> {
     let lower = text.to_ascii_lowercase();
     if let Some(number) = lower.strip_prefix('f') {
         if let Ok(index) = number.parse::<u8>() {
@@ -162,7 +162,7 @@ fn parse_key(text: &str) -> Result<Key, String> {
     })
 }
 
-fn key_name(key: Key) -> String {
+pub fn key_label(key: Key) -> String {
     match key {
         Key::F(n) => format!("F{n}"),
         Key::Char(c) => c.to_string(),
@@ -381,6 +381,28 @@ pub fn capture_egui(ctx: &egui::Context) -> Option<String> {
                 parts.push(name.to_string());
                 captured = Some(parts.join("+"));
                 break;
+            }
+        }
+    });
+    captured
+}
+
+/// 录制单个按键（不带修饰键），用于按键映射。Esc 留给调用方取消录制。
+pub fn capture_egui_key(ctx: &egui::Context) -> Option<String> {
+    let mut captured = None;
+    ctx.input(|input| {
+        for event in &input.events {
+            if let egui::Event::Key {
+                key,
+                pressed: true,
+                repeat: false,
+                ..
+            } = event
+            {
+                if let Some(name) = egui_key_name(*key) {
+                    captured = Some(name.to_string());
+                    break;
+                }
             }
         }
     });

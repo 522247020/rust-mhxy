@@ -99,6 +99,14 @@
   // 悬浮窗位置（逻辑像素），留空 = 每次启动由系统摆放
   "meditation/position": "",
 
+  // ---- 键盘按键映射 ----
+  // 把源按键替换成目标按键（Windows 全局生效）。每条映射用 enabled 单独开关。
+  // 只支持单键，不支持 Ctrl / Alt 组合键；默认 F9 ↔ Tab 互换。
+  "keymap/items": [
+    { "from": "F9", "to": "Tab", "enabled": true },
+    { "from": "Tab", "to": "F9", "enabled": true },
+  ],
+
   // ---- 独立地图浮窗 ----
   // 每个任务类型（抓鬼 / 鬼王 / 通用）单独一个无边框浮窗，可分别拖动、缩放
   "map_window/enabled": false,

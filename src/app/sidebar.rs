@@ -225,6 +225,7 @@ impl MhxyApp {
                     "识别模式",
                     "任务类型",
                     "显示与布局",
+                    "按键映射",
                     "打坐计时",
                     "说明",
                 ] {
@@ -427,6 +428,7 @@ impl MhxyApp {
                 "识别模式" => "\u{E721}",
                 "任务类型" => "\u{E716}",
                 "显示与布局" => "\u{E740}",
+                "按键映射" => "\u{E765}",
                 "打坐计时" => "\u{E823}",
                 "识别方式" => "\u{E174}",
                 "方案管理" => "\u{E8F1}",
@@ -655,6 +657,10 @@ impl MhxyApp {
                             .clicked()
                         {
                             self.recording_hotkey = !self.recording_hotkey;
+                            if self.recording_hotkey {
+                                self.keymap_recording = None;
+                                self.suspend_keymap();
+                            }
                         }
                     });
                     match Hotkey::parse(&self.config.ocr_hotkey) {
@@ -1428,6 +1434,7 @@ impl MhxyApp {
             "方案管理（高级设置）：保存 / 切换识别区域和图色门控，一套配置一个方案。",
             "合成旗编辑器（高级设置）：维护各大地图的飞行点，点在地图上直接加。",
             "打坐计时（页面）：启用后显示透明悬浮窗并注册快捷键。",
+            "按键映射（页面）：把源按键替换成目标按键，例如 F9 → Tab；每条映射都能单独开关，默认已加好 F9 ↔ Tab 两条。",
             "日志（高级设置）：实时看最近 1000 行日志，能清空显示、复制、看落盘路径和级别；详细级别记录完整 OCR 过程，写进 logs/rust-mhxy.log。",
             "设置改动会自动保存到程序目录的 config.json。",
         ] {

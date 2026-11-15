@@ -388,6 +388,8 @@ impl MhxyApp {
                     self.meditation_recording_hotkey = !self.meditation_recording_hotkey;
                     if self.meditation_recording_hotkey {
                         self.recording_hotkey = false;
+                        self.keymap_recording = None;
+                        self.suspend_keymap();
                     }
                 }
             });

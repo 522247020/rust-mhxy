@@ -731,6 +731,7 @@ fn menu_bar_holds_everything_top_bar_stays_clean() {
         "识别模式",
         "任务类型",
         "显示与布局",
+        "按键映射",
         "打坐计时",
         "合成旗编辑器",
         "识别方式",
@@ -819,6 +820,39 @@ fn menu_groups_put_help_last_and_rows_debug_in_advanced() {
         "高级设置组整体在页面组下面：{:?} / {:?}",
         find("行分割调试"),
         find("说明")
+    );
+}
+
+/// 按键映射页：默认 F9 ↔ Tab 两条，能添加 / 删除并就地提示无效输入。
+#[test]
+fn keymap_page_shows_default_mappings_and_validation() {
+    let mut app = app();
+    app.sidebar_tab = "按键映射";
+    let ctx = app.ctx.clone();
+    let mut frame = eframe::Frame::_new_kittest();
+    let input = || egui::RawInput {
+        screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1120.0, 900.0))),
+        ..Default::default()
+    };
+    let mut output = ctx.run_ui(input(), |ui| app.ui(ui, &mut frame));
+    let texts = collect_texts(&output.shapes);
+    output.textures_delta.clear();
+    for expected in ["按键映射", "添加映射", "恢复默认映射"] {
+        assert!(
+            texts.iter().any(|text| text == expected),
+            "按键映射页缺少「{expected}」：{texts:?}"
+        );
+    }
+    assert_eq!(app.config.key_mappings.len(), 2, "应自带两条默认映射");
+
+    // 源 / 目标为空时直接在当前行提示，不再静默失败。
+    app.config.key_mappings[0].to.clear();
+    let mut output = ctx.run_ui(input(), |ui| app.ui(ui, &mut frame));
+    let texts = collect_texts(&output.shapes);
+    output.textures_delta.clear();
+    assert!(
+        texts.iter().any(|text| text.contains("缺少目标按键")),
+        "无效映射应在行内提示：{texts:?}"
     );
 }
 

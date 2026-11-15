@@ -9,6 +9,7 @@ mod core;
 mod flight_flags;
 mod gate;
 mod hotkey;
+mod keymap;
 mod meditation;
 mod ocr;
 mod ocr_normalize;
