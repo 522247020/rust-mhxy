@@ -1,0 +1,72 @@
+name: CI
+
+# 日常提交的快速门禁：格式 / clippy / 测试。
+# Windows 打包与发布仍然只在推 v* 标签时由 windows.yml 负责；这里用的是 Linux
+# 跑得最快的组合（和 .gitea/workflows/site.yml 里那段 clippy + test 一致）。
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - 'site/**'
+      - '**.md'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: fmt / clippy / test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+      ORT_CACHE_DIR: ${{ github.workspace }}/.ort-cache
+      OAR_HOME: ${{ github.workspace }}/.ocr-models
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+
+      - name: Set up Rust
+        # 版本由 rust-toolchain.toml 决定；这里只补 CI 需要的组件。
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-linux-x86_64
+          cache-on-failure: true
+
+      - name: Cache ONNX Runtime and OCR models
+        uses: actions/cache@v5
+        with:
+          path: |
+            .ort-cache
+            .ocr-models
+          key: linux-ocr-${{ hashFiles('Cargo.lock') }}
+
+      - name: Install native build dependencies
+        # xcap 需要 pipewire；eframe/winit 需要 egl/gl/wayland/xkb；中文字体供字体测试用。
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libpipewire-0.3-dev libegl1-mesa-dev libgl1-mesa-dev \
+            libgbm-dev libdrm-dev libxkbcommon-dev libwayland-dev libx11-dev \
+            libxcb1-dev fonts-wqy-microhei
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Check Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Run tests
+        run: cargo test --locked

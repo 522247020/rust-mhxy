@@ -2,6 +2,9 @@
 name = "rust-mhxy"
 version = "0.3.3"
 edition = "2021"
+# 最低 Rust 版本。CI / 发版实际用的是 rust-toolchain.toml 锁住的版本；
+# 声明 MSRV 后，clippy 的 incompatible_msrv 会拦住「随手用了新 API」。
+rust-version = "1.88"
 description = "梦幻西游抓鬼/鬼王任务坐标辅助（Rust + egui）"
 license = "MIT"
 default-run = "rust-mhxy"
