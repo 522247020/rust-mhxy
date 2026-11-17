@@ -248,11 +248,9 @@ impl MhxyApp {
             self.keymap_recording = None;
             changed = true;
         }
-        if add {
-            if self.config.key_mappings.len() < 32 {
-                self.config.key_mappings.push(KeyMapping::default());
-                changed = true;
-            }
+        if add && self.config.key_mappings.len() < 32 {
+            self.config.key_mappings.push(KeyMapping::default());
+            changed = true;
         }
         if changed {
             self.keymap_attempted = None;
