@@ -19,64 +19,42 @@ impl MhxyApp {
 
     pub(super) fn sync_meditation_hotkey(&mut self) {
         if !self.config.meditation_enabled {
-            self.meditation_hotkey_listener = None;
-            self.meditation_hotkey_attempted = None;
-            self.meditation_hotkey_error = None;
-            self.meditation_hotkey_tried_at = None;
+            hotkey_slot::reset(
+                &mut self.meditation_hotkey_listener,
+                &mut self.meditation_hotkey_attempted,
+                &mut self.meditation_hotkey_error,
+                &mut self.meditation_hotkey_tried_at,
+            );
             return;
         }
         let raw = self.config.meditation_hotkey.trim().to_string();
-        let changed = self.meditation_hotkey_attempted.as_deref() != Some(raw.as_str());
-        if !changed {
-            // 已注册就什么都不做；线程意外退出或注册失败则定期重试，
-            // 免得界面停在「已注册」而实际按键无效。
-            if self
-                .meditation_hotkey_listener
-                .as_ref()
-                .is_some_and(|l| l.is_alive())
-            {
-                return;
-            }
-            if self.meditation_hotkey_listener.is_some() {
+        // 先解析一次只为日志里的规范化文本；解析失败本身也按注册失败上报。
+        let parsed = Hotkey::parse(&raw);
+        let label = parsed.as_ref().map(|hotkey| hotkey.display()).ok();
+        let sender = self.meditation_hotkey_tx.clone();
+        let outcome = hotkey_slot::sync(
+            &mut self.meditation_hotkey_listener,
+            &mut self.meditation_hotkey_attempted,
+            &mut self.meditation_hotkey_error,
+            &mut self.meditation_hotkey_tried_at,
+            Some(raw),
+            || {
+                let hotkey = parsed?;
+                hotkey::spawn(hotkey, next_hotkey_id(), sender)
+            },
+        );
+        match outcome {
+            hotkey_slot::Synced::Restarted => {
                 self.log_detail("打坐快捷键监听线程已退出，重新注册");
-                self.meditation_hotkey_listener = None;
-                self.meditation_hotkey_error = None;
             }
-            if self
-                .meditation_hotkey_tried_at
-                .is_some_and(|at| at.elapsed() < HOTKEY_RETRY_DELAY)
-            {
-                return;
+            hotkey_slot::Synced::Registered => self.log_detail(format!(
+                "已注册打坐计时快捷键：{}",
+                label.unwrap_or_default()
+            )),
+            hotkey_slot::Synced::Failed { first: true, error } => {
+                self.log_detail(format!("打坐计时快捷键注册失败：{error}"));
             }
-        } else if self
-            .meditation_hotkey_tried_at
-            .is_some_and(|at| at.elapsed() < HOTKEY_CHANGE_DELAY)
-        {
-            return;
-        }
-        self.meditation_hotkey_attempted = Some(raw.clone());
-        self.meditation_hotkey_tried_at = Some(Instant::now());
-        let (hotkey, label) = match Hotkey::parse(&raw) {
-            Ok(hotkey) => (hotkey, hotkey.display()),
-            Err(err) => {
-                self.meditation_hotkey_error = Some(err);
-                self.meditation_hotkey_listener = None;
-                return;
-            }
-        };
-        // 先释放旧的，避免同一个键重复注册。
-        self.meditation_hotkey_listener = None;
-        match hotkey::spawn(hotkey, next_hotkey_id(), self.meditation_hotkey_tx.clone()) {
-            Ok(listener) => {
-                self.meditation_hotkey_listener = Some(listener);
-                self.meditation_hotkey_error = None;
-                self.log_detail(format!("已注册打坐计时快捷键：{label}"));
-            }
-            Err(err) => {
-                self.meditation_hotkey_listener = None;
-                self.meditation_hotkey_error = Some(err.clone());
-                self.log_detail(format!("打坐计时快捷键注册失败：{err}"));
-            }
+            _ => {}
         }
     }
 

@@ -59,7 +59,8 @@ pub struct OcrRegion {
 /// 把这些像素操作从 UI 线程拿走，避免每次识别时窗口拖动卡顿。
 #[derive(Debug)]
 pub struct Captured {
-    pub full: RgbImage,
+    /// 整张客户区截图；只有「识别区域」页需要预览时才回读，否则为 `None`。
+    pub full: Option<RgbImage>,
     pub panel: RgbImage,
     pub signature: u64,
 }
@@ -616,6 +617,18 @@ fn bundled_model(name: &str) -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from(name))
 }
 
+/// 远端识别复用一个 Agent：它自带连接池，而 `Agent::new_with_config` 每轮重做
+/// TLS 配置，请求一结束连接池也跟着销毁，等于每次都重新握手。
+fn remote_agent() -> &'static ureq::Agent {
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    AGENT.get_or_init(|| {
+        let config = ureq::Agent::config_builder()
+            .timeout_global(Some(REMOTE_TIMEOUT))
+            .build();
+        ureq::Agent::new_with_config(config)
+    })
+}
+
 /// 直接把 PNG 字节发给远端 PP-OCR 服务，取回纯文本。
 pub fn remote_recognize(
     base_url: &str,
@@ -628,10 +641,7 @@ pub fn remote_recognize(
     }
     let url = build_ppocr_url(base_url, format)?;
     let (content_type, body) = build_ppocr_body(png, format)?;
-    let config = ureq::Agent::config_builder()
-        .timeout_global(Some(REMOTE_TIMEOUT))
-        .build();
-    let agent = ureq::Agent::new_with_config(config);
+    let agent = remote_agent();
     let started = Instant::now();
     let mut request = agent.post(&url).header("Content-Type", &content_type);
     if !token.trim().is_empty() {

@@ -16,6 +16,13 @@ struct WindowState {
 #[cfg(windows)]
 static WINDOWS: std::sync::Mutex<Vec<WindowState>> = std::sync::Mutex::new(Vec::new());
 
+/// 按窗口标题缓存最近一次查到的 HWND。
+///
+/// `FindWindowW` 每次都要遍历顶层窗口（几十微秒），而地图浮窗每帧要按标题问好几次
+/// 「窗口还在吗 / 正在拖吗」；缓存后用 `IsWindow` + 进程 ID 校验（微秒级）就够。
+#[cfg(windows)]
+static WINDOW_HANDLES: std::sync::Mutex<Vec<(String, isize)>> = std::sync::Mutex::new(Vec::new());
+
 #[cfg(any(windows, test))]
 pub(super) fn constrain_sizing(
     edge: usize,
@@ -71,13 +78,37 @@ fn window_state(hwnd: windows::Win32::Foundation::HWND) -> Option<WindowState> {
 #[cfg(windows)]
 fn find_own_window(title: &str) -> Option<windows::Win32::Foundation::HWND> {
     use windows::core::PCWSTR;
-    use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, GetWindowThreadProcessId};
-    let title: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+    use windows::Win32::UI::WindowsAndMessaging::{
+        FindWindowW, GetWindowThreadProcessId, IsWindow,
+    };
+    // 命中缓存时只做一次 IsWindow + 进程校验；句柄被系统回收给别的进程时进程 ID 会对不上。
+    if let Ok(cached) = WINDOW_HANDLES.lock() {
+        if let Some((_, raw)) = cached.iter().find(|(name, _)| name == title) {
+            let hwnd = windows::Win32::Foundation::HWND(*raw as *mut core::ffi::c_void);
+            unsafe {
+                if IsWindow(Some(hwnd)).as_bool() {
+                    let mut pid = 0;
+                    GetWindowThreadProcessId(hwnd, Some(&mut pid));
+                    if pid == std::process::id() {
+                        return Some(hwnd);
+                    }
+                }
+            }
+        }
+    }
+    let wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
     unsafe {
-        let hwnd = FindWindowW(None, PCWSTR(title.as_ptr())).ok()?;
+        let hwnd = FindWindowW(None, PCWSTR(wide.as_ptr())).ok()?;
         let mut pid = 0;
         GetWindowThreadProcessId(hwnd, Some(&mut pid));
-        (pid == std::process::id()).then_some(hwnd)
+        if pid != std::process::id() {
+            return None;
+        }
+        if let Ok(mut cache) = WINDOW_HANDLES.lock() {
+            cache.retain(|(name, _)| name != title);
+            cache.push((title.to_string(), hwnd.0 as isize));
+        }
+        Some(hwnd)
     }
 }
 

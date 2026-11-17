@@ -21,64 +21,39 @@ impl MhxyApp {
         let desired = if recording || rules.is_empty() {
             None
         } else {
-            Some(signature)
+            Some(signature.clone())
         };
-        let changed = desired != self.keymap_attempted;
-        if !changed {
-            if self
-                .keymap_listener
-                .as_ref()
-                .is_some_and(|listener| listener.is_alive())
-            {
-                return;
-            }
-            if self.keymap_listener.is_some() {
+        let outcome = hotkey_slot::sync(
+            &mut self.keymap_listener,
+            &mut self.keymap_attempted,
+            &mut self.keymap_error,
+            &mut self.keymap_tried_at,
+            desired,
+            || crate::keymap::spawn(rules),
+        );
+        match outcome {
+            hotkey_slot::Synced::Restarted => {
                 self.log_detail("按键映射钩子线程已退出，重新安装");
-                self.keymap_listener = None;
-                self.keymap_error = None;
-            } else if desired.is_none() {
-                self.keymap_error = None;
-                return;
-            }
-        }
-        let delay = if changed {
-            HOTKEY_CHANGE_DELAY
-        } else {
-            HOTKEY_RETRY_DELAY
-        };
-        if self.keymap_tried_at.is_some_and(|at| at.elapsed() < delay) {
-            return;
-        }
-        self.keymap_attempted = desired.clone();
-        self.keymap_tried_at = Some(Instant::now());
-        self.keymap_listener = None;
-        let Some(signature) = desired else {
-            self.keymap_error = None;
-            return;
-        };
-        match crate::keymap::spawn(rules) {
-            Ok(listener) => {
                 self.log_detail(format!("已启用按键映射：{signature}"));
-                self.keymap_listener = Some(listener);
-                self.keymap_error = None;
             }
-            Err(err) => {
-                self.keymap_listener = None;
-                // 同一个错误只记一次，避免每 5 秒刷屏。
-                if self.keymap_error.as_deref() != Some(err.as_str()) {
-                    self.log(format!("按键映射启用失败：{err}"));
-                }
-                self.keymap_error = Some(err);
+            hotkey_slot::Synced::Registered => {
+                self.log_detail(format!("已启用按键映射：{signature}"));
             }
+            hotkey_slot::Synced::Failed { first: true, error } => {
+                self.log(format!("按键映射启用失败：{error}"));
+            }
+            _ => {}
         }
     }
 
     /// 临时释放键盘钩子（录制快捷键时用），后面 sync_keymap 会按配置重新安装。
     pub(super) fn suspend_keymap(&mut self) {
-        self.keymap_listener = None;
-        self.keymap_attempted = None;
-        self.keymap_tried_at = None;
-        self.keymap_error = None;
+        hotkey_slot::reset(
+            &mut self.keymap_listener,
+            &mut self.keymap_attempted,
+            &mut self.keymap_error,
+            &mut self.keymap_tried_at,
+        );
     }
 
     /// 录制单条映射的源按键或目标按键；Esc 取消。

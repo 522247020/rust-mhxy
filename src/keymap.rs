@@ -68,7 +68,6 @@ pub fn rules_signature(rules: &[KeyRule]) -> String {
 pub struct KeymapListener {
     #[cfg(windows)]
     thread_id: u32,
-    #[allow(dead_code)]
     handle: std::thread::JoinHandle<()>,
 }
 
@@ -122,7 +121,8 @@ mod windows_impl {
 
     // 低级键盘钩子的回调是无状态函数指针，规则通过装载钩子的线程局部变量传入。
     thread_local! {
-        static RULES: std::cell::RefCell<Vec<HookRule>> = std::cell::RefCell::new(Vec::new());
+        static RULES: std::cell::RefCell<Vec<HookRule>> =
+            const { std::cell::RefCell::new(Vec::new()) };
     }
 
     /// 方向键、Insert/Delete/Home/End/PageUp/PageDown 是扩展键，

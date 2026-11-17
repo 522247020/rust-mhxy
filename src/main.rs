@@ -31,6 +31,7 @@ fn main() -> eframe::Result {
     if !acquire_single_instance() {
         return Ok(());
     }
+    // 建窗口只需要主题和置顶；这里不校验也不备份，配置读取与提示统一由 MhxyApp::new 负责。
     let config = config::Config::load(&config::default_config_path());
     let mut viewport = egui::ViewportBuilder::default()
         .with_title(main_window_title())
@@ -142,6 +143,8 @@ static BOLD_FONT_AVAILABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// 界面字体是否加载到了中文；没有时界面中文会显示成方块。
+/// 只有测试会问这个问题（运行时靠字体本身回退），所以只在测试构建里编译。
+#[cfg(test)]
 pub fn has_cjk_font() -> bool {
     CJK_FONT_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed)
 }

@@ -283,9 +283,6 @@ pub struct Config {
     /// 界面主题：system（跟随系统）/ light / dark。
     #[serde(rename = "window/theme")]
     pub theme: String,
-    /// 侧栏各分组折叠状态，逗号分隔的 id（如 "window,task"）。
-    #[serde(rename = "window/sidebar/folded", default)]
-    pub sidebar_folded: String,
     /// 打坐倒计时：时长（秒）、显示格式、悬浮窗样式。
     #[serde(rename = "meditation/duration_seconds")]
     pub meditation_duration_seconds: u32,
@@ -403,8 +400,6 @@ impl Default for Config {
             color_gate_tolerance: 12,
             color_gate_points: Vec::new(),
             theme: "system".into(),
-            // 新用户默认收起「高级设置」，侧栏只留常用项。
-            sidebar_folded: "advanced".to_string(),
             meditation_duration_seconds: crate::meditation::DEFAULT_DURATION_SECONDS,
             meditation_clock_format: false,
             meditation_opacity: 0.85,
@@ -444,20 +439,46 @@ impl Config {
         Profile::from_config(self, self.active_profile.clone())
     }
 
+    /// 只取配置本身，不给调用方任何提示，也不动磁盘上的文件。
+    ///
+    /// 文件不存在、写坏了都返回默认值。用在这两个地方：
+    /// - 建窗口前拿主题 / 置顶（此时还没有界面可以提示）；
+    /// - 测试里读回刚保存的配置。
+    ///
+    /// 真正决定「用哪份配置、要不要提示用户、原文件要不要备份」的是
+    /// [`Config::load_checked`]——所以这条路径绝不能自己动文件，否则两次读取会各备份一次。
     pub fn load(path: &Path) -> Config {
-        let Ok(raw) = std::fs::read_to_string(path) else {
-            return Config::default();
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|raw| parse_config(&raw).ok())
+            .unwrap_or_default()
+    }
+
+    /// 载入配置，并把「为什么没读成功」一并交回给调用方。
+    ///
+    /// 读坏了（JSON5 语法错误、顶层不是对象、字段类型对不上）时先把原文件改名成
+    /// `<名>.broken-<时间>.json` 再落默认值：之后自动保存配置不会把用户手写的内容
+    /// 整份覆盖掉，用户也还能从备份里找回原来的设置。
+    /// 文件不存在属于首次启动，不算错误。
+    pub fn load_checked(path: &Path) -> (Config, Option<String>) {
+        let raw = match std::fs::read_to_string(path) {
+            Ok(raw) => raw,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return (Config::default(), None);
+            }
+            Err(err) => {
+                return (
+                    Config::default(),
+                    Some(format!(
+                        "读取配置失败：{err}；本次按默认值启动，改动设置会覆盖原文件"
+                    )),
+                );
+            }
         };
-        let Ok(value) = json5::from_str::<Value>(&raw) else {
-            return Config::default();
-        };
-        let Value::Object(mut map) = value else {
-            return Config::default();
-        };
-        prepare_flat_values(&mut map);
-        let mut config = serde_json::from_value::<Config>(Value::Object(map)).unwrap_or_default();
-        config.normalize();
-        config
+        match parse_config(&raw) {
+            Ok(config) => (config, None),
+            Err(err) => (Config::default(), Some(backup_broken_config(path, &err))),
+        }
     }
 
     pub fn save(&self, path: &Path) -> Result<(), String> {
@@ -627,7 +648,6 @@ const STRING_KEYS: &[&str] = &[
     "log/level",
     "color_gate/mode",
     "window/theme",
-    "window/sidebar/folded",
     "meditation/hotkey",
     "update/manifest_url",
     "profiles/active",
@@ -744,6 +764,48 @@ fn coerce_f32(map: &mut Map<String, Value>, key: &str) {
         None => {
             map.remove(key);
         }
+    }
+}
+
+/// 把配置文件文本解析成 [`Config`]；失败时返回给用户看的说明。
+fn parse_config(raw: &str) -> Result<Config, String> {
+    let value = json5::from_str::<Value>(raw)
+        .map_err(|err| format!("配置解析失败：{}", one_line(err.to_string())))?;
+    let Value::Object(mut map) = value else {
+        return Err("配置解析失败：顶层必须是一个对象".to_string());
+    };
+    prepare_flat_values(&mut map);
+    let mut config = serde_json::from_value::<Config>(Value::Object(map))
+        .map_err(|err| format!("配置字段格式错误：{}", one_line(err.to_string())))?;
+    config.normalize();
+    Ok(config)
+}
+
+/// 把 json5 / serde 的多行报错压成一行：日志和顶栏提示都是一行一条。
+fn one_line(message: String) -> String {
+    message.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// 把写坏的配置改名备份（`config.broken-20251117-083700.json`），返回给用户看的提示。
+///
+/// 改名而不是复制：备份之后原路径是空的，程序再自动保存配置也不会覆盖用户手写的内容。
+fn backup_broken_config(path: &Path, reason: &str) -> String {
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+    let stem = path
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_else(|| CONFIG_FILE_NAME.to_string());
+    let backup = path.with_file_name(format!("{stem}.broken-{stamp}.json"));
+    match std::fs::rename(path, &backup) {
+        Ok(()) => format!(
+            "{reason}；原文件已备份为 {}，本次按默认值启动",
+            backup.display()
+        ),
+        // 备份失败（文件被占用等）也不能直接覆盖，提示用户自己先备份。
+        Err(err) => format!(
+            "{reason}；备份原文件失败：{err}。请先手动备份 {}，本次按默认值启动",
+            path.display()
+        ),
     }
 }
 
@@ -1223,6 +1285,57 @@ mod tests {
         assert_eq!(loaded.color_gate_points[0].tolerance, 15);
     }
 
+    /// 配置写坏了不能默默吞掉：要给出提示，并把原文件改名备份，
+    /// 否则下一次自动保存会把用户手写的内容整份覆盖。
+    #[test]
+    fn broken_config_is_backed_up_and_reported() {
+        let dir = std::env::temp_dir().join(format!(
+            "rust-mhxy-config-broken-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("config.json");
+        std::fs::write(&path, "{ \"ocr/mode\": \"local\", oops }").unwrap();
+        let (config, error) = Config::load_checked(&path);
+        let error = error.expect("写坏的配置必须回报错误");
+        assert!(!path.exists(), "原文件应已改名，不能留在原路径被覆盖");
+        assert!(error.contains("已备份"), "提示里要说清备份到哪了：{error}");
+        let backup = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .find(|name| name.contains(".broken-") && name.ends_with(".json"));
+        assert!(backup.is_some(), "目录里应有 config.broken-*.json 备份");
+        assert_eq!(config.ocr_mode, Config::default().ocr_mode);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 示例配置必须能解析，而且内容就是代码默认值——用户复制一份当配置用，
+    /// 期望「什么都不改」和默认一致；两边漂移（比如示例里的置顶开关写反）不该靠肉眼发现。
+    #[test]
+    fn example_config_matches_defaults() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config.example.json");
+        let raw = std::fs::read_to_string(&path).expect("应能读到 config.example.json");
+        let example = parse_config(&raw).expect("config.example.json 必须能解析");
+        let expected = serde_json::to_value(Config::default()).unwrap();
+        let actual = serde_json::to_value(&example).unwrap();
+        assert_eq!(actual, expected, "config.example.json 应与代码默认值一致");
+    }
+
+    #[test]
+    fn missing_config_is_not_an_error() {
+        let dir = std::env::temp_dir().join(format!(
+            "rust-mhxy-config-missing-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let path = dir.join("config.json");
+        let (config, error) = Config::load_checked(&path);
+        assert!(error.is_none(), "首次启动没有配置文件不该报错：{error:?}");
+        assert_eq!(config.ocr_mode, Config::default().ocr_mode);
+    }
+
     #[test]
     fn generic_task_wins_over_zhuagui_in_config() {
         let dir = std::env::temp_dir().join("rust-mhxy-config-exclusive-test");
@@ -1325,20 +1438,6 @@ mod tests {
         assert_eq!(Config::load(&path).theme, "system");
         std::fs::write(&path, r#"{}"#).unwrap();
         assert_eq!(Config::load(&path).theme, "system");
-    }
-
-    #[test]
-    fn round_trips_sidebar_fold_state() {
-        let dir = std::env::temp_dir().join("rust-mhxy-config-sidebar-fold-test");
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("config.json");
-        Config {
-            sidebar_folded: "window,task".into(),
-            ..Default::default()
-        }
-        .save(&path)
-        .unwrap();
-        assert_eq!(Config::load(&path).sidebar_folded, "window,task");
     }
 
     #[test]
@@ -1608,7 +1707,6 @@ mod tests {
             "window/coordinate/on_top",
             "window/region/gate_open",
             "window/region/scope_open",
-            "window/sidebar/folded",
             "window/sidebar_expanded",
             "window/theme",
         ];
@@ -1706,8 +1804,6 @@ mod tests {
         assert_eq!(profile.gate_mode, "all");
         assert_eq!(profile.gate_tolerance, 12);
         assert!(profile.gate_points.is_empty());
-        // 旧版 load 对缺失的侧栏折叠字段使用空字符串，而不是 Config::default。
-        assert_eq!(loaded.sidebar_folded, "");
     }
 
     #[test]

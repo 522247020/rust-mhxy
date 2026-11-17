@@ -413,7 +413,6 @@ pub fn capture_egui_key(ctx: &egui::Context) -> Option<String> {
 pub struct GlobalHotkey {
     #[cfg(windows)]
     thread_id: u32,
-    #[allow(dead_code)]
     handle: std::thread::JoinHandle<()>,
     /// 注册时发现该组合已被其它程序占用（会提示用户换键）。
     /// 有键盘钩子兜底，所以即便这里非空，快捷键仍然能触发。
@@ -542,11 +541,14 @@ mod windows_impl {
 
     // 低级键盘钩子的回调是一个无状态函数指针，只能通过线程局部变量把配置和发送端传进去。
     // 钩子回调就在装载它的监听线程里执行，所以 thread_local 能正确解析到该线程的状态。
+    // 初始值写成 `const { .. }`：thread_local 的初始化器就整段放进静态区，不产生运行时判断。
     thread_local! {
-        static DESIRED: std::cell::Cell<Option<Desired>> = std::cell::Cell::new(None);
-        static SENDER: std::cell::RefCell<Option<Sender<()>>> = std::cell::RefCell::new(None);
-        static HOLDING_VK: std::cell::Cell<u32> = std::cell::Cell::new(0);
-        static LAST_FIRE: std::cell::Cell<Option<std::time::Instant>> = std::cell::Cell::new(None);
+        static DESIRED: std::cell::Cell<Option<Desired>> = const { std::cell::Cell::new(None) };
+        static SENDER: std::cell::RefCell<Option<Sender<()>>> =
+            const { std::cell::RefCell::new(None) };
+        static HOLDING_VK: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        static LAST_FIRE: std::cell::Cell<Option<std::time::Instant>> =
+            const { std::cell::Cell::new(None) };
     }
 
     fn desired_of(hotkey: Hotkey) -> Desired {

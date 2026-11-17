@@ -306,7 +306,7 @@ fn meditation_panel_shows_countdown_and_controls() {
 fn basic_sidebar_keeps_primary_path_and_hides_advanced_details() {
     let mut app = app();
     // 主区默认是任务地图；选到「游戏窗口」设置页再检查主路径在场。
-    app.sidebar_tab = "游戏窗口";
+    app.sidebar_tab = Page::GameWindow;
     let ctx = app.ctx.clone();
     let mut frame = eframe::Frame::_new_kittest();
     let input = egui::RawInput {
@@ -385,7 +385,7 @@ fn basic_sidebar_keeps_primary_path_and_hides_advanced_details() {
 fn interval_is_only_shown_in_auto_mode() {
     let mut app = app();
     // 模式相关的控件在「识别模式」页里，默认选中该页再渲染设置栏。
-    app.sidebar_tab = "识别模式";
+    app.sidebar_tab = Page::Mode;
     let ctx = app.ctx.clone();
     let input = || egui::RawInput {
         screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(420.0, 900.0))),
@@ -685,7 +685,7 @@ fn task_panel_has_no_high_chance_checkbox() {
     output.textures_delta.clear();
 
     // 高概率开关在基础区「显示与布局」页里。
-    app.sidebar_tab = "显示与布局";
+    app.sidebar_tab = Page::Display;
     let mut output = ctx.run_ui(input, |ui| app.settings_page_ui(ui));
     let texts = collect_texts(&output.shapes);
     output.textures_delta.clear();
@@ -761,7 +761,7 @@ fn menu_bar_holds_everything_top_bar_stays_clean() {
 
     // 地图浮窗开启：不新增菜单项，任务地图页就地给出占位说明 + 浮窗设置卡。
     app.config.map_window_enabled = true;
-    app.sidebar_tab = "任务地图";
+    app.sidebar_tab = Page::TaskMap;
     let mut output = ctx.run_ui(input(), |ui| app.ui(ui, &mut frame));
     let texts = collect_texts(&output.shapes);
     output.textures_delta.clear();
@@ -827,7 +827,7 @@ fn menu_groups_put_help_last_and_rows_debug_in_advanced() {
 #[test]
 fn keymap_page_shows_default_mappings_and_validation() {
     let mut app = app();
-    app.sidebar_tab = "按键映射";
+    app.sidebar_tab = Page::Keymap;
     let ctx = app.ctx.clone();
     let mut frame = eframe::Frame::_new_kittest();
     let input = || egui::RawInput {
@@ -1151,7 +1151,7 @@ fn map_window_mode_gives_each_task_its_own_popout() {
     output.textures_delta.clear();
 
     // 浮窗设置卡只在任务地图页出现：切到说明页不能被设置卡覆盖。
-    app.sidebar_tab = "说明";
+    app.sidebar_tab = Page::Help;
     let mut output = ctx.run_ui(input(), |ui| app.ui(ui, &mut frame));
     let texts = collect_texts(&output.shapes);
     assert!(
@@ -1159,7 +1159,7 @@ fn map_window_mode_gives_each_task_its_own_popout() {
         "说明页不应被浮窗设置卡覆盖：{texts:?}"
     );
     output.textures_delta.clear();
-    app.sidebar_tab = "任务地图";
+    app.sidebar_tab = Page::TaskMap;
 
     // 每个任务的开关在任务地图页占位的下方设置卡里。
     let mut output = ctx.run_ui(input(), |ui| app.map_window_settings_controls(ui));
@@ -1701,7 +1701,7 @@ fn compact_mode_hides_chrome_and_esc_restores_it() {
 
     app.compact = true;
     // 不管当前在哪个设置页，进精简模式主区只画地图。
-    app.sidebar_tab = "行分割调试";
+    app.sidebar_tab = Page::RowsDebug;
     let mut output = ctx.run_ui(input(), |ui| app.ui(ui, &mut frame));
     let texts = collect_texts(&output.shapes);
     assert!(
@@ -1799,9 +1799,10 @@ fn pausing_discards_inflight_results() {
 fn remote_test_feedback_is_available_with_simple_logging() {
     let mut app = app();
     app.config.log_level = "detailed".into();
-    app.log_path =
-        std::env::temp_dir().join(format!("rust-mhxy-log-test-{}.log", std::process::id()));
-    let _ = std::fs::remove_file(&app.log_path);
+    app.log_file = super::LogFile::new(
+        std::env::temp_dir().join(format!("rust-mhxy-log-test-{}.log", std::process::id())),
+    );
+    let _ = std::fs::remove_file(app.log_file.path());
     app.testing_remote = true;
     app.sender
         .send(OcrEvent::Test {
@@ -1811,9 +1812,9 @@ fn remote_test_feedback_is_available_with_simple_logging() {
     app.poll_events();
     assert!(!app.testing_remote);
     assert_eq!(app.remote_feedback, Some(Err("连接超时".into())));
-    let text = std::fs::read_to_string(&app.log_path).unwrap_or_default();
+    let text = std::fs::read_to_string(app.log_file.path()).unwrap_or_default();
     assert!(text.contains("连接超时"), "日志应直接写入磁盘：{text:?}");
-    let _ = std::fs::remove_file(&app.log_path);
+    let _ = std::fs::remove_file(app.log_file.path());
 }
 
 #[test]
@@ -1932,14 +1933,18 @@ fn panel_test_result_is_formatted_for_region_window() {
 #[test]
 fn preview_updates_reuse_the_existing_texture() {
     let mut app = app();
-    app.sidebar_tab = "识别区域";
-    app.update_preview(image::RgbImage::from_pixel(100, 100, image::Rgb([0, 0, 0])));
+    app.sidebar_tab = Page::Region;
+    app.update_preview(Some(image::RgbImage::from_pixel(
+        100,
+        100,
+        image::Rgb([0, 0, 0]),
+    )));
     let texture_id = app.preview_texture.as_ref().unwrap().id();
-    app.update_preview(image::RgbImage::from_pixel(
+    app.update_preview(Some(image::RgbImage::from_pixel(
         120,
         100,
         image::Rgb([255, 0, 0]),
-    ));
+    )));
     assert_eq!(app.preview_texture.as_ref().unwrap().id(), texture_id);
     assert_eq!(
         sample_image(app.preview_image.as_ref().unwrap(), 119, 99),
@@ -1947,22 +1952,58 @@ fn preview_updates_reuse_the_existing_texture() {
     );
 }
 
+/// 预览纹理有刷新节流：实时模式一轮一帧时，不能每轮都把整窗转 RGBA 再整张上传。
+#[test]
+fn preview_texture_refresh_is_throttled() {
+    let mut app = app();
+    app.sidebar_tab = Page::Region;
+    app.update_preview(Some(image::RgbImage::from_pixel(
+        64,
+        64,
+        image::Rgb([1, 2, 3]),
+    )));
+    let first = app.preview_synced_at.expect("首帧应刷新预览纹理");
+    app.update_preview(Some(image::RgbImage::from_pixel(
+        64,
+        64,
+        image::Rgb([4, 5, 6]),
+    )));
+    assert_eq!(
+        app.preview_synced_at,
+        Some(first),
+        "节流窗口内不应重复上传纹理"
+    );
+    assert_eq!(
+        sample_image(app.preview_image.as_ref().unwrap(), 0, 0),
+        Some([4, 5, 6]),
+        "预览图本身要跟着最新截图走，方便取点"
+    );
+}
+
 #[test]
 fn preview_is_released_outside_region_page() {
     let mut app = app();
-    app.sidebar_tab = "识别区域";
-    app.update_preview(image::RgbImage::from_pixel(64, 64, image::Rgb([1, 2, 3])));
+    app.sidebar_tab = Page::Region;
+    app.update_preview(Some(image::RgbImage::from_pixel(
+        64,
+        64,
+        image::Rgb([1, 2, 3]),
+    )));
     assert!(app.preview_image.is_some());
     assert!(app.preview_texture.is_some());
     assert_eq!(app.client_size, Some((64, 64)));
 
-    app.sidebar_tab = "任务地图";
+    app.sidebar_tab = Page::TaskMap;
     app.release_preview();
     assert!(app.preview_image.is_none());
     assert!(app.preview_texture.is_none());
     assert_eq!(app.client_size, Some((64, 64)), "客户区尺寸仍用于图色取点");
 
-    app.update_preview(image::RgbImage::from_pixel(80, 60, image::Rgb([4, 5, 6])));
+    app.update_preview(Some(image::RgbImage::from_pixel(
+        80,
+        60,
+        image::Rgb([4, 5, 6]),
+    )));
     assert!(app.preview_image.is_none());
     assert!(app.preview_texture.is_none());
     assert_eq!(app.client_size, Some((80, 60)));
@@ -2074,41 +2115,6 @@ fn profiles_apply_save_and_delete() {
 }
 
 #[test]
-fn sidebar_sections_can_collapse() {
-    let mut app = app();
-    app.config.sidebar_folded =
-        "window,trigger,ocr,task,log,advanced,region,profiles,display,meditation,flight_flags"
-            .into();
-    assert!(!app.sidebar_section_open("window"));
-    assert!(!app.sidebar_section_open("log"));
-    assert!(!app.sidebar_section_open("advanced"));
-    assert!(!app.sidebar_section_open("region"));
-    assert!(!app.sidebar_section_open("profiles"));
-    assert!(!app.sidebar_section_open("display"));
-    assert!(!app.sidebar_section_open("meditation"));
-    assert!(!app.sidebar_section_open("flight_flags"));
-    assert!(app.sidebar_section_open("unknown"));
-    app.set_sidebar_section_open("window", true);
-    assert!(app.sidebar_section_open("window"));
-    assert!(app.config.sidebar_folded.contains("trigger"));
-    app.set_sidebar_section_open("trigger", true);
-    assert!(!app.config.sidebar_folded.contains("trigger"));
-
-    // 全折叠时侧栏仍能正常渲染。
-    let ctx = app.ctx.clone();
-    let mut frame = eframe::Frame::_new_kittest();
-    let mut output = ctx.run_ui(
-        egui::RawInput {
-            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1120.0, 800.0))),
-            ..Default::default()
-        },
-        |ui| app.ui(ui, &mut frame),
-    );
-    assert!(!output.shapes.is_empty());
-    output.textures_delta.clear();
-}
-
-#[test]
 fn generic_task_panel_follows_config() {
     let mut app = app();
     assert!(app.task_active("抓鬼"), "抓鬼默认开启");
@@ -2143,7 +2149,7 @@ fn long_window_titles_do_not_push_sidebar_controls_out_of_the_card() {
 
     let mut app = app();
     // 游戏窗口设置页在主区，选到该页再检查控件不被长标题挤出去。
-    app.sidebar_tab = "游戏窗口";
+    app.sidebar_tab = Page::GameWindow;
     let ctx = app.ctx.clone();
     let mut frame = eframe::Frame::_new_kittest();
     app.config.sidebar_expanded = true;
@@ -2311,7 +2317,7 @@ fn rows_debug_preview_shows_projection_rows() {
     let mut app = app();
     // 两行「方块字」，行间留足空隙，确保投影能切开。
     let panel = two_line_panel();
-    app.sidebar_tab = "行分割调试";
+    app.sidebar_tab = Page::RowsDebug;
     app.set_rows_debug_panel(panel);
     let layout = app.rows_debug_layout.clone().expect("应算出分行结果");
     assert_eq!(layout.rows.len(), 2, "两行应切成两条带：{layout:?}");
@@ -2598,9 +2604,9 @@ fn menu_bar_exposes_rows_debug_entry() {
 #[test]
 fn open_rows_debug_switches_page_and_explains_missing_window() {
     let mut app = app();
-    assert_ne!(app.sidebar_tab, "行分割调试");
+    assert_ne!(app.sidebar_tab, Page::RowsDebug);
     app.open_rows_debug();
-    assert_eq!(app.sidebar_tab, "行分割调试");
+    assert_eq!(app.sidebar_tab, Page::RowsDebug);
     assert!(
         app.rows_debug_message
             .as_deref()

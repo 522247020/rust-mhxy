@@ -14,6 +14,7 @@ use crate::ocr::{self, LocalWorker, OcrEvent, OcrText};
 use crate::theme;
 use crate::update::UpdateInfo;
 use egui::{pos2, vec2, Align2, Color32, CornerRadius, FontId, Rect, Sense, TextureHandle, Vec2};
+use page::Page;
 #[cfg(test)]
 use region::sample_image;
 use std::collections::{HashMap, HashSet};
@@ -26,9 +27,11 @@ use std::time::{Duration, Instant};
 
 mod borderless;
 mod flight;
+mod hotkey_slot;
 mod keymap;
 mod map_window;
 mod meditation;
+mod page;
 mod region;
 mod rows_debug;
 mod shell;
@@ -43,12 +46,11 @@ const TASK_ORDER: [&str; 3] = ["抓鬼", "鬼王", "通用"];
 /// 每次注册全局快捷键都换一个 id：旧监听线程还在退出时，
 /// 复用同一个 id 会撞上「热键已被注册」，导致新快捷键要等重试才生效。
 static NEXT_HOTKEY_ID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(100);
-/// 快捷键文本变化后的注册节流，避免输入过程中每个字符注册一次。
-const HOTKEY_CHANGE_DELAY: Duration = Duration::from_millis(500);
-/// 注册失败后的重试间隔。
-const HOTKEY_RETRY_DELAY: Duration = Duration::from_secs(5);
 /// 打坐悬浮窗胶囊的最小尺寸。
 const NEARBY_RADIUS: f32 = 50.0;
+/// 「识别区域」预览纹理的最小刷新间隔：整窗转 RGBA + 上传都在 UI 线程，
+/// 按 OCR 频率刷新没有意义（取点看的是大致画面）。
+const PREVIEW_MIN_INTERVAL: Duration = Duration::from_millis(500);
 /// 侧栏展开 / 收起时的最小窗口尺寸。
 const MIN_WINDOW_SIZE_EXPANDED: Vec2 = Vec2::new(760.0, 540.0);
 const MIN_WINDOW_SIZE_COLLAPSED: Vec2 = Vec2::new(460.0, 460.0);
@@ -137,6 +139,8 @@ pub struct MhxyApp {
     help_textures: HashMap<&'static str, TextureHandle>,
     preview_image: Option<image::RgbImage>,
     preview_texture: Option<TextureHandle>,
+    /// 上次把预览图转纹理的时间（节流用）。
+    preview_synced_at: Option<Instant>,
     /// 行分割调试窗口：开关、最近一帧面板、分行结果和缩略图纹理。
     rows_debug_panel: Option<image::RgbImage>,
     rows_debug_layout: Option<crate::text_layout::RowLayout>,
@@ -226,8 +230,8 @@ pub struct MhxyApp {
     pending_manual_trigger: bool,
     /// 精简模式：只留地图，隐藏顶部按钮栏、状态栏和侧栏；按 Esc 退出。
     compact: bool,
-    /// 设置栏当前选中的页签（侧栏纵向导轨的一页，只在本次运行内有效，不落盘）。
-    sidebar_tab: &'static str,
+    /// 设置栏当前选中的页签（侧栏纵向导航的一页，只在本次运行内有效，不落盘）。
+    sidebar_tab: Page,
     /// 进入精简模式后的提示（按 Esc 退出），到点自动消失。
     compact_hint_until: Option<Instant>,
     /// 当前实际应用的亮色 / 暗色，用于跟随系统主题时即时切换。
@@ -262,11 +266,15 @@ pub struct MhxyApp {
     /// 合成旗点位单独保存在用户本地目录，不进入主配置和更新包。
     flight_flags: FlightFlags,
     flight_flags_path: PathBuf,
-    /// 地图浮窗设置内容（每个任务的开关 + 不透明度 / 宽度 / 置顶 / 锁定），嵌入任务地图页占位下方。
-    /// 日志落盘路径（日志页里展示）。
-    log_path: PathBuf,
+    /// 日志落盘（常驻句柄，日志页里展示路径）。
+    log_file: LogFile,
     /// 内存里的实时日志（最近行）：日志页直接显示，不用开文件。
     log_lines: std::collections::VecDeque<String>,
+    /// 日志页缓存的拼接文本，以及它对应的日志版本；日志没变就不重建。
+    log_page_text: String,
+    log_page_revision: u64,
+    /// 每追加一行日志 +1，日志页据此判断缓存是否过期。
+    log_revision: u64,
     flight_map_edit: String,
     flight_flag_index: usize,
     flight_flag_name_edit: String,
@@ -286,29 +294,95 @@ fn default_log_path(config_path: &std::path::Path) -> PathBuf {
     dir.join("rust-mhxy.log")
 }
 
-/// 追加一行日志；文件超过 2MB 时轮转成 `.1`，避免无限增长。
-fn append_log(path: &std::path::Path, line: &str) {
+/// 日志落盘：常驻一个追加句柄。
+///
+/// 以前每写一行都要「建目录 + 查文件大小 + 打开 + 写入」四次系统调用，还全在 UI 线程；
+/// 现在只在首次打开时做一次，之后每行只剩一次 write（轮转靠累计字节数判断）。
+struct LogFile {
+    path: PathBuf,
+    writer: Option<std::io::BufWriter<std::fs::File>>,
+    /// 当前文件已写入的字节数（含打开时已有的内容）。
+    bytes: u64,
+}
+
+impl LogFile {
+    /// 单个日志文件的上限：超过后轮转成 `.log.1`，避免无限增长。
     const MAX_BYTES: u64 = 2 * 1024 * 1024;
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if std::fs::metadata(path)
-        .map(|meta| meta.len() > MAX_BYTES)
-        .unwrap_or(false)
-    {
-        let rotated = path.with_extension("log.1");
-        let _ = std::fs::rename(path, rotated);
-    }
-    match std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
-        Ok(mut file) => {
-            use std::io::Write;
-            let _ = file.write_all(line.as_bytes());
+
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            writer: None,
+            bytes: 0,
         }
-        Err(err) => eprintln!("写入日志失败（{}）：{err}", path.display()),
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    /// 追加一行（自动补换行）。写失败就丢掉句柄，下一行重新打开。
+    fn write_line(&mut self, line: &str) {
+        use std::io::Write;
+        if self.writer.is_none() {
+            self.open();
+        }
+        let Some(writer) = self.writer.as_mut() else {
+            return;
+        };
+        if writer.write_all(line.as_bytes()).is_err() || writer.write_all(b"\n").is_err() {
+            self.writer = None;
+            return;
+        }
+        // 立刻 flush：日志是用户和售后要 tail 的，压在缓冲区里会「看着没输出」。
+        let _ = writer.flush();
+        self.bytes += line.len() as u64 + 1;
+        if self.bytes > Self::MAX_BYTES {
+            self.rotate();
+        }
+    }
+
+    fn open(&mut self) {
+        if let Some(parent) = self
+            .path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let existing = std::fs::metadata(&self.path)
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+        if existing > Self::MAX_BYTES {
+            self.rotate_files();
+        }
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+        {
+            Ok(file) => {
+                self.bytes = std::fs::metadata(&self.path)
+                    .map(|meta| meta.len())
+                    .unwrap_or(0);
+                self.writer = Some(std::io::BufWriter::new(file));
+            }
+            Err(err) => eprintln!("写入日志失败（{}）：{err}", self.path.display()),
+        }
+    }
+
+    fn rotate(&mut self) {
+        // 先放掉句柄：Windows 上文件还开着时改名会失败。
+        self.writer = None;
+        self.rotate_files();
+        self.open();
+    }
+
+    fn rotate_files(&mut self) {
+        let rotated = self.path.with_extension("log.1");
+        // std 在 Windows 上用 MoveFileExW(MOVEFILE_REPLACE_EXISTING)，覆盖旧备份没问题。
+        let _ = std::fs::rename(&self.path, rotated);
+        self.bytes = 0;
     }
 }
 
@@ -319,8 +393,13 @@ fn next_hotkey_id() -> i32 {
 impl MhxyApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let config_path = crate::config::default_config_path();
-        let config = Config::load(&config_path);
+        let (config, config_error) = Config::load_checked(&config_path);
         let mut app = Self::from_config(config, config_path, cc.egui_ctx.clone());
+        // 配置没读成功时必须让用户看到：否则他改的设置会把原文件覆盖掉，还以为是程序丢了配置。
+        if let Some(err) = config_error {
+            app.log(err.clone());
+            app.notice = Some(err);
+        }
         app.refresh_windows(true);
         app
     }
@@ -396,6 +475,7 @@ impl MhxyApp {
             help_textures: HashMap::new(),
             preview_image: None,
             preview_texture: None,
+            preview_synced_at: None,
             rows_debug_panel: None,
             rows_debug_layout: None,
             rows_debug_row_texts: Vec::new(),
@@ -448,7 +528,7 @@ impl MhxyApp {
             last_manual_trigger: None,
             pending_manual_trigger: false,
             compact: false,
-            sidebar_tab: "任务地图",
+            sidebar_tab: Page::default(),
             compact_hint_until: None,
             applied_light: None,
             meditation: MeditationTimer::new(meditation_duration),
@@ -470,8 +550,11 @@ impl MhxyApp {
             meditation_recording_hotkey: false,
             flight_flags,
             flight_flags_path,
-            log_path,
+            log_file: LogFile::new(log_path),
             log_lines: std::collections::VecDeque::new(),
+            log_page_text: String::new(),
+            log_page_revision: 0,
+            log_revision: 0,
             flight_map_edit: SUPPORTED_MAPS[0].to_string(),
             flight_flag_index: 0,
             flight_flag_name_edit: String::new(),
@@ -483,35 +566,6 @@ impl MhxyApp {
             app.log(err);
         }
         app
-    }
-
-    /// 侧栏折叠状态（按 id 存 config.sidebar_folded 逗号串）：折叠区都已改为独立页面，生产路径不再调用，仅测试用。
-    #[cfg(test)]
-    fn sidebar_section_open(&self, id: &str) -> bool {
-        !self
-            .config
-            .sidebar_folded
-            .split(',')
-            .any(|item| item.trim() == id)
-    }
-
-    #[cfg(test)]
-    fn set_sidebar_section_open(&mut self, id: &str, open: bool) {
-        let mut folded: Vec<String> = self
-            .config
-            .sidebar_folded
-            .split(',')
-            .map(str::trim)
-            .filter(|item| !item.is_empty())
-            .map(str::to_string)
-            .collect();
-        if open {
-            folded.retain(|item| item != id);
-        } else if !folded.iter().any(|item| item == id) {
-            folded.push(id.to_string());
-        }
-        self.config.sidebar_folded = folded.join(",");
-        self.persist();
     }
 
     fn persist(&mut self) {
@@ -598,13 +652,31 @@ impl MhxyApp {
         }
     }
 
-    /// 记录客户区尺寸；仅在打开识别区域窗口时才保留整张截图，避免常驻内存。
-    fn update_preview(&mut self, image: image::RgbImage) {
+    /// 记录客户区尺寸；只有打「识别区域」页时才保留整窗截图。
+    ///
+    /// 预览要先把整窗 RGB 转成 RGBA 再整张上传纹理，全部在 UI 线程；
+    /// 按 OCR 频率（实时模式最快 10 轮/秒）刷纯属浪费，所以单独做了刷新节流。
+    fn update_preview(&mut self, image: Option<image::RgbImage>) {
+        // 平时只截任务栏那两块，没有整窗图，客户区尺寸已经由 `trigger_scan` 记好。
+        let Some(image) = image else {
+            return;
+        };
         self.client_size = Some(image.dimensions());
-        if self.sidebar_tab != "识别区域" {
+        if self.sidebar_tab != Page::Region {
             return;
         }
-        let color = to_color_image(&image);
+        self.preview_image = Some(image);
+        if self
+            .preview_synced_at
+            .is_some_and(|at| at.elapsed() < PREVIEW_MIN_INTERVAL)
+        {
+            return;
+        }
+        self.preview_synced_at = Some(Instant::now());
+        let Some(image) = self.preview_image.as_ref() else {
+            return;
+        };
+        let color = to_color_image(image);
         if let Some(texture) = &mut self.preview_texture {
             texture.set(color, egui::TextureOptions::LINEAR);
         } else {
@@ -614,13 +686,13 @@ impl MhxyApp {
                 egui::TextureOptions::LINEAR,
             ));
         }
-        self.preview_image = Some(image);
     }
 
     /// 关闭取点工具后释放截图和纹理。
     fn release_preview(&mut self) {
         self.preview_image = None;
         self.preview_texture = None;
+        self.preview_synced_at = None;
     }
 
     fn set_on_top(&mut self, on: bool, ctx: &egui::Context) {
@@ -830,61 +902,44 @@ impl MhxyApp {
         // 只要在运行就注册（自动模式下手动按一下也会立即识别一次），
         // 不再依赖「手动模式」开关，避免切模式后忘记重新注册。
         let desired = if self.running {
-            Hotkey::parse(&self.config.ocr_hotkey)
-                .ok()
-                .map(|hotkey| (hotkey, hotkey.display()))
+            Hotkey::parse(&self.config.ocr_hotkey).ok()
         } else {
             None
         };
-        let desired_label = desired.as_ref().map(|(_, label)| label.clone());
-        let changed = desired_label != self.hotkey_attempted;
-        if !changed {
-            // 监听线程意外退出时，系统已经把热键注销了，但界面还写着「已注册」。
-            // 这里主动发现并重新注册，否则就会一直「提示已注册、按键没反应」。
-            if self.hotkey_listener.as_ref().is_some_and(|l| l.is_alive()) {
-                return;
-            }
-            if self.hotkey_listener.is_some() {
-                self.log_detail("全局快捷键监听线程已退出，重新注册");
-                self.hotkey_listener = None;
-                self.hotkey_error = None;
-            } else if !self.running {
-                return;
-            }
+        let label = desired.as_ref().map(|hotkey| hotkey.display());
+        let log_label = label.clone();
+        let sender = self.hotkey_tx.clone();
+        let outcome = hotkey_slot::sync(
+            &mut self.hotkey_listener,
+            &mut self.hotkey_attempted,
+            &mut self.hotkey_error,
+            &mut self.hotkey_tried_at,
+            label,
+            || {
+                let hotkey = desired.ok_or_else(|| "没有可注册的快捷键".to_string())?;
+                hotkey::spawn(hotkey, next_hotkey_id(), sender)
+            },
+        );
+        if outcome == hotkey_slot::Synced::Restarted {
+            self.log_detail("全局快捷键监听线程已退出，重新注册");
         }
-        // 输入过程中每 500ms 才注册一次；注册失败或线程退出则每 5 秒重试。
-        let delay = if changed {
-            HOTKEY_CHANGE_DELAY
-        } else {
-            HOTKEY_RETRY_DELAY
-        };
-        if self.hotkey_tried_at.is_some_and(|at| at.elapsed() < delay) {
-            return;
-        }
-        self.hotkey_attempted = desired_label;
-        self.hotkey_tried_at = Some(Instant::now());
-        self.hotkey_listener = None;
-        let Some((hotkey, label)) = desired else {
-            self.hotkey_error = None;
-            return;
-        };
-        match hotkey::spawn(hotkey, next_hotkey_id(), self.hotkey_tx.clone()) {
-            Ok(listener) => {
-                match &listener.warning {
+        match outcome {
+            hotkey_slot::Synced::Registered | hotkey_slot::Synced::Restarted => {
+                match self
+                    .hotkey_listener
+                    .as_ref()
+                    .and_then(|listener| listener.warning.as_deref())
+                {
                     Some(warn) => self.log_detail(format!("快捷键提示：{warn}")),
-                    None => self.log_detail(format!("已注册全局快捷键：{label}")),
+                    None => self.log_detail(format!(
+                        "已注册全局快捷键：{}",
+                        log_label.as_deref().unwrap_or("")
+                    )),
                 }
-                self.hotkey_listener = Some(listener);
-                self.hotkey_error = None;
             }
-            Err(err) => {
-                self.hotkey_listener = None;
-                // 同一个错误只记一次，避免每 5 秒刷屏。
-                if self.hotkey_error.as_deref() != Some(err.as_str()) {
-                    self.log(err.clone());
-                }
-                self.hotkey_error = Some(err);
-            }
+            // 同一个错误只记一次，避免每 5 秒刷屏。
+            hotkey_slot::Synced::Failed { first: true, error } => self.log(error),
+            _ => {}
         }
     }
 
@@ -946,12 +1001,17 @@ impl MhxyApp {
             .unwrap_or_else(|| format!("#{handle}"));
         self.last_scan = Some(Instant::now());
         // 分辨率变了就切换识别区域（每个分辨率记住一套）。
-        self.sync_region_for_size(capture::client_size(handle));
+        let client_size = capture::client_size(handle);
+        self.sync_region_for_size(client_size);
+        self.client_size = client_size.or(self.client_size);
         // 截图 / 裁剪 / 预处理 / 放大都很耗 CPU（调试构建尤其明显），
         // 放到后台线程做，避免每次识别都把 UI 卡住一下，拖窗口时特别明显。
         let region = self.config.task_region;
         let extra_region = self.config.extra_task_region;
         let extra_enabled = self.config.extra_region_enabled;
+        // 整窗截图只在「识别区域」页要预览时才值得做；平时直接截任务栏那两块，
+        // 少搬十几倍像素（1600×900 整窗 ≈ 20 MB 内存流量，任务栏面板只有 0.6 MB）。
+        let want_full = self.sidebar_tab == Page::Region;
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
         self.pending_signature = None;
@@ -961,15 +1021,24 @@ impl MhxyApp {
         let title = window_title.clone();
         thread::spawn(move || {
             let result = (|| -> Result<ocr::Captured, String> {
-                let full = capture::capture_client(handle, region)?;
-                // 主区域和备用区域各裁一块，上下拼成一张面板。不做预处理也不放大：
+                // 主区域和备用区域各截一块，上下拼成一张面板。不做预处理也不放大：
                 // 分行用原生分辨率做投影，识别模型自己会把行高归一化到 48；
                 // 只有回退检测模型时才在识别线程里放大。
-                let mut panels = vec![capture::crop_task_region(&full, region)];
-                if extra_enabled {
-                    panels.push(capture::crop_task_region(&full, extra_region));
-                }
-                let panel = capture::stack_images(&panels);
+                let (full, panel) = if want_full {
+                    let full = capture::capture_client(handle, region)?;
+                    let mut panels = vec![capture::crop_task_region(&full, region)];
+                    if extra_enabled {
+                        panels.push(capture::crop_task_region(&full, extra_region));
+                    }
+                    let panel = capture::stack_images(&panels);
+                    (Some(full), panel)
+                } else {
+                    let mut panels = vec![capture::capture_region(handle, region)?];
+                    if extra_enabled {
+                        panels.push(capture::capture_region(handle, extra_region)?);
+                    }
+                    (None, capture::stack_images(&panels))
+                };
                 let signature = hash_image(&panel);
                 Ok(ocr::Captured {
                     full,
@@ -1056,7 +1125,7 @@ impl MhxyApp {
                             }
                             self.pending_signature = Some(captured.signature);
                             // 调试窗口开着就跟着最新面板刷新，不用每次手点。
-                            if self.sidebar_tab == "行分割调试" {
+                            if self.sidebar_tab == Page::RowsDebug {
                                 self.set_rows_debug_panel(captured.panel.clone());
                             }
                             self.start_ocr(generation, captured.panel, &window_title);

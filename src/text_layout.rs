@@ -15,7 +15,7 @@
 //! # 算法步骤
 //!
 //! 1. [`binary`]：按通道最大值做 Otsu，结合边框亮度判断极性，输出黑字白底；
-//! 2. [`components`]：4-连通域标记，按面积过滤单像素噪点；
+//! 2. 8-连通域标记（`label_components`），按面积过滤单像素噪点；
 //! 3. 逐行统计保留连通域的墨迹数，得到水平投影；
 //! 4. 用 `ink_ratio * 最大投影` 作阈值，切出原始带；
 //! 5. 用原始带高度中位数（MAD 剔除离群值）估计行高先验 `h0`；
@@ -43,9 +43,6 @@
 //!   本模块用横向条带合并来修复，但两行恰好都是同样的横条时无法区分。
 //! - 倾斜文字、粗描边、极淡的抗锯齿灰边会让行带变胖，`h0` 偏大时可能少切行。
 //! - 装饰线很粗或很短时可能被当成一行标点保留下来。
-
-// 这个模块的公开 API 会在后续步骤逐步接线；中间状态不要因为 dead_code 报警。
-#![allow(dead_code)]
 
 use image::{GrayImage, Luma, Rgb, RgbImage};
 
@@ -88,51 +85,6 @@ pub fn binary(image: &RgbImage) -> GrayImage {
         };
         Luma([if ink { 0 } else { 255 }])
     })
-}
-
-/// 局部对比度二值化：积分图求窗口均值，和均值差超过 `bias` 的像素算墨迹。
-///
-/// 全局 Otsu 遇到花纹背景（纹理、半透明底图）会把背景也当文字；局部均值只保留
-/// 「细、和周围反差大」的笔画。输出同样是黑字白底。`radius` 是窗口半径（像素），
-/// `bias` 是灰度差阈值；背景很花时调用方可以传较大的 `bias`。
-///
-/// 这个函数不参与 [`rows`] 的默认路径，由调用方在全局二值化效果差时替换使用。
-pub fn adaptive_binary(image: &RgbImage, radius: u32, bias: u8) -> GrayImage {
-    let gray = channel_max(image);
-    let (width, height) = (gray.width() as usize, gray.height() as usize);
-    if width == 0 || height == 0 {
-        return gray;
-    }
-    // 积分图，多一行一列哨兵，方便窗口求和。
-    let stride = width + 1;
-    let mut integral = vec![0u64; stride * (height + 1)];
-    for y in 0..height {
-        let mut row_sum = 0u64;
-        for x in 0..width {
-            row_sum += gray.get_pixel(x as u32, y as u32)[0] as u64;
-            integral[(y + 1) * stride + (x + 1)] = integral[y * stride + (x + 1)] + row_sum;
-        }
-    }
-    let radius = radius.max(1) as i64;
-    let bias = bias as i64;
-    let mut out = GrayImage::new(width as u32, height as u32);
-    for y in 0..height {
-        for x in 0..width {
-            let x0 = (x as i64 - radius).max(0) as usize;
-            let y0 = (y as i64 - radius).max(0) as usize;
-            let x1 = ((x as i64 + radius + 1) as usize).min(width);
-            let y1 = ((y as i64 + radius + 1) as usize).min(height);
-            let area = ((x1 - x0) * (y1 - y0)).max(1) as u64;
-            let sum = integral[y1 * stride + x1] + integral[y0 * stride + x0]
-                - integral[y0 * stride + x1]
-                - integral[y1 * stride + x0];
-            let mean = (sum / area) as i64;
-            let value = gray.get_pixel(x as u32, y as u32)[0] as i64;
-            let ink = (value - mean).abs() > bias;
-            out.put_pixel(x as u32, y as u32, Luma([if ink { 0 } else { 255 }]));
-        }
-    }
-    out
 }
 
 /// 取每个像素 R/G/B 的最大值，得到一张单通道亮度图。
@@ -232,21 +184,6 @@ impl Rect {
     }
 }
 
-/// 4-连通域标记，按面积过滤，返回包围盒（按 x0 升序）。
-///
-/// 只把灰度 `< 128` 的像素当墨迹，所以 [`binary`] / [`adaptive_binary`] 的输出
-/// 可以直接喂进来。面积小于 `min_area` 的连通域（单像素噪点、抗锯齿灰边）丢弃。
-pub fn components(gray: &GrayImage, min_area: u32) -> Vec<Rect> {
-    let (_, blobs) = label_components(gray, false);
-    let mut rects: Vec<Rect> = blobs
-        .into_iter()
-        .filter(|blob| blob.area >= min_area.max(1))
-        .map(|blob| blob.rect)
-        .collect();
-    rects.sort_by_key(|rect| (rect.x0, rect.y0));
-    rects
-}
-
 /// 一个连通域的几何信息，行投影和聚类都复用它。
 #[derive(Clone, Copy, Debug)]
 struct Blob {
@@ -264,8 +201,7 @@ impl Blob {
 
 /// 给二值图的墨迹像素打标签；返回 `(标签图, 连通域列表)`，标签 0 表示背景。
 /// `diagonal = true` 时用 8-连通，供内部行聚类使用：点阵字的斜角笔画在 4-连通下
-/// 会碎成很多小段，用它们估行高/聚类会把一行拆散；公开的 [`components`] 仍按
-/// 需求保持 4-连通。
+/// 会碎成很多小段，用它们估行高/聚类会把一行拆散。
 fn label_components(gray: &GrayImage, diagonal: bool) -> (Vec<u32>, Vec<Blob>) {
     let (width, height) = (gray.width(), gray.height());
     let mut labels = vec![0u32; width as usize * height as usize];
@@ -1455,27 +1391,6 @@ fn stretch_percentile(gray: &GrayImage) -> GrayImage {
         let scaled = ((value - low as i32) * 255 / span).clamp(0, 255) as u8;
         Luma([scaled])
     })
-}
-
-/// 全图中位数亮度（直方图累计到一半）。
-fn image_median(gray: &GrayImage) -> u8 {
-    let total = gray.width() as u64 * gray.height() as u64;
-    if total == 0 {
-        return 0;
-    }
-    let mut histogram = [0u32; 256];
-    for pixel in gray.pixels() {
-        histogram[pixel[0] as usize] += 1;
-    }
-    let target = total / 2;
-    let mut cumulative = 0u64;
-    for (value, count) in histogram.iter().enumerate() {
-        cumulative += *count as u64;
-        if cumulative > target {
-            return value as u8;
-        }
-    }
-    255
 }
 
 // ---------------------------------------------------------------- 长行分块

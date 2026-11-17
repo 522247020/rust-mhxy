@@ -429,7 +429,9 @@ impl MhxyApp {
             .unwrap_or_else(|| format!("#{handle}"));
         match capture::capture_task_panel(handle, self.config.task_region, extra) {
             Ok((_panel, full)) => {
-                self.update_preview(full);
+                // 手动截图要立刻看到新画面，跳过节流。
+                self.preview_synced_at = None;
+                self.update_preview(Some(full));
                 self.notice = None;
                 self.log_detail(format!("手动截取截图：{title}"));
                 // 立即刷新一次图色门控状态，方便在取点工具里看命中情况。

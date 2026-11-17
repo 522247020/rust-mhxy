@@ -19,7 +19,7 @@ const MAX_ROW_THUMBS: usize = 64;
 impl MhxyApp {
     /// 打开调试页并先抓一帧，避免空白。
     pub(super) fn open_rows_debug(&mut self) {
-        self.sidebar_tab = "行分割调试";
+        self.sidebar_tab = Page::RowsDebug;
         self.refresh_rows_debug();
     }
 

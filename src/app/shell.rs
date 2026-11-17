@@ -2,7 +2,7 @@
 use super::*;
 
 impl MhxyApp {
-    /// 「地图浮窗设置」窗口的内容：每个任务一行开关 + 宽度，下面是全局参数。
+    /// 任务地图页里的浮窗设置卡：每个任务一行开关 + 宽度，下面是全局参数。
     pub(super) fn map_window_settings_controls(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.heading("地图浮窗");
@@ -312,7 +312,12 @@ impl eframe::App for MhxyApp {
         if self.config.meditation_enabled {
             self.meditation.tick();
             if self.meditation.state() == MeditationState::Running {
-                ctx.request_repaint_after(Duration::from_millis(100));
+                // 悬浮窗只显示到秒（向上取整），对齐到下一个整秒重绘就够；
+                // 以前固定 100ms 一次，等于为一个文本时钟空转 10fps。
+                let remaining = self.meditation.remaining();
+                ctx.request_repaint_after(Duration::from_millis(
+                    u64::from(remaining.subsec_millis()) + 20,
+                ));
             }
             if self
                 .meditation
@@ -378,7 +383,7 @@ impl eframe::App for MhxyApp {
             self.refresh_windows(false);
             self.last_window_refresh = Instant::now();
         }
-        if (self.sidebar_tab == "识别区域" || (self.running && !self.manual_mode()))
+        if (self.sidebar_tab == Page::Region || (self.running && !self.manual_mode()))
             && self.config.color_gate_enabled
         {
             let gate_interval =
@@ -682,11 +687,11 @@ impl eframe::App for MhxyApp {
 
                 // 主区页（顺序即优先级）：说明 / 打坐计时 / 识别区域 / 合成旗编辑器 / 行分割调试 / 识别方式 / 方案管理
                 match self.sidebar_tab {
-                    "识别区域" => {
+                    Page::Region => {
                         self.region_page_ui(ui);
                         return;
                     }
-                    "按键映射" => {
+                    Page::Keymap => {
                         egui::ScrollArea::vertical()
                             .id_salt("keymap_page")
                             .show(ui, |ui| {
@@ -695,7 +700,7 @@ impl eframe::App for MhxyApp {
                             });
                         return;
                     }
-                    "合成旗编辑器" => {
+                    Page::FlightFlags => {
                         egui::ScrollArea::vertical()
                             .id_salt("flight_flags_page")
                             .show(ui, |ui| {
@@ -704,7 +709,7 @@ impl eframe::App for MhxyApp {
                             });
                         return;
                     }
-                    "行分割调试" => {
+                    Page::RowsDebug => {
                         egui::ScrollArea::vertical()
                             .id_salt("rows_debug_page")
                             .show(ui, |ui| {
@@ -713,7 +718,7 @@ impl eframe::App for MhxyApp {
                             });
                         return;
                     }
-                    "识别方式" => {
+                    Page::OcrMode => {
                         egui::ScrollArea::vertical()
                             .id_salt("mode_page")
                             .show(ui, |ui| {
@@ -722,7 +727,7 @@ impl eframe::App for MhxyApp {
                             });
                         return;
                     }
-                    "方案管理" => {
+                    Page::Profiles => {
                         egui::ScrollArea::vertical()
                             .id_salt("profiles_page")
                             .show(ui, |ui| {
@@ -731,7 +736,7 @@ impl eframe::App for MhxyApp {
                             });
                         return;
                     }
-                    "日志" => {
+                    Page::Log => {
                         egui::ScrollArea::vertical()
                             .id_salt("log_page")
                             .show(ui, |ui| {
@@ -740,10 +745,17 @@ impl eframe::App for MhxyApp {
                             });
                         return;
                     }
-                    _ => {}
+                    // 其余页签走下面的通用编排（设置页 / 说明 / 打坐 / 任务地图）。
+                    Page::TaskMap
+                    | Page::GameWindow
+                    | Page::Mode
+                    | Page::TaskType
+                    | Page::Display
+                    | Page::Meditation
+                    | Page::Help => {}
                 }
 
-                if self.config.map_window_enabled && self.sidebar_tab == "任务地图" {
+                if self.config.map_window_enabled && self.sidebar_tab == Page::TaskMap {
                     // 地图已经弹到独立浮窗：任务地图页就地给出说明 + 浮窗设置卡，
                     // 不再顶栏多一个菜单项。只在任务地图页出，其他页照常走。
                     egui::ScrollArea::vertical()
@@ -760,21 +772,21 @@ impl eframe::App for MhxyApp {
                         });
                     return;
                 }
-                if self.sidebar_tab == "说明" {
+                if self.sidebar_tab == Page::Help {
                     egui::ScrollArea::vertical()
                         .id_salt("help_page")
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width().min(640.0));
                             self.help_page_ui(ui);
                         });
-                } else if self.sidebar_tab == "打坐计时" {
+                } else if self.sidebar_tab == Page::Meditation {
                     egui::ScrollArea::vertical()
                         .id_salt("meditation_page")
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width().min(640.0));
                             self.meditation_page_ui(ui);
                         });
-                } else if self.sidebar_tab == "任务地图" {
+                } else if self.sidebar_tab == Page::TaskMap {
                     self.task_area(ui, 255, true);
                 } else {
                     // 设置页：主区滚动，内宽封顶 640，不让控件拉得太松也不能捅出窗口。
@@ -835,7 +847,7 @@ impl eframe::App for MhxyApp {
                 },
             );
         }
-        if self.sidebar_tab != "识别区域" {
+        if self.sidebar_tab != Page::Region {
             self.release_preview();
         }
         if self.config.meditation_enabled {

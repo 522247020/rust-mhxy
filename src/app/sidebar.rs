@@ -23,7 +23,9 @@ impl MhxyApp {
             self.log_lines.pop_front();
         }
         self.log_lines.push_back(line.clone());
-        append_log(&self.log_path, &format!("{line}\n"));
+        self.log_revision = self.log_revision.wrapping_add(1);
+        // 落盘只用常驻句柄追加一行；内存里这份留给日志页和「复制日志」。
+        self.log_file.write_line(&line);
     }
     pub(super) fn profile_dirty(&self) -> bool {
         let current = Config::profile_from_current(&self.config);
@@ -218,20 +220,12 @@ impl MhxyApp {
                 ui.spacing_mut().item_spacing.y = 2.0;
                 // 页面：切换主区看什么。
                 theme::section_label(ui, "页面");
-                for tab in [
-                    "任务地图",
-                    "游戏窗口",
-                    "识别区域",
-                    "识别模式",
-                    "任务类型",
-                    "显示与布局",
-                    "按键映射",
-                    "打坐计时",
-                    "说明",
-                ] {
-                    let active = self.sidebar_tab == tab;
+                for page in page::PAGES {
+                    let active = self.sidebar_tab == *page;
                     // 未选中：纯文本行；选中：浅灰高亮（Win11 导航风），文字保持正色。
-                    let label = egui::RichText::new(tab).size(14.0).color(theme::text());
+                    let label = egui::RichText::new(page.label())
+                        .size(14.0)
+                        .color(theme::text());
                     let button = egui::Button::new(label).wrap_mode(egui::TextWrapMode::Extend);
                     let button = if active {
                         button.fill(theme::inset())
@@ -239,10 +233,9 @@ impl MhxyApp {
                         button.fill(Color32::TRANSPARENT)
                     };
                     if ui.add_sized([ui.available_width(), 34.0], button).clicked() {
-                        self.sidebar_tab = tab;
+                        self.sidebar_tab = *page;
                     }
                 }
-                theme::divider(ui);
                 theme::divider(ui);
                 // 显示：界面模式和主题。
                 theme::section_label(ui, "显示");
@@ -259,7 +252,7 @@ impl MhxyApp {
                     } else {
                         self.apply_map_window_display();
                         // 打开后直接落到任务地图页：浮窗参数就地在占位说明下方，不另开页面。
-                        self.sidebar_tab = "任务地图";
+                        self.sidebar_tab = Page::TaskMap;
                     }
                 }
                 if Self::menu_toggle(
@@ -304,14 +297,14 @@ impl MhxyApp {
                     self.apply_compact_display();
                 }
                 theme::divider(ui);
-                theme::divider(ui);
                 // 高级设置：单独一个分组在侧边，合成旗编辑器 / 识别方式 / 方案管理 /
                 // 行分割调试 / 日志都放里面。
                 theme::section_label(ui, "高级设置");
-                for tab in ["合成旗编辑器", "识别方式", "方案管理", "行分割调试", "日志"]
-                {
-                    let active = self.sidebar_tab == tab;
-                    let label = egui::RichText::new(tab).size(14.0).color(theme::text());
+                for page in page::ADVANCED {
+                    let active = self.sidebar_tab == *page;
+                    let label = egui::RichText::new(page.label())
+                        .size(14.0)
+                        .color(theme::text());
                     let button = egui::Button::new(label).wrap_mode(egui::TextWrapMode::Extend);
                     let button = if active {
                         button.fill(theme::inset())
@@ -319,7 +312,7 @@ impl MhxyApp {
                         button.fill(Color32::TRANSPARENT)
                     };
                     if ui.add_sized([ui.available_width(), 34.0], button).clicked() {
-                        self.sidebar_tab = tab;
+                        self.sidebar_tab = *page;
                     }
                 }
             });
@@ -422,288 +415,271 @@ impl MhxyApp {
             });
         // 页标题：Win11 设置风，20 号粗体 + 图标。
         ui.horizontal(|ui| {
-            let glyph = match self.sidebar_tab {
-                "任务地图" => "\u{E816}",
-                "游戏窗口" => "\u{E7B8}",
-                "识别模式" => "\u{E721}",
-                "任务类型" => "\u{E716}",
-                "显示与布局" => "\u{E740}",
-                "按键映射" => "\u{E765}",
-                "打坐计时" => "\u{E823}",
-                "识别方式" => "\u{E174}",
-                "方案管理" => "\u{E8F1}",
-                "日志" => "\u{E8B4}",
-                _ => "\u{E713}",
-            };
             if let Some(font) = theme::icon_font() {
-                ui.label(egui::RichText::new(glyph).font(font).color(theme::jade()));
+                ui.label(
+                    egui::RichText::new(self.sidebar_tab.glyph())
+                        .font(font)
+                        .color(theme::jade()),
+                );
             }
             ui.label(
-                egui::RichText::new(self.sidebar_tab)
+                egui::RichText::new(self.sidebar_tab.label())
                     .size(20.0)
                     .color(theme::text())
                     .strong(),
             );
         });
         theme::divider(ui);
-        // 设置页内容：一页一张白卡（Win11 控制面板分类卡）。
         // 设置页内容：Win11 设置风，一页一张白卡，卡片里是「图标+标题+说明+控件」的行。
-        if self.sidebar_tab == "游戏窗口" {
-            theme::card_with(theme::surface()).show(ui, |ui| {
-                let current = self
-                    .windows
-                    .iter()
-                    .find(|window| Some(window.handle) == self.selected_handle)
-                    .map(|window| window.title.clone())
-                    .unwrap_or_else(|| "未找到游戏窗口".into());
-                let mut selected = self.selected_handle;
-                Self::setting_row(
-                    ui,
-                    "\u{E7B8}",
-                    "游戏窗口",
-                    "选择要识别的游戏窗口",
-                    |ui| {
-                        // ComboBox::width() 只是「最小宽度」：egui 用父 Ui 的 available_width
-                        // 作为文本换行宽度，默认 Extend 模式下选中项文本多长它就有多宽。
-                        // 游戏窗口标题很长时，它会撑破卡片右缘并把「刷新」按钮挤出可视区，
-                        // 所以这里用一个限宽的子 Ui 把可用宽度钉死，并让选中项文本截断。
-                        let combo_width = (ui.available_width() - 66.0).max(100.0);
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(combo_width, ui.spacing().interact_size.y),
-                            egui::Layout::left_to_right(egui::Align::Center),
-                            |ui| {
-                                egui::ComboBox::from_id_salt("window")
-                                    .selected_text(current)
-                                    .width(combo_width)
-                                    .truncate()
-                                    .show_ui(ui, |ui| {
-                                        for window in &self.windows {
-                                            ui.selectable_value(
-                                                &mut selected,
-                                                Some(window.handle),
-                                                &window.title,
-                                            );
-                                        }
-                                    });
-                            },
-                        );
-                        if ui.button("刷新").clicked() {
-                            self.refresh_windows(true);
-                            selected = self.selected_handle;
-                        }
-                    },
-                );
-                if selected != self.selected_handle {
-                    self.set_window(selected);
-                    self.log_detail("已切换游戏窗口，清除旧任务结果");
+        // 设置页按当前页签分派：以前是 494 行的单函数里串 4 段互不相干的 if。
+        match self.sidebar_tab {
+            Page::GameWindow => self.settings_window_page(ui),
+            Page::Mode => self.settings_mode_page(ui),
+            Page::TaskType => self.settings_task_page(ui),
+            Page::Display => self.settings_display_page(ui),
+            _ => {}
+        }
+        // 浮窗参数就在任务地图页的浮窗设置卡里，设置栏底部常驻一句指路（原来在「显示与布局」页里）。
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(
+                "地图浮窗的每个任务开关、不透明度、宽度、置顶和锁定都在任务地图页下方的浮窗设置卡里（打开「地图浮窗」开关后就地出现）",
+            )
+            .small()
+            .weak(),
+        );
+    }
+
+    /// 游戏窗口页：列出游戏窗口并选中要识别的那个。
+    fn settings_window_page(&mut self, ui: &mut egui::Ui) {
+        theme::card_with(theme::surface()).show(ui, |ui| {
+            let current = self
+                .windows
+                .iter()
+                .find(|window| Some(window.handle) == self.selected_handle)
+                .map(|window| window.title.clone())
+                .unwrap_or_else(|| "未找到游戏窗口".into());
+            let mut selected = self.selected_handle;
+            Self::setting_row(
+                ui,
+                "\u{E7B8}",
+                "游戏窗口",
+                "选择要识别的游戏窗口",
+                |ui| {
+                    // ComboBox::width() 只是「最小宽度」：egui 用父 Ui 的 available_width
+                    // 作为文本换行宽度，默认 Extend 模式下选中项文本多长它就有多宽。
+                    // 游戏窗口标题很长时，它会撑破卡片右缘并把「刷新」按钮挤出可视区，
+                    // 所以这里用一个限宽的子 Ui 把可用宽度钉死，并让选中项文本截断。
+                    let combo_width = (ui.available_width() - 66.0).max(100.0);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(combo_width, ui.spacing().interact_size.y),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            egui::ComboBox::from_id_salt("window")
+                                .selected_text(current)
+                                .width(combo_width)
+                                .truncate()
+                                .show_ui(ui, |ui| {
+                                    for window in &self.windows {
+                                        ui.selectable_value(
+                                            &mut selected,
+                                            Some(window.handle),
+                                            &window.title,
+                                        );
+                                    }
+                                });
+                        },
+                    );
+                    if ui.button("刷新").clicked() {
+                        self.refresh_windows(true);
+                        selected = self.selected_handle;
+                    }
+                },
+            );
+            if selected != self.selected_handle {
+                self.set_window(selected);
+                self.log_detail("已切换游戏窗口，清除旧任务结果");
+            }
+            ui.separator();
+            Self::setting_row(
+                ui,
+                "\u{E7D8}",
+                "识别区域",
+                "调整截图区域并配置图色门控",
+                |ui| {
+                    if ui
+                        .add_sized(
+                            [ui.available_width(), 38.0],
+                            egui::Button::new(
+                                egui::RichText::new(if self.sidebar_tab == Page::Region {
+                                    "识别区域已打开"
+                                } else {
+                                    "设置识别区域"
+                                })
+                                .color(theme::jade())
+                                .strong(),
+                            )
+                            .fill(if self.sidebar_tab == Page::Region {
+                                theme::jade_tint()
+                            } else {
+                                Color32::TRANSPARENT
+                            })
+                            .stroke(egui::Stroke::new(1.0, theme::jade().gamma_multiply(0.55))),
+                        )
+                        .on_hover_text("到主区「识别区域」页调整截图区域并点击取点")
+                        .clicked()
+                    {
+                        self.sidebar_tab = Page::Region;
+                        self.capture_preview_once();
+                    }
+                },
+            );
+            // 游戏窗口的分辨率是固定的，识别区域也固定：按分辨率记住一套区域，
+            // 换分辨率时自动套用，只有需要微调时才进「设置识别区域」。
+            if let Some(handle) = self.selected_handle {
+                if let Some((width, height)) = capture::client_size(handle) {
+                    let key = format!("{width}x{height}");
+                    let saved = self.config.region_presets.contains_key(&key);
+                    ui.separator();
+                    Self::setting_row(
+                        ui,
+                        "\u{E740}",
+                        "分辨率",
+                        &format!(
+                            "当前 {key} · {}",
+                            if saved {
+                                "已记住该分辨率的区域"
+                            } else {
+                                "首次使用，调整后会自动记住"
+                            }
+                        ),
+                        |ui| {
+                            if saved && ui.button("忘记").clicked() {
+                                self.config.region_presets.remove(&key);
+                                self.config.task_region = crate::core::DEFAULT_TASK_REGION;
+                                // 记成「当前分辨率」，避免下一次识别又把默认区域存回去。
+                                self.last_client_size = Some((width, height));
+                                self.persist();
+                                self.notice = Some(format!("已恢复 {key} 的默认识别区域"));
+                            }
+                        },
+                    );
                 }
+            }
+        });
+        if self.windows.is_empty() {
+            ui.label(
+                egui::RichText::new("请先打开游戏，窗口列表会自动刷新")
+                    .small()
+                    .color(theme::gold()),
+            );
+        }
+    }
+
+    /// 识别模式页：触发方式、识别间隔、实时模式。
+    fn settings_mode_page(&mut self, ui: &mut egui::Ui) {
+        theme::card_with(theme::surface()).show(ui, |ui| {
+            let previous = self.config.trigger_mode.clone();
+            Self::setting_row(
+                ui,
+                "\u{E721}",
+                "触发方式",
+                "自动按间隔触发，或手动用快捷键触发",
+                |ui| {
+                    ui.selectable_value(
+                        &mut self.config.trigger_mode,
+                        "auto".into(),
+                        "自动（按间隔）",
+                    );
+                    ui.selectable_value(
+                        &mut self.config.trigger_mode,
+                        "manual".into(),
+                        "手动（快捷键）",
+                    );
+                },
+            );
+            if previous != self.config.trigger_mode {
+                self.invalidate_scan();
+                self.sync_hotkey();
+                self.persist();
+            }
+            if !self.manual_mode() {
                 ui.separator();
                 Self::setting_row(
                     ui,
-                    "\u{E7D8}",
-                    "识别区域",
-                    "调整截图区域并配置图色门控",
+                    "\u{E823}",
+                    "识别间隔",
+                    "自动模式下每隔多少秒识别一次",
                     |ui| {
-                        if ui
-                            .add_sized(
-                                [ui.available_width(), 38.0],
-                                egui::Button::new(
-                                    egui::RichText::new(if self.sidebar_tab == "识别区域" {
-                                        "识别区域已打开"
-                                    } else {
-                                        "设置识别区域"
-                                    })
-                                    .color(theme::jade())
-                                    .strong(),
-                                )
-                                .fill(if self.sidebar_tab == "识别区域" {
-                                    theme::jade_tint()
-                                } else {
-                                    Color32::TRANSPARENT
-                                })
-                                .stroke(egui::Stroke::new(1.0, theme::jade().gamma_multiply(0.55))),
-                            )
-                            .on_hover_text("到主区「识别区域」页调整截图区域并点击取点")
-                            .clicked()
-                        {
-                            self.sidebar_tab = "识别区域";
-                            self.capture_preview_once();
-                        }
-                    },
-                );
-                // 游戏窗口的分辨率是固定的，识别区域也固定：按分辨率记住一套区域，
-                // 换分辨率时自动套用，只有需要微调时才进「设置识别区域」。
-                if let Some(handle) = self.selected_handle {
-                    if let Some((width, height)) = capture::client_size(handle) {
-                        let key = format!("{width}x{height}");
-                        let saved = self.config.region_presets.contains_key(&key);
-                        ui.separator();
-                        Self::setting_row(
-                            ui,
-                            "\u{E740}",
-                            "分辨率",
-                            &format!(
-                                "当前 {key} · {}",
-                                if saved {
-                                    "已记住该分辨率的区域"
-                                } else {
-                                    "首次使用，调整后会自动记住"
-                                }
-                            ),
-                            |ui| {
-                                if saved && ui.button("忘记").clicked() {
-                                    self.config.region_presets.remove(&key);
-                                    self.config.task_region = crate::core::DEFAULT_TASK_REGION;
-                                    // 记成「当前分辨率」，避免下一次识别又把默认区域存回去。
-                                    self.last_client_size = Some((width, height));
-                                    self.persist();
-                                    self.notice = Some(format!("已恢复 {key} 的默认识别区域"));
-                                }
-                            },
-                        );
-                    }
-                }
-            });
-            if self.windows.is_empty() {
-                ui.label(
-                    egui::RichText::new("请先打开游戏，窗口列表会自动刷新")
-                        .small()
-                        .color(theme::gold()),
-                );
-            }
-        }
-        if self.sidebar_tab == "识别模式" {
-            theme::card_with(theme::surface()).show(ui, |ui| {
-                let previous = self.config.trigger_mode.clone();
-                Self::setting_row(
-                    ui,
-                    "\u{E721}",
-                    "触发方式",
-                    "自动按间隔触发，或手动用快捷键触发",
-                    |ui| {
-                        ui.selectable_value(
-                            &mut self.config.trigger_mode,
-                            "auto".into(),
-                            "自动（按间隔）",
-                        );
-                        ui.selectable_value(
-                            &mut self.config.trigger_mode,
-                            "manual".into(),
-                            "手动（快捷键）",
-                        );
-                    },
-                );
-                if previous != self.config.trigger_mode {
-                    self.invalidate_scan();
-                    self.sync_hotkey();
-                    self.persist();
-                }
-                if !self.manual_mode() {
-                    ui.separator();
-                    Self::setting_row(
-                        ui,
-                        "\u{E823}",
-                        "识别间隔",
-                        "自动模式下每隔多少秒识别一次",
-                        |ui| {
-                            ui.add_enabled_ui(!self.config.realtime, |ui| {
-                                if ui
-                                    .add(
-                                        egui::DragValue::new(&mut self.config.interval_seconds)
-                                            .range(1..=60)
-                                            .suffix(" 秒"),
-                                    )
-                                    .on_hover_text("自动模式下每隔多少秒识别一次")
-                                    .changed()
-                                {
-                                    self.persist();
-                                }
-                            });
-                        },
-                    );
-                    ui.separator();
-                    Self::setting_row(
-                        ui,
-                        "\u{E768}",
-                        "实时模式",
-                        "截图 → OCR 一完成就立刻开始下一轮（持续占用 CPU）",
-                        |ui| {
+                        ui.add_enabled_ui(!self.config.realtime, |ui| {
                             if ui
-                                .checkbox(&mut self.config.realtime, "")
-                                .on_hover_text(
-                                    "不等固定间隔：截图→OCR 一完成就立刻开始下一轮，                                     适合抓鬼飞行、赶路时追坐标；会持续占用 CPU / GPU",
+                                .add(
+                                    egui::DragValue::new(&mut self.config.interval_seconds)
+                                        .range(1..=60)
+                                        .suffix(" 秒"),
                                 )
+                                .on_hover_text("自动模式下每隔多少秒识别一次")
                                 .changed()
                             {
                                 self.persist();
                             }
-                        },
-                    );
-                }
-                if self.manual_mode() {
-                    ui.separator();
-                    Self::setting_row(ui, "\u{E765}", "快捷键", "按一次触发一次识别", |ui| {
-                        let response = ui.add(
-                            egui::TextEdit::singleline(&mut self.config.ocr_hotkey)
-                                .desired_width(96.0)
-                                .hint_text("F8"),
-                        );
-                        if response.lost_focus() {
-                            self.sync_hotkey();
+                        });
+                    },
+                );
+                ui.separator();
+                Self::setting_row(
+                    ui,
+                    "\u{E768}",
+                    "实时模式",
+                    "截图 → OCR 一完成就立刻开始下一轮（持续占用 CPU）",
+                    |ui| {
+                        if ui
+                            .checkbox(&mut self.config.realtime, "")
+                            .on_hover_text(
+                                "不等固定间隔：截图→OCR 一完成就立刻开始下一轮，                                     适合抓鬼飞行、赶路时追坐标；会持续占用 CPU / GPU",
+                            )
+                            .changed()
+                        {
                             self.persist();
                         }
-                        if ui
-                            .button(if self.recording_hotkey { "按键…" } else { "录制" })
-                            .clicked()
-                        {
-                            self.recording_hotkey = !self.recording_hotkey;
-                            if self.recording_hotkey {
-                                self.keymap_recording = None;
-                                self.suspend_keymap();
-                            }
+                    },
+                );
+            }
+            if self.manual_mode() {
+                ui.separator();
+                Self::setting_row(ui, "\u{E765}", "快捷键", "按一次触发一次识别", |ui| {
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut self.config.ocr_hotkey)
+                            .desired_width(96.0)
+                            .hint_text("F8"),
+                    );
+                    if response.lost_focus() {
+                        self.sync_hotkey();
+                        self.persist();
+                    }
+                    if ui
+                        .button(if self.recording_hotkey { "按键…" } else { "录制" })
+                        .clicked()
+                    {
+                        self.recording_hotkey = !self.recording_hotkey;
+                        if self.recording_hotkey {
+                            self.keymap_recording = None;
+                            self.suspend_keymap();
                         }
-                    });
-                    match Hotkey::parse(&self.config.ocr_hotkey) {
-                        Ok(hotkey) => {
-                            let (registered, warning) = match &self.hotkey_listener {
-                                Some(listener) => (listener.is_alive(), listener.warning.clone()),
-                                None => (false, None),
-                            };
-                            if registered {
-                                if let Some(warn) = warning {
-                                    ui.colored_label(
-                                        theme::gold(),
-                                        format!("⚠ {}：{}", hotkey.display(), warn),
-                                    );
-                                    if let Some(alt) = hotkey::suggest_available(hotkey) {
-                                        if ui
-                                            .button(format!("改用 {}（空闲）", alt.display()))
-                                            .clicked()
-                                        {
-                                            self.adopt_hotkey(alt.display());
-                                        }
-                                    }
-                                } else {
-                                    ui.label(
-                                        egui::RichText::new(format!(
-                                            "{} · 全局快捷键已注册",
-                                            hotkey.display()
-                                        ))
-                                        .small()
-                                        .color(theme::muted()),
-                                    );
-                                }
-                            } else if !self.running {
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "{} · 开始监听后生效",
-                                        hotkey.display()
-                                    ))
-                                    .small()
-                                    .color(theme::gold()),
+                    }
+                });
+                match Hotkey::parse(&self.config.ocr_hotkey) {
+                    Ok(hotkey) => {
+                        let (registered, warning) = match &self.hotkey_listener {
+                            Some(listener) => (listener.is_alive(), listener.warning.clone()),
+                            None => (false, None),
+                        };
+                        if registered {
+                            if let Some(warn) = warning {
+                                ui.colored_label(
+                                    theme::gold(),
+                                    format!("⚠ {}：{}", hotkey.display(), warn),
                                 );
-                            } else if let Some(err) = self.hotkey_error.clone() {
-                                ui.colored_label(theme::gold(), format!("⚠ {err}"));
                                 if let Some(alt) = hotkey::suggest_available(hotkey) {
                                     if ui
                                         .button(format!("改用 {}（空闲）", alt.display()))
@@ -714,164 +690,186 @@ impl MhxyApp {
                                 }
                             } else {
                                 ui.label(
-                                    egui::RichText::new(format!("{} · 正在注册…", hotkey.display()))
-                                        .small()
-                                        .color(theme::gold()),
+                                    egui::RichText::new(format!(
+                                        "{} · 全局快捷键已注册",
+                                        hotkey.display()
+                                    ))
+                                    .small()
+                                    .color(theme::muted()),
                                 );
                             }
-                        }
-                        Err(err) => {
-                            ui.colored_label(theme::gold(), format!("快捷键无效：{err}"));
-                        }
-                    }
-                    ui.separator();
-                    Self::setting_row(ui, "\u{E768}", "立即识别一次", "手动模式下按键触发一次 OCR", |ui| {
-                        if ui.button("立即识别").clicked() {
-                            self.manual_trigger();
-                        }
-                    });
-                }
-            });
-        }
-        if self.sidebar_tab == "任务类型" {
-            // 抓鬼 / 鬼王 按任务名解析；通用任务不看任务类型，两边互斥。
-            theme::card_with(theme::surface()).show(ui, |ui| {
-                Self::setting_row(
-                    ui,
-                    "\u{E716}",
-                    "抓鬼任务",
-                    "识别任务栏里的抓鬼任务，并在地图上标出 NPC 坐标",
-                    |ui| {
-                        if ui
-                            .checkbox(&mut self.config.zhuagui_enabled, "")
-                            .on_hover_text("识别任务栏里的抓鬼任务，并在地图上标出 NPC 坐标")
-                            .changed()
-                        {
-                            if self.config.zhuagui_enabled {
-                                self.config.generic_enabled = false;
-                            }
-                            self.invalidate_scan();
-                            self.persist();
-                        }
-                    },
-                );
-                ui.separator();
-                Self::setting_row(
-                    ui,
-                    "\u{E7B4}",
-                    "鬼王任务",
-                    "同时识别鬼王任务，并单独显示一块地图面板",
-                    |ui| {
-                        if ui
-                            .checkbox(&mut self.config.ghost_king_enabled, "")
-                            .on_hover_text("同时识别鬼王任务，并单独显示一块地图面板")
-                            .changed()
-                        {
-                            if self.config.ghost_king_enabled {
-                                // 通用任务是独立模式，勾选鬼王时把它让开。
-                                self.config.generic_enabled = false;
-                            }
-                            self.invalidate_scan();
-                            self.persist();
-                        }
-                    },
-                );
-                ui.separator();
-                Self::setting_row(
-                    ui,
-                    "\u{E8A5}",
-                    "通用任务（只看地图名和坐标）",
-                    "不识别任务类型，只按地图名和坐标标注；坐标可能落在备用区域",
-                    |ui| {
-                        if ui
-                            .checkbox(&mut self.config.generic_enabled, "")
-                            .on_hover_text(
-                                "不识别任务类型，只按地图名和坐标标注；坐标不一定在第一个截图区域里，勾选后会自动启用备用区域",
-                            )
-                            .changed()
-                        {
-                            if self.config.generic_enabled {
-                                // 通用任务与抓鬼/鬼王互斥；坐标可能落在第二块截图里，顺手打开备用区域。
-                                self.config.zhuagui_enabled = false;
-                                self.config.ghost_king_enabled = false;
-                                if !self.config.extra_region_enabled {
-                                    self.config.extra_region_enabled = true;
+                        } else if !self.running {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{} · 开始监听后生效",
+                                    hotkey.display()
+                                ))
+                                .small()
+                                .color(theme::gold()),
+                            );
+                        } else if let Some(err) = self.hotkey_error.clone() {
+                            ui.colored_label(theme::gold(), format!("⚠ {err}"));
+                            if let Some(alt) = hotkey::suggest_available(hotkey) {
+                                if ui
+                                    .button(format!("改用 {}（空闲）", alt.display()))
+                                    .clicked()
+                                {
+                                    self.adopt_hotkey(alt.display());
                                 }
-                            } else if !self.config.zhuagui_enabled && !self.config.ghost_king_enabled {
-                                // 关掉通用任务后一个任务都不剩，就把抓鬼打开，免得没有面板。
-                                self.config.zhuagui_enabled = true;
                             }
-                            self.invalidate_scan();
-                            self.persist();
+                        } else {
+                            ui.label(
+                                egui::RichText::new(format!("{} · 正在注册…", hotkey.display()))
+                                    .small()
+                                    .color(theme::gold()),
+                            );
                         }
-                    },
-                );
-            });
-        }
-        if self.sidebar_tab == "显示与布局" {
-            theme::card_with(theme::surface()).show(ui, |ui| {
-                let mut high_chance_changed = false;
-                if self.config.zhuagui_enabled {
-                    Self::setting_row(
-                        ui,
-                        "\u{E816}",
-                        "抓鬼：显示高概率区域",
-                        "按 175LG 捉鬼省眼规则，叠加 50×50 的高概率格子",
-                        |ui| {
-                            high_chance_changed |= ui
-                                .checkbox(&mut self.config.high_chance, "")
-                                .on_hover_text(
-                                    "按 175LG 捉鬼省眼规则，在抓鬼地图上叠加 50×50 的高概率格子",
-                                )
-                                .changed();
-                        },
-                    );
-                }
-                if self.config.ghost_king_enabled {
-                    if self.config.zhuagui_enabled {
-                        ui.separator();
                     }
-                    Self::setting_row(
-                        ui,
-                        "\u{E816}",
-                        "鬼王：显示高概率区域",
-                        "按 175LG 捉鬼省眼规则，叠加 50×50 的高概率格子",
-                        |ui| {
-                            high_chance_changed |= ui
-                                .checkbox(&mut self.config.ghost_king_high_chance, "")
-                                .on_hover_text(
-                                    "按 175LG 捉鬼省眼规则，在鬼王地图上叠加 50×50 的高概率格子",
-                                )
-                                .changed();
-                        },
-                    );
-                }
-                if high_chance_changed {
-                    self.persist();
+                    Err(err) => {
+                        ui.colored_label(theme::gold(), format!("快捷键无效：{err}"));
+                    }
                 }
                 ui.separator();
-                let previous = self.config.horizontal_layout;
-                Self::setting_row(ui, "\u{E8A3}", "布局", "地图的排布方向", |ui| {
-                    ui.selectable_value(&mut self.config.horizontal_layout, false, "上下");
-                    ui.selectable_value(&mut self.config.horizontal_layout, true, "左右");
+                Self::setting_row(ui, "\u{E768}", "立即识别一次", "手动模式下按键触发一次 OCR", |ui| {
+                    if ui.button("立即识别").clicked() {
+                        self.manual_trigger();
+                    }
                 });
-                if previous != self.config.horizontal_layout {
-                    self.persist();
-                }
-            });
-        }
-        // 浮窗参数在独立窗口「地图浮窗设置」里，设置栏底部常驻一句指路（原来在「显示与布局」页里）。
-        ui.add_space(4.0);
-        ui.label(
-                egui::RichText::new(
-                    "地图浮窗的每个任务开关、不透明度、宽度、置顶和锁定都在任务地图页下方的浮窗设置卡里（打开「地图浮窗」开关后就地出现）",
-                )
-                .small()
-                .weak(),
-            );
+            }
+        });
     }
 
-    /// 识别方式页（主区）：标题 + 白卡（原来在「高级设置」页里的识别方式折叠区）。
+    /// 任务类型页：抓鬼 / 鬼王 / 通用任务的开关与说明。
+    fn settings_task_page(&mut self, ui: &mut egui::Ui) {
+        // 抓鬼 / 鬼王 按任务名解析；通用任务不看任务类型，两边互斥。
+        theme::card_with(theme::surface()).show(ui, |ui| {
+            Self::setting_row(
+                ui,
+                "\u{E716}",
+                "抓鬼任务",
+                "识别任务栏里的抓鬼任务，并在地图上标出 NPC 坐标",
+                |ui| {
+                    if ui
+                        .checkbox(&mut self.config.zhuagui_enabled, "")
+                        .on_hover_text("识别任务栏里的抓鬼任务，并在地图上标出 NPC 坐标")
+                        .changed()
+                    {
+                        if self.config.zhuagui_enabled {
+                            self.config.generic_enabled = false;
+                        }
+                        self.invalidate_scan();
+                        self.persist();
+                    }
+                },
+            );
+            ui.separator();
+            Self::setting_row(
+                ui,
+                "\u{E7B4}",
+                "鬼王任务",
+                "同时识别鬼王任务，并单独显示一块地图面板",
+                |ui| {
+                    if ui
+                        .checkbox(&mut self.config.ghost_king_enabled, "")
+                        .on_hover_text("同时识别鬼王任务，并单独显示一块地图面板")
+                        .changed()
+                    {
+                        if self.config.ghost_king_enabled {
+                            // 通用任务是独立模式，勾选鬼王时把它让开。
+                            self.config.generic_enabled = false;
+                        }
+                        self.invalidate_scan();
+                        self.persist();
+                    }
+                },
+            );
+            ui.separator();
+            Self::setting_row(
+                ui,
+                "\u{E8A5}",
+                "通用任务（只看地图名和坐标）",
+                "不识别任务类型，只按地图名和坐标标注；坐标可能落在备用区域",
+                |ui| {
+                    if ui
+                        .checkbox(&mut self.config.generic_enabled, "")
+                        .on_hover_text(
+                            "不识别任务类型，只按地图名和坐标标注；坐标不一定在第一个截图区域里，勾选后会自动启用备用区域",
+                        )
+                        .changed()
+                    {
+                        if self.config.generic_enabled {
+                            // 通用任务与抓鬼/鬼王互斥；坐标可能落在第二块截图里，顺手打开备用区域。
+                            self.config.zhuagui_enabled = false;
+                            self.config.ghost_king_enabled = false;
+                            if !self.config.extra_region_enabled {
+                                self.config.extra_region_enabled = true;
+                            }
+                        } else if !self.config.zhuagui_enabled && !self.config.ghost_king_enabled {
+                            // 关掉通用任务后一个任务都不剩，就把抓鬼打开，免得没有面板。
+                            self.config.zhuagui_enabled = true;
+                        }
+                        self.invalidate_scan();
+                        self.persist();
+                    }
+                },
+            );
+        });
+    }
+
+    /// 显示与布局页：置顶、透明度、高概率区域等界面相关设置。
+    fn settings_display_page(&mut self, ui: &mut egui::Ui) {
+        theme::card_with(theme::surface()).show(ui, |ui| {
+            let mut high_chance_changed = false;
+            if self.config.zhuagui_enabled {
+                Self::setting_row(
+                    ui,
+                    "\u{E816}",
+                    "抓鬼：显示高概率区域",
+                    "按 175LG 捉鬼省眼规则，叠加 50×50 的高概率格子",
+                    |ui| {
+                        high_chance_changed |= ui
+                            .checkbox(&mut self.config.high_chance, "")
+                            .on_hover_text(
+                                "按 175LG 捉鬼省眼规则，在抓鬼地图上叠加 50×50 的高概率格子",
+                            )
+                            .changed();
+                    },
+                );
+            }
+            if self.config.ghost_king_enabled {
+                if self.config.zhuagui_enabled {
+                    ui.separator();
+                }
+                Self::setting_row(
+                    ui,
+                    "\u{E816}",
+                    "鬼王：显示高概率区域",
+                    "按 175LG 捉鬼省眼规则，叠加 50×50 的高概率格子",
+                    |ui| {
+                        high_chance_changed |= ui
+                            .checkbox(&mut self.config.ghost_king_high_chance, "")
+                            .on_hover_text(
+                                "按 175LG 捉鬼省眼规则，在鬼王地图上叠加 50×50 的高概率格子",
+                            )
+                            .changed();
+                    },
+                );
+            }
+            if high_chance_changed {
+                self.persist();
+            }
+            ui.separator();
+            let previous = self.config.horizontal_layout;
+            Self::setting_row(ui, "\u{E8A3}", "布局", "地图的排布方向", |ui| {
+                ui.selectable_value(&mut self.config.horizontal_layout, false, "上下");
+                ui.selectable_value(&mut self.config.horizontal_layout, true, "左右");
+            });
+            if previous != self.config.horizontal_layout {
+                self.persist();
+            }
+        });
+    }
+
     pub(super) fn mode_page_ui(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             if let Some(font) = theme::icon_font() {
@@ -1161,7 +1159,7 @@ impl MhxyApp {
                 }
             });
             ui.label(
-                egui::RichText::new(format!("日志写入：{}", self.log_path.display()))
+                egui::RichText::new(format!("日志写入：{}", self.log_file.path().display()))
                     .small()
                     .weak(),
             );
@@ -1180,6 +1178,7 @@ impl MhxyApp {
                         .clicked()
                     {
                         self.log_lines.clear();
+                        self.log_revision = self.log_revision.wrapping_add(1);
                     }
                     if ui
                         .add(theme::secondary_button("复制日志"))
@@ -1206,15 +1205,19 @@ impl MhxyApp {
                         .weak(),
                 );
             } else {
-                let text = self
-                    .log_lines
-                    .iter()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                let mut text = text;
+                // 只在日志变化时重新拼一次：以前每帧 1000 次 String 分配 + 整串哈希。
+                if self.log_page_revision != self.log_revision {
+                    self.log_page_text = self
+                        .log_lines
+                        .iter()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    self.log_page_revision = self.log_revision;
+                }
+                // 只读视图：直接借缓存文本给 TextEdit，内容没变时 egui 也不必重新排版。
                 ui.add(
-                    egui::TextEdit::multiline(&mut text)
+                    egui::TextEdit::multiline(&mut self.log_page_text)
                         .font(egui::TextStyle::Monospace)
                         .desired_width(f32::INFINITY)
                         .desired_rows(14)

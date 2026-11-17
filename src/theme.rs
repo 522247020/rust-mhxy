@@ -20,7 +20,6 @@ struct Palette {
     control: Color32,
     control_hover: Color32,
     control_active: Color32,
-    on_accent: Color32,
 }
 
 const DARK: Palette = Palette {
@@ -39,7 +38,6 @@ const DARK: Palette = Palette {
     control: Color32::from_rgb(51, 51, 51),
     control_hover: Color32::from_rgb(58, 58, 58),
     control_active: Color32::from_rgb(56, 56, 56),
-    on_accent: Color32::from_rgb(0, 0, 0),
 };
 
 const LIGHT: Palette = Palette {
@@ -58,7 +56,6 @@ const LIGHT: Palette = Palette {
     control: Color32::from_rgb(243, 243, 243),
     control_hover: Color32::from_rgb(241, 241, 241),
     control_active: Color32::from_rgb(233, 233, 233),
-    on_accent: Color32::from_rgb(255, 255, 255),
 };
 
 fn palette() -> Palette {
@@ -113,15 +110,6 @@ pub fn gold() -> Color32 {
 }
 pub fn red() -> Color32 {
     palette().red
-}
-#[allow(dead_code)]
-/// 强调色（Win11 蓝）上的文字颜色。
-pub fn on_accent() -> Color32 {
-    palette().on_accent
-}
-#[allow(dead_code)]
-pub fn control() -> Color32 {
-    palette().control
 }
 /// Fluent 图标（Segoe MDL2 Assets），没有图标字体时返回 None。
 pub fn icon_font() -> Option<FontId> {

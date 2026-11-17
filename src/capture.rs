@@ -29,13 +29,20 @@ fn filter_game_windows(windows: Vec<WindowInfo>) -> Vec<WindowInfo> {
     result
 }
 
-fn crop_region(full: &RgbImage, region: TaskRegion) -> RgbImage {
-    let (width, height) = full.dimensions();
+/// 把客户区尺寸 + 比例区域换算成像素矩形（`x, y, w, h`，已夹到画面内）。
+/// 整窗截图后的裁剪和「直接截这块矩形」两条路都靠它，保证两种方式切出的区域完全一致。
+fn region_rect(width: u32, height: u32, region: TaskRegion) -> (u32, u32, u32, u32) {
     let (left, top, right, bottom) = task_region(width as f32, height as f32, region);
     let x = left.max(0.0).min(width as f32) as u32;
     let y = top.max(0.0).min(height as f32) as u32;
     let w = (right - left).max(1.0).min(width as f32 - x as f32) as u32;
     let h = (bottom - top).max(1.0).min(height as f32 - y as f32) as u32;
+    (x, y, w, h)
+}
+
+fn crop_region(full: &RgbImage, region: TaskRegion) -> RgbImage {
+    let (width, height) = full.dimensions();
+    let (x, y, w, h) = region_rect(width, height, region);
     image::imageops::crop_imm(full, x, y, w, h).to_image()
 }
 
@@ -69,6 +76,13 @@ pub fn task_panels(full: &RgbImage, region: TaskRegion, extra: Option<TaskRegion
 /// 截取完整客户区（不做裁剪），供分区预处理使用。
 pub fn capture_client(handle: i64, region: TaskRegion) -> Result<RgbImage, String> {
     imp::capture_client(handle, region)
+}
+
+/// 只截取指定区域（相对客户区的比例），不回读整张客户区。
+///
+/// 一次识别真正需要的只是任务栏那一小块，整窗截图 + 裁剪会多搬十几倍的像素。
+pub fn capture_region(handle: i64, region: TaskRegion) -> Result<RgbImage, String> {
+    imp::capture_region(handle, region)
 }
 
 /// 把多张图纵向拼接（区域之间留白），用于送一次 OCR。
@@ -105,36 +119,6 @@ pub fn client_size(handle: i64) -> Option<(u32, u32)> {
 /// 调识别区域（取点）时靠它把屏幕坐标换回相对客户区的百分比。
 pub fn client_rect(handle: i64) -> Option<(i32, i32, u32, u32)> {
     imp::client_rect(handle)
-}
-
-/// 整个屏幕（主屏，像素）。调试分行 / 取点时用，看到的就是用户看到的。
-#[allow(dead_code)]
-pub fn capture_desktop() -> Result<RgbImage, String> {
-    imp::capture_desktop()
-}
-
-/// 屏幕上这个点最上层的窗口句柄和标题。用来判断「选中的区域是不是被别的窗口盖住了」。
-#[allow(dead_code)]
-pub fn window_at(x: i32, y: i32) -> Option<(i64, String)> {
-    imp::window_at(x, y)
-}
-
-/// DPI 信息。屏幕缩放会造成「逻辑像素 vs 物理像素」两套坐标；
-/// 区域百分比按比例算不受影响，但取点/截图混用两套值就会整体偏移。
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug)]
-pub struct DpiInfo {
-    /// 系统 DPI（96 = 100%，120 = 125%，144 = 150%）。
-    pub system_dpi: u32,
-    /// 本进程的 DPI 感知级别。
-    pub awareness: &'static str,
-    /// 系统报告的屏幕尺寸；不感知 DPI 时这里是「虚拟（逻辑）像素」。
-    pub screen: (i32, i32),
-}
-
-#[allow(dead_code)]
-pub fn dpi_info() -> Option<DpiInfo> {
-    imp::dpi_info()
 }
 
 /// 只截取客户区里的一小块（图色门控用），开销远小于整张客户区。
@@ -232,16 +216,13 @@ mod imp {
         Ok(image::imageops::crop_imm(&full, x, y, width, height).to_image())
     }
 
-    pub fn capture_desktop() -> Result<RgbImage, String> {
-        Err("当前平台暂不支持整屏截图".into())
-    }
-
-    pub fn window_at(_x: i32, _y: i32) -> Option<(i64, String)> {
-        None
-    }
-
-    pub fn dpi_info() -> Option<super::DpiInfo> {
-        None
+    /// xcap 只能整窗取图，这里截完再裁——开发期近似实现，不是 Windows 的性能路径。
+    pub fn capture_region(
+        handle: i64,
+        region: crate::core::TaskRegion,
+    ) -> Result<RgbImage, String> {
+        let full = capture_client(handle, region)?;
+        Ok(super::crop_region(&full, region))
     }
 }
 
@@ -259,10 +240,9 @@ mod imp {
         DIB_RGB_COLORS, HGDIOBJ, SRCCOPY,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetAncestor, GetClientRect, GetSystemMetrics, GetWindowRect, GetWindowTextW,
+        EnumWindows, GetAncestor, GetClientRect, GetWindowRect, GetWindowTextW,
         GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, WindowFromPoint, GA_ROOT,
     };
-    use windows::Win32::UI::WindowsAndMessaging::{SM_CXSCREEN, SM_CYSCREEN};
 
     unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
         let windows = &mut *(lparam.0 as *mut Vec<WindowInfo>);
@@ -364,42 +344,73 @@ mod imp {
         result
     }
 
+    /// 校验窗口还活着、拿到客户区尺寸和它在屏幕上的原点。
+    unsafe fn client_geometry(hwnd: HWND) -> Result<(i32, i32, POINT), String> {
+        if !IsWindow(Some(hwnd)).as_bool() || IsIconic(hwnd).as_bool() {
+            return Err("游戏窗口已关闭或最小化".into());
+        }
+        let mut client = RECT::default();
+        GetClientRect(hwnd, &mut client).map_err(|err| format!("读取窗口大小失败：{err}"))?;
+        let width = client.right;
+        let height = client.bottom;
+        if width < 500 || height < 350 {
+            return Err(format!("游戏客户区尺寸过小：{width}×{height}"));
+        }
+        let mut origin = POINT { x: 0, y: 0 };
+        if !ClientToScreen(hwnd, &mut origin).as_bool() {
+            return Err("定位游戏窗口失败".into());
+        }
+        Ok((width, height, origin))
+    }
+
+    /// 任务区域被其他窗口挡住时截到的是别的画面，先查一下这块区域的正中是不是本窗口。
+    unsafe fn ensure_uncovered(
+        hwnd: HWND,
+        region: crate::core::TaskRegion,
+        width: i32,
+        height: i32,
+        origin: POINT,
+    ) -> Result<(), String> {
+        let (left, top, right, bottom) = task_region(width as f32, height as f32, region);
+        let center = POINT {
+            x: origin.x + ((left + right) / 2.0) as i32,
+            y: origin.y + ((top + bottom) / 2.0) as i32,
+        };
+        let covering = GetAncestor(WindowFromPoint(center), GA_ROOT);
+        if covering.0 != hwnd.0 {
+            // 本程序自己的置顶悬浮窗（打坐计时）不算遮挡，否则会一直截不到图。
+            let mut pid = 0u32;
+            GetWindowThreadProcessId(covering, Some(&mut pid));
+            if pid != std::process::id() {
+                return Err("任务区域被其他窗口遮挡".into());
+            }
+        }
+        Ok(())
+    }
+
     pub fn capture_client(
         handle: i64,
         region: crate::core::TaskRegion,
     ) -> Result<RgbImage, String> {
         unsafe {
             let hwnd = HWND(handle as *mut core::ffi::c_void);
-            if !IsWindow(Some(hwnd)).as_bool() || IsIconic(hwnd).as_bool() {
-                return Err("游戏窗口已关闭或最小化".into());
-            }
-            let mut client = RECT::default();
-            GetClientRect(hwnd, &mut client).map_err(|err| format!("读取窗口大小失败：{err}"))?;
-            let width = client.right;
-            let height = client.bottom;
-            if width < 500 || height < 350 {
-                return Err(format!("游戏客户区尺寸过小：{width}×{height}"));
-            }
-            let mut origin = POINT { x: 0, y: 0 };
-            if !ClientToScreen(hwnd, &mut origin).as_bool() {
-                return Err("定位游戏窗口失败".into());
-            }
-            // 任务区域被其他窗口挡住时截到的是别的画面，先检查一下。
-            let (left, top, right, bottom) = task_region(width as f32, height as f32, region);
-            let center = POINT {
-                x: origin.x + ((left + right) / 2.0) as i32,
-                y: origin.y + ((top + bottom) / 2.0) as i32,
-            };
-            let covering = GetAncestor(WindowFromPoint(center), GA_ROOT);
-            if covering.0 != hwnd.0 {
-                // 本程序自己的置顶悬浮窗（打坐计时）不算遮挡，否则会一直截不到图。
-                let mut pid = 0u32;
-                GetWindowThreadProcessId(covering, Some(&mut pid));
-                if pid != std::process::id() {
-                    return Err("任务区域被其他窗口遮挡".into());
-                }
-            }
+            let (width, height, origin) = client_geometry(hwnd)?;
+            ensure_uncovered(hwnd, region, width, height, origin)?;
             capture_screen(origin.x, origin.y, width, height)
+        }
+    }
+
+    /// 只回读识别区域那几块像素：一次 BitBlt 就够，不用整窗截图再裁剪。
+    pub fn capture_region(
+        handle: i64,
+        region: crate::core::TaskRegion,
+    ) -> Result<RgbImage, String> {
+        unsafe {
+            let hwnd = HWND(handle as *mut core::ffi::c_void);
+            let (width, height, origin) = client_geometry(hwnd)?;
+            ensure_uncovered(hwnd, region, width, height, origin)?;
+            let (x, y, w, h) = super::region_rect(width as u32, height as u32, region);
+            capture_screen(origin.x + x as i32, origin.y + y as i32, w as i32, h as i32)
         }
     }
 
@@ -421,70 +432,6 @@ mod imp {
                 client.right.max(0) as u32,
                 client.bottom.max(0) as u32,
             ))
-        }
-    }
-
-    pub fn capture_desktop() -> Result<RgbImage, String> {
-        unsafe {
-            let width = GetSystemMetrics(SM_CXSCREEN);
-            let height = GetSystemMetrics(SM_CYSCREEN);
-            if width <= 0 || height <= 0 {
-                return Err("读取屏幕尺寸失败".into());
-            }
-            capture_screen(0, 0, width, height)
-        }
-    }
-
-    pub fn window_at(x: i32, y: i32) -> Option<(i64, String)> {
-        unsafe {
-            let hwnd = WindowFromPoint(POINT { x, y });
-            if hwnd.0.is_null() {
-                return None;
-            }
-            let root = GetAncestor(hwnd, GA_ROOT);
-            let mut buffer = [0u16; 512];
-            let length = GetWindowTextW(root, &mut buffer);
-            let title = String::from_utf16_lossy(&buffer[..length.max(0) as usize])
-                .trim()
-                .to_string();
-            Some((root.0 as i64, title))
-        }
-    }
-
-    pub fn dpi_info() -> Option<super::DpiInfo> {
-        use windows::Win32::UI::HiDpi::{
-            GetAwarenessFromDpiAwarenessContext, GetDpiForSystem, GetThreadDpiAwarenessContext,
-            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
-            DPI_AWARENESS_CONTEXT_SYSTEM_AWARE, DPI_AWARENESS_CONTEXT_UNAWARE,
-            DPI_AWARENESS_CONTEXT_UNAWARE_GDISCALED,
-        };
-        unsafe {
-            let dpi = GetDpiForSystem();
-            let context = GetThreadDpiAwarenessContext();
-            let awareness = GetAwarenessFromDpiAwarenessContext(context);
-            let label = if context == DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 {
-                "per-monitor-v2"
-            } else if context == DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE {
-                "per-monitor"
-            } else if context == DPI_AWARENESS_CONTEXT_SYSTEM_AWARE {
-                "system"
-            } else if context == DPI_AWARENESS_CONTEXT_UNAWARE {
-                "unaware"
-            } else if context == DPI_AWARENESS_CONTEXT_UNAWARE_GDISCALED {
-                "unaware-gdiscaled"
-            } else {
-                // 枚举兜底：0=unaware 1=system 2=per-monitor
-                match awareness.0 {
-                    1 => "system",
-                    2 => "per-monitor",
-                    _ => "unaware",
-                }
-            };
-            Some(super::DpiInfo {
-                system_dpi: dpi.max(96),
-                awareness: label,
-                screen: (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)),
-            })
         }
     }
 
