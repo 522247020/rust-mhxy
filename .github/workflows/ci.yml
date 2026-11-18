@@ -52,6 +52,10 @@ jobs:
             .ort-cache
             .ocr-models
           key: linux-ocr-${{ hashFiles('Cargo.lock') }}
+          # 命中不了也要退到上一份缓存：key 里含 Cargo.lock，版本号一改就会 miss，
+          # 而 ort-sys 在缓存缺东西时是直接 panic（不会安静地重新下载运行库）。
+          restore-keys: |
+            linux-ocr-
 
       - name: Install native build dependencies
         # xcap 需要 pipewire；eframe/winit 需要 egl/gl/wayland/xkb；中文字体供字体测试用。

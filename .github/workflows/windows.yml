@@ -65,6 +65,10 @@ jobs:
             .ort-cache
             .ocr-models
           key: windows-ocr-${{ hashFiles('Cargo.lock', 'scripts/package-windows.py') }}
+          # 命中不了也要退到上一份缓存：key 里含 Cargo.lock，版本号一改就会 miss，
+          # 而 ort-sys 找不到 .ort-cache 里的 DirectML.dll 时是直接 panic（不是重新下载）。
+          restore-keys: |
+            windows-ocr-
 
       - name: Check formatting
         run: cargo fmt --check
