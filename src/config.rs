@@ -180,18 +180,21 @@ impl Default for KeyMapping {
     }
 }
 
-/// 新用户和旧配置的默认映射：F9 ↔ Tab。
+/// 新用户和旧配置的默认映射：F9 ↔ Tab，**默认不启用**。
+///
+/// 键盘钩子会全局拦按键，装完就悄悄改掉 F9 / Tab 的行为太唐突；这里只把两条常见映射
+/// 摆出来，用户要用了自己在「按键映射」页打开。
 pub fn default_key_mappings() -> Vec<KeyMapping> {
     vec![
         KeyMapping {
             from: "F9".to_string(),
             to: "Tab".to_string(),
-            enabled: true,
+            enabled: false,
         },
         KeyMapping {
             from: "Tab".to_string(),
             to: "F9".to_string(),
-            enabled: true,
+            enabled: false,
         },
     ]
 }
@@ -1350,7 +1353,10 @@ mod tests {
         assert_eq!(config.key_mappings[0].to, "Tab");
         assert_eq!(config.key_mappings[1].from, "Tab");
         assert_eq!(config.key_mappings[1].to, "F9");
-        assert!(config.key_mappings.iter().all(|mapping| mapping.enabled));
+        assert!(
+            config.key_mappings.iter().all(|mapping| !mapping.enabled),
+            "按键映射默认不启用，免得装完就改掉 F9 / Tab 的行为"
+        );
 
         let dir = std::env::temp_dir().join("rust-mhxy-config-keymap-test");
         let _ = std::fs::create_dir_all(&dir);
@@ -1651,7 +1657,7 @@ mod tests {
         assert_eq!(value["color_gate/points"][0]["color"], "#d4a017");
         assert_eq!(value["keymap/items"][0]["from"], "F9");
         assert_eq!(value["keymap/items"][0]["to"], "Tab");
-        assert_eq!(value["keymap/items"][0]["enabled"], true);
+        assert_eq!(value["keymap/items"][0]["enabled"], false);
         assert_eq!(
             value["profiles/items"][0]["task_region"],
             "0.7,0.24,0.99,0.7"

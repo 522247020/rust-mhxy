@@ -91,10 +91,10 @@
 
   // ---- 键盘按键映射 ----
   // 把源按键替换成目标按键（Windows 全局生效）。每条映射用 enabled 单独开关。
-  // 只支持单键，不支持 Ctrl / Alt 组合键；默认 F9 ↔ Tab 互换。
+  // 只支持单键，不支持 Ctrl / Alt 组合键；下面两条 F9 ↔ Tab 默认关闭，要用了把 enabled 改成 true。
   "keymap/items": [
-    { "from": "F9", "to": "Tab", "enabled": true },
-    { "from": "Tab", "to": "F9", "enabled": true },
+    { "from": "F9", "to": "Tab", "enabled": false },
+    { "from": "Tab", "to": "F9", "enabled": false },
   ],
 
   // ---- 独立地图浮窗 ----

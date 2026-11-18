@@ -254,8 +254,23 @@ mod tests {
     }
 
     #[test]
-    fn default_mappings_are_f9_and_tab_swapped() {
-        let rules = collect_rules(&crate::config::default_key_mappings());
+    fn default_mappings_are_f9_and_tab_swapped_but_disabled() {
+        let defaults = crate::config::default_key_mappings();
+        // 默认不启用：刚装好不装键盘钩子，免得悄悄改掉 F9 / Tab 的行为。
+        assert!(
+            collect_rules(&defaults).is_empty(),
+            "默认映射不应产生任何生效规则"
+        );
+
+        // 用户打开两条后才有规则。
+        let enabled: Vec<_> = defaults
+            .into_iter()
+            .map(|mapping| crate::config::KeyMapping {
+                enabled: true,
+                ..mapping
+            })
+            .collect();
+        let rules = collect_rules(&enabled);
         assert_eq!(
             rules,
             vec![

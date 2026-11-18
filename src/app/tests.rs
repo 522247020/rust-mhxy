@@ -842,7 +842,8 @@ fn keymap_page_shows_default_mappings_and_validation() {
     }
     assert_eq!(app.config.key_mappings.len(), 2, "应自带两条默认映射");
 
-    // 源 / 目标为空时直接在当前行提示，不再静默失败。
+    // 源 / 目标为空时直接在当前行提示，不再静默失败（先打开这一行，关闭的行不提示）。
+    app.config.key_mappings[0].enabled = true;
     app.config.key_mappings[0].to.clear();
     let mut output = ctx.run_ui(input(), |ui| app.ui(ui, &mut frame));
     let texts = collect_texts(&output.shapes);
