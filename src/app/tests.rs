@@ -2340,6 +2340,98 @@ fn rows_debug_preview_shows_projection_rows() {
     output.textures_delta.clear();
 }
 
+/// 分行不可信时会静默回退检测模型，结果和「关闭」一样；路径变化必须能用简单级别
+/// 在日志里看到，否则用户只会觉得「行模式没生效」。
+#[test]
+fn row_path_changes_are_logged_once_at_simple_level() {
+    let mut app = app();
+    app.config.log_level = "simple".into();
+    app.config.ocr_row_mode = "auto".into();
+    // 不可信的分行结果：模拟回退检测模型。
+    let layout = crate::text_layout::rows(&two_line_panel(), Default::default());
+    assert!(layout.reliable, "样例图本身应当可信，这里只要它的结构");
+    let unreliable = crate::text_layout::RowLayout {
+        reliable: false,
+        ..layout
+    };
+    let text = OcrText {
+        text: "抓鬼 长寿村 12,34".into(),
+        elapsed_secs: 0.1,
+        regions: Vec::new(),
+        notes: Vec::new(),
+        layout: Some(unreliable.clone()),
+        row_texts: Vec::new(),
+    };
+    app.apply_ocr(&text);
+    app.apply_ocr(&text);
+    let hits = app
+        .log_lines
+        .iter()
+        .filter(|line| line.contains("已回退检测模型"))
+        .count();
+    assert_eq!(hits, 1, "同一路径重复识别不该刷屏：{:?}", app.log_lines);
+
+    // 切回「关闭分行」时清空状态，下次再开还会记一条。
+    app.config.ocr_row_mode = "detect".into();
+    app.apply_ocr(&text);
+    app.config.ocr_row_mode = "auto".into();
+    app.apply_ocr(&text);
+    let hits = app
+        .log_lines
+        .iter()
+        .filter(|line| line.contains("已回退检测模型"))
+        .count();
+    assert_eq!(hits, 2, "关掉再开应重新提示：{:?}", app.log_lines);
+}
+
+/// 手动网格选了但没设行高时，实际按自动分行跑；这一条也要说清楚。
+#[test]
+fn manual_mode_without_height_is_reported() {
+    let mut app = app();
+    app.config.log_level = "simple".into();
+    app.config.ocr_row_mode = "manual".into();
+    app.config.ocr_row_height = 0;
+    let layout = crate::text_layout::rows(&two_line_panel(), Default::default());
+    app.apply_ocr(&OcrText {
+        text: String::new(),
+        elapsed_secs: 0.0,
+        regions: Vec::new(),
+        notes: Vec::new(),
+        layout: Some(layout),
+        row_texts: Vec::new(),
+    });
+    assert!(
+        app.log_lines
+            .iter()
+            .any(|line| line.contains("手动网格没设行高")),
+        "应提示手动网格缺行高：{:?}",
+        app.log_lines
+    );
+}
+
+/// 调试页的预览和「测试当前设置」必须用同一个模式：全局关闭分行、但设过行高时，
+/// 预览要按手动网格画（否则拖行高看不到任何变化）。
+#[test]
+fn rows_debug_preview_and_test_share_the_same_mode() {
+    let mut app = app();
+    app.config.ocr_row_mode = "detect".into();
+    app.config.ocr_row_height = 22;
+    let config = app.rows_debug_row_config();
+    assert_eq!(config.line_height, Some(22), "设过行高时预览应按手动网格切");
+    assert_eq!(config.first_line_top, Some(app.config.ocr_row_start));
+
+    // 手动网格但行高无效：预览退回自动，和正式识别一致。
+    app.config.ocr_row_mode = "manual".into();
+    app.config.ocr_row_height = 1;
+    let config = app.rows_debug_row_config();
+    assert_eq!(config.line_height, None, "行高 < 4 时应退回自动分行");
+
+    // 自动分行：不带手动参数。
+    app.config.ocr_row_mode = "auto".into();
+    app.config.ocr_row_height = 22;
+    assert_eq!(app.rows_debug_row_config().line_height, None);
+}
+
 /// 归一化 + 混淆字符还原之后，解析器要能认出坐标和地图名。
 #[test]
 fn manual_row_height_reaches_rows_layout() {

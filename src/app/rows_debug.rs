@@ -57,16 +57,10 @@ impl MhxyApp {
         self.set_rows_debug_panel(panel.clone());
         self.rows_debug_test_running = true;
         self.rows_debug_message = None;
-        // 调试页的「测试当前设置」按预览走：全局关闭分行时也要能对比签名效果，
-        // 否则这里测的是检测模型，逐行文本无从对照。
+        // 「测试当前设置」和上面的预览必须用同一个模式，否则会出现
+        // 「预览没变、测试结果变了」这种自相矛盾的调试体验。
         let mut row = self.row_tuning();
-        if row.mode == crate::ocr::RowMode::Detect {
-            row.mode = if self.rows_debug_row_config().line_height.is_some() {
-                crate::ocr::RowMode::Manual
-            } else {
-                crate::ocr::RowMode::Auto
-            };
-        }
+        row.mode = self.rows_debug_mode();
         let upscale = self.config.ocr_upscale;
         let result = self.worker.submit_test(panel, upscale, row);
         if let Err(err) = result {
@@ -75,11 +69,26 @@ impl MhxyApp {
         }
     }
 
-    /// 调试预览用的分行配置：手动参数只在手动网格下带（预览不受「关闭分行」影响，
-    /// 关了分行也能看到到底能切成几行）。
-    fn rows_debug_row_config(&self) -> text_layout::RowConfig {
-        let manual = self.config.ocr_row_mode == crate::ocr::RowMode::Manual.config_value()
-            && self.config.ocr_row_height >= 4;
+    /// 调试页实际用来分行的模式。
+    ///
+    /// 全局「关闭」时也要能看分行效果（否则这个页面没什么可调的），所以关闭时按
+    /// 「有行高就手动、没行高就自动」跑；手动但没设行高时退回自动，和正式识别一致。
+    fn rows_debug_mode(&self) -> crate::ocr::RowMode {
+        match crate::ocr::RowMode::from_config(&self.config.ocr_row_mode) {
+            crate::ocr::RowMode::Detect if self.config.ocr_row_height >= 4 => {
+                crate::ocr::RowMode::Manual
+            }
+            crate::ocr::RowMode::Detect => crate::ocr::RowMode::Auto,
+            crate::ocr::RowMode::Manual if self.config.ocr_row_height < 4 => {
+                crate::ocr::RowMode::Auto
+            }
+            mode => mode,
+        }
+    }
+
+    /// 调试预览用的分行配置：手动参数只在手动网格下带。
+    pub(super) fn rows_debug_row_config(&self) -> text_layout::RowConfig {
+        let manual = self.rows_debug_mode() == crate::ocr::RowMode::Manual;
         text_layout::RowConfig {
             line_height: manual.then_some(self.config.ocr_row_height),
             first_line_top: manual.then_some(self.config.ocr_row_start),

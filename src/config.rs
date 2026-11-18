@@ -509,41 +509,17 @@ impl Config {
         self.ocr_upscale = self.ocr_upscale.clamp(1, 3);
         self.ocr_row_height = self.ocr_row_height.clamp(0, 200);
         // 行分割默认关闭（`detect`）：旧配置里没有这个键、或者写错值，都当关闭。
-        self.ocr_row_mode = match self.ocr_row_mode.as_str() {
-            "auto" => "auto".to_string(),
-            "manual" => "manual".to_string(),
-            _ => "detect".to_string(),
-        };
+        self.ocr_row_mode = normalize_choice(&self.ocr_row_mode, &["auto", "manual"], "detect");
         self.ocr_row_start = self.ocr_row_start.clamp(0, 4096);
         self.ocr_row_pad = self.ocr_row_pad.clamp(0, 50);
         self.region_presets
             .retain(|_, region| parse_region(region).is_some());
-        self.api_format = if self.api_format == "raw" {
-            "raw".to_string()
-        } else {
-            "multipart".to_string()
-        };
-        self.trigger_mode = if self.trigger_mode == "manual" {
-            "manual".to_string()
-        } else {
-            "auto".to_string()
-        };
-        self.log_level = if self.log_level == "detailed" {
-            "detailed".to_string()
-        } else {
-            "simple".to_string()
-        };
+        self.api_format = normalize_choice(&self.api_format, &["raw"], "multipart");
+        self.trigger_mode = normalize_choice(&self.trigger_mode, &["manual"], "auto");
+        self.log_level = normalize_choice(&self.log_level, &["detailed"], "simple");
         self.color_gate_interval_ms = self.color_gate_interval_ms.clamp(50, 5000);
-        self.color_gate_mode = if self.color_gate_mode == "any" {
-            "any".to_string()
-        } else {
-            "all".to_string()
-        };
-        self.theme = match self.theme.as_str() {
-            "light" => "light".to_string(),
-            "dark" => "dark".to_string(),
-            _ => "system".to_string(),
-        };
+        self.color_gate_mode = normalize_choice(&self.color_gate_mode, &["any"], "all");
+        self.theme = normalize_choice(&self.theme, &["light", "dark"], "system");
         self.meditation_duration_seconds =
             crate::meditation::clamp_duration(self.meditation_duration_seconds);
         self.meditation_opacity = self.meditation_opacity.clamp(0.0, 1.0);
@@ -765,6 +741,17 @@ fn coerce_f32(map: &mut Map<String, Value>, key: &str) {
             map.remove(key);
         }
     }
+}
+
+/// 归一化「取值有限的字符串配置」：容忍空格和大小写（手改配置时很常见），
+/// 认不出来的值退回 `fallback`。以前是逐字比较，写 `"Auto "` 会被静默当成关闭。
+fn normalize_choice(value: &str, allowed: &[&'static str], fallback: &'static str) -> String {
+    let lowered = value.trim().to_ascii_lowercase();
+    allowed
+        .iter()
+        .find(|candidate| **candidate == lowered)
+        .map(|candidate| (*candidate).to_string())
+        .unwrap_or_else(|| fallback.to_string())
 }
 
 /// 把配置文件文本解析成 [`Config`]；失败时返回给用户看的说明。
@@ -1313,6 +1300,31 @@ mod tests {
 
     /// 示例配置必须能解析，而且内容就是代码默认值——用户复制一份当配置用，
     /// 期望「什么都不改」和默认一致；两边漂移（比如示例里的置顶开关写反）不该靠肉眼发现。
+    /// 手改配置时写成 `"Auto "`、`"MANUAL"` 也要认：以前会被静默当成「关闭」，
+    /// 表现就是「开了行分割却没有任何效果」。
+    #[test]
+    fn row_mode_tolerates_case_and_spaces() {
+        let dir = std::env::temp_dir().join(format!(
+            "rust-mhxy-config-row-mode-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("config.json");
+        for (raw, expected) in [
+            ("auto", "auto"),
+            (" Auto ", "auto"),
+            ("AUTO", "auto"),
+            ("Manual", "manual"),
+            ("detect", "detect"),
+            ("nonsense", "detect"),
+        ] {
+            std::fs::write(&path, format!("{{ \"ocr/row_mode\": \"{raw}\" }}")).unwrap();
+            assert_eq!(Config::load(&path).ocr_row_mode, expected, "输入 {raw:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn example_config_matches_defaults() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config.example.json");

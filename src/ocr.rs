@@ -103,7 +103,9 @@ pub enum RowMode {
 impl RowMode {
     /// 从配置字符串解析；未知值（含旧配置缺失键的空串）一律当关闭。
     pub fn from_config(value: &str) -> RowMode {
-        match value {
+        // 手改配置常见 `"Auto"` / `"auto "`：容错大小写和空白，
+        // 否则会被当成未知值静默退回「关闭」，看起来就是「设了没效果」。
+        match value.trim().to_ascii_lowercase().as_str() {
             "auto" => RowMode::Auto,
             "manual" => RowMode::Manual,
             _ => RowMode::Detect,

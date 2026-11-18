@@ -62,6 +62,20 @@ struct TaskState {
     votes: VoteBuffer,
 }
 
+/// 最近一次 OCR 走的分行路径。
+///
+/// 分行不可信时会静默回退检测模型，结果和「关闭分行」完全一样；只在详细日志里
+/// 留一句 note 的话，用户只会觉得「开不开分行没区别」。路径变化时用简单级别记一条。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RowPath {
+    /// 投影/聚类分行可信，每行单独识别。
+    Rows,
+    /// 分行不可信，回退到「检测 + 识别」。
+    Fallback,
+    /// 选了手动网格但没设行高（<4px），实际按自动分行跑。
+    ManualWithoutHeight,
+}
+
 /// 多帧投票：地图取最近几帧的众数（连续 2 帧相同则立即切换），
 /// 坐标取该地图最近 3 帧的中位数。
 #[derive(Default)]
@@ -253,6 +267,8 @@ pub struct MhxyApp {
     meditation_pending_size: Option<(Vec2, Instant)>,
     /// 上一次识别时的游戏客户区尺寸，用来在分辨率变化时切换识别区域。
     last_client_size: Option<(u32, u32)>,
+    /// 最近一次走的分行路径；只在变化时记日志，避免每轮刷屏。
+    last_row_path: Option<RowPath>,
     /// 悬浮窗去阴影的尝试次数；窗口重建后归零重试。
     meditation_shadow_attempts: u8,
     /// 每个任务类型独立地图浮窗的运行时状态（位置 / 大小缓存、层级、最小化）。
@@ -543,6 +559,7 @@ impl MhxyApp {
             meditation_applied_size: None,
             meditation_pending_size: None,
             last_client_size: None,
+            last_row_path: None,
             meditation_shadow_attempts: 0,
             map_windows: HashMap::new(),
             closed_map_windows: HashSet::new(),
@@ -1281,8 +1298,53 @@ impl MhxyApp {
         }
     }
 
+    /// 分行路径变化时用简单级别记一条：让「行模式到底有没有生效」在日志页里一眼可见。
+    ///
+    /// 每轮都记会把日志刷满，所以只在「走分行 / 回退检测 / 手动没设行高」之间切换时记。
+    fn log_row_path(&mut self, ocr_text: &OcrText) {
+        let mode = ocr::RowMode::from_config(&self.config.ocr_row_mode);
+        let path = if mode == ocr::RowMode::Detect {
+            None
+        } else if mode == ocr::RowMode::Manual && self.config.ocr_row_height < 4 {
+            Some(RowPath::ManualWithoutHeight)
+        } else if ocr_text
+            .layout
+            .as_ref()
+            .is_some_and(|layout| layout.reliable)
+        {
+            Some(RowPath::Rows)
+        } else {
+            Some(RowPath::Fallback)
+        };
+        let Some(path) = path else {
+            self.last_row_path = None;
+            return;
+        };
+        if self.last_row_path == Some(path) {
+            return;
+        }
+        self.last_row_path = Some(path);
+        match path {
+            RowPath::Rows => {
+                let rows = ocr_text
+                    .layout
+                    .as_ref()
+                    .map(|layout| layout.rows.len())
+                    .unwrap_or(0);
+                self.log(format!("行分割：走分行路径（{rows} 行）"));
+            }
+            RowPath::Fallback => {
+                self.log("行分割：分行不可信，已回退检测模型（详细日志里有原因）");
+            }
+            RowPath::ManualWithoutHeight => {
+                self.log("行分割：手动网格没设行高，本次按自动分行（到「行分割调试」拖一个行高）");
+            }
+        }
+    }
+
     fn apply_ocr(&mut self, ocr_text: &OcrText) {
         self.last_ocr_layout = ocr_text.layout.clone();
+        self.log_row_path(ocr_text);
         // 分行、归一化、回退等后处理说明先进详细日志，再解析任务。
         for note in &ocr_text.notes {
             self.log_detail(note.clone());
