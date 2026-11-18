@@ -150,6 +150,9 @@ jobs:
           # 只要主仓库索引能拿到，后面的 apt-get install 就能跑。
           $SUDO apt-get update || echo "::warning::apt-get update 有源失败，已用拿到的旧索引继续"
 
+      # 注意：runner 的 rustup 走清华镜像，镜像只保留当前 stable，历史版本会被清掉
+      # （例如 1.97.1 已 403）。所以仓库里不要放 rust-toolchain.toml 钉版本号，
+      # 版本约束用 Cargo.toml 的 rust-version，实际工具链用 runner 上已有的 stable。
       - name: Set up Rust toolchain
         env:
           # 国内镜像：rustup 与 crates.io 都走清华；连不上时改成 rsproxy：

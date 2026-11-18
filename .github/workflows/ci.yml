@@ -34,7 +34,7 @@ jobs:
         uses: actions/checkout@v5
 
       - name: Set up Rust
-        # 版本由 rust-toolchain.toml 决定；这里只补 CI 需要的组件。
+        # 用 stable：仓库里不钉版本（见 Cargo.toml 的说明），这里补上 fmt / clippy 组件。
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
