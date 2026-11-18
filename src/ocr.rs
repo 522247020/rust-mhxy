@@ -1,15 +1,10 @@
 //! OCR：本地 PP-OCR（oar-ocr + ONNX Runtime）与远端 PP-OCR 服务。
 //!
-//! 本地识别有两条路：
-//! 1. **分行路径（主）**：先用 `text_layout` 做投影分行，每行裁图后只跑识别模型
-//!    （rec-only，跳过检测）。任务栏行数少、行距小，检测模型最容易在这里把相邻两行
-//!    并成一个框，分行路径从根上避开这个问题。
-//! 2. **检测路径（兜底）**：分行不可信（行数异常、行高差异过大）时回退到 PP-OCR 的
-//!    「检测 + 识别」完整流程。
+//! 本地识别走 PP-OCR 的「检测 + 识别」完整流程；任务栏行距小、容易把相邻两行并成
+//! 一个框的问题，靠调检测阈值（高召回）和多帧投票解决，不再自己切行。
 use image::{ImageEncoder, RgbImage};
 use oar_ocr::core::config::OrtSessionConfig;
 use oar_ocr::oarocr::OAROCRBuilder;
-use oar_ocr::predictors::text_recognition::TextRecognitionPredictor;
 use serde_json::Value;
 use std::io::Cursor;
 use std::sync::mpsc::{channel, Sender};
@@ -24,35 +19,12 @@ pub const LOCAL_DICT: &str = "ppocrv5_dict.txt";
 const LOCAL_INTRA_THREADS: usize = 4;
 const REMOTE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// 识别模型输入是 3x48x320，宽度超出会让整行被压扁；长行按这个宽高比切块。
-const MAX_LINE_RATIO: f32 = 6.0;
-
 #[derive(Clone, Debug, Default)]
 pub struct OcrText {
     pub text: String,
     pub elapsed_secs: f64,
-    /// 每个文本块的文字和位置。远端接口只回文本，所以可能是空的。
-    pub regions: Vec<OcrRegion>,
-    /// 归一化、分行、回退等处理产生的说明，由 UI 写详细日志。
+    /// 归一化、预处理、回退等处理产生的说明，由 UI 写详细日志。
     pub notes: Vec<String>,
-    /// 本次用的行布局（分行路径算过时才有值），供调试预览使用。
-    pub layout: Option<crate::text_layout::RowLayout>,
-    /// 每一行归一化后的文本，与 `layout.rows` 下标一一对应。
-    pub row_texts: Vec<String>,
-}
-
-/// 一个 OCR 检测框：内容、置信度、在原图（送 OCR 的那张图）里的矩形，
-/// 以及它在 `OcrText::text` 里对应的字符区间（用于就地替换）。
-#[derive(Clone, Debug, PartialEq)]
-pub struct OcrRegion {
-    pub text: String,
-    pub score: f32,
-    pub left: f32,
-    pub top: f32,
-    pub right: f32,
-    pub bottom: f32,
-    /// 在 `OcrText::text` 中的字符下标区间（左闭右开）。
-    pub range: std::ops::Range<usize>,
 }
 
 /// 后台线程完成「截图 → 裁剪 → 预处理 → 放大」后的结果。
@@ -88,54 +60,6 @@ pub enum OcrEvent {
     PanelTest { result: Result<OcrText, String> },
 }
 
-/// 行分割（分行识别）的三种走法，对应配置里的 `ocr/row_mode`。
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum RowMode {
-    /// 自动分行：投影分行 + 校验，不可信时回退检测模型。
-    Auto,
-    /// 手动网格：完全按首行定位 / 行高 / 空白行切，不再做投影估计。
-    Manual,
-    /// 关闭分行：直接走「检测 + 识别」（默认，和旧版一致）。
-    #[default]
-    Detect,
-}
-
-impl RowMode {
-    /// 从配置字符串解析；未知值（含旧配置缺失键的空串）一律当关闭。
-    pub fn from_config(value: &str) -> RowMode {
-        // 手改配置常见 `"Auto"` / `"auto "`：容错大小写和空白，
-        // 否则会被当成未知值静默退回「关闭」，看起来就是「设了没效果」。
-        match value.trim().to_ascii_lowercase().as_str() {
-            "auto" => RowMode::Auto,
-            "manual" => RowMode::Manual,
-            _ => RowMode::Detect,
-        }
-    }
-
-    pub fn config_value(self) -> &'static str {
-        match self {
-            RowMode::Auto => "auto",
-            RowMode::Manual => "manual",
-            RowMode::Detect => "detect",
-        }
-    }
-}
-
-/// 分行的手动参数包：行高 / 首行定位 / 空白行。
-#[derive(Clone, Debug)]
-pub struct RowTuning {
-    /// 行分割策略：决定下面这些手动参数要不要用。
-    pub mode: RowMode,
-    /// 手动行高（像素，0 = 自动估计）：> 0 时切手动网格。
-    pub height: u32,
-    /// 首行定位（像素，图片顶部是 0）：行高不为 0 时才生效。
-    pub start: u32,
-    /// 空白行配置字符串：`"5x24,9x30"`（手动网格才生效）。
-    pub gaps: String,
-    /// 行裁图上下留白（百分比，0..=50）：识别图上下各加行高 × pad% 的留白。
-    pub pad: u32,
-}
-
 struct LocalJob {
     generation: u64,
     image: RgbImage,
@@ -143,9 +67,8 @@ struct LocalJob {
     test: bool,
     /// 高召回检测：降低检测阈值，宁可多出噪声框也别漏字（只影响兜底的检测路径）。
     high_recall: bool,
-    /// 检测路径送模型前的放大倍数（分行路径不需要，识别模型自己会归一化行高）。
+    /// 送模型前的放大倍数。
     upscale: u32,
-    row: RowTuning,
 }
 
 /// 常驻线程：收到第一张截图时才加载模型，远端模式不占用模型内存。
@@ -159,7 +82,6 @@ impl LocalWorker {
         thread::spawn(move || {
             let mut engine_normal = None;
             let mut engine_recall = None;
-            let mut rows_engine: Option<RowsEngine> = None;
             let mut pending: std::collections::VecDeque<LocalJob> =
                 std::collections::VecDeque::new();
             loop {
@@ -181,41 +103,6 @@ impl LocalWorker {
                     }
                 }
                 let result = (|| {
-                    let mode = job.row.mode;
-                    // 手动参数只在手动网格下生效：自动分行要完全靠投影估计。
-                    let manual = mode == RowMode::Manual && job.row.height >= 4;
-                    let cfg = crate::text_layout::RowConfig {
-                        line_height: manual.then_some(job.row.height),
-                        first_line_top: manual.then_some(job.row.start),
-                        gap_rows: if manual {
-                            crate::text_layout::parse_gap_rows(&job.row.gaps)
-                        } else {
-                            Vec::new()
-                        },
-                        pad_ratio: job.row.pad as f32 / 100.0,
-                        ..Default::default()
-                    };
-                    // 1) 分行路径：投影分行 → 每行 rec-only 识别。`detect` 模式整条跳过。
-                    let layout = (mode != RowMode::Detect)
-                        .then(|| crate::text_layout::rows(&job.image, cfg.clone()));
-                    if let Some(layout) = &layout {
-                        if layout.reliable {
-                            if rows_engine.is_none() {
-                                rows_engine = Some(RowsEngine::new()?);
-                            }
-                            let mut ocr = rows_engine
-                                .as_ref()
-                                .expect("initialized rows engine")
-                                .recognize(&job.image, layout, cfg.pad_ratio)?;
-                            for note in &layout.notes {
-                                ocr.notes.push(format!("分行：{note}"));
-                            }
-                            ocr.layout = Some(layout.clone());
-                            return Ok(ocr);
-                        }
-                    }
-
-                    // 2) 兜底：关闭分行或行分割不可信时走「检测 + 识别」。
                     let slot = if job.high_recall {
                         &mut engine_recall
                     } else {
@@ -225,27 +112,7 @@ impl LocalWorker {
                         *slot = Some(LocalEngine::new(job.high_recall)?);
                     }
                     let image = upscale(&job.image, job.upscale);
-                    let mut ocr = slot
-                        .as_ref()
-                        .expect("initialized engine")
-                        .recognize(&image)?;
-                    match (&layout, mode) {
-                        (None, _) => ocr.notes.push("行分割已关闭，直接走检测模型".to_string()),
-                        (Some(_), RowMode::Manual) if job.row.height < 4 => ocr
-                            .notes
-                            .push("手动网格还没设行高（≥4px），本次按自动分行".to_string()),
-                        (Some(layout), _) => ocr.notes.push(format!(
-                            "行分割不可信（{} 行），已回退检测模型",
-                            layout.rows.len()
-                        )),
-                    }
-                    if let Some(layout) = &layout {
-                        for note in &layout.notes {
-                            ocr.notes.push(format!("分行：{note}"));
-                        }
-                    }
-                    ocr.layout = layout;
-                    Ok(ocr)
+                    slot.as_ref().expect("initialized engine").recognize(&image)
                 })();
                 let event = if job.test {
                     OcrEvent::PanelTest { result }
@@ -270,7 +137,6 @@ impl LocalWorker {
         image: RgbImage,
         high_recall: bool,
         upscale: u32,
-        row: RowTuning,
     ) -> Result<(), String> {
         self.sender
             .send(LocalJob {
@@ -279,13 +145,12 @@ impl LocalWorker {
                 test: false,
                 high_recall,
                 upscale,
-                row,
             })
             .map_err(|_| "本地识别线程已退出，请重启程序".to_string())
     }
 
     /// 取点窗口的「测试 OCR」：不占用正式识别的 generation。
-    pub fn submit_test(&self, image: RgbImage, upscale: u32, row: RowTuning) -> Result<(), String> {
+    pub fn submit_test(&self, image: RgbImage, upscale: u32) -> Result<(), String> {
         self.sender
             .send(LocalJob {
                 generation: 0,
@@ -293,7 +158,6 @@ impl LocalWorker {
                 test: true,
                 high_recall: false,
                 upscale,
-                row,
             })
             .map_err(|_| "本地识别线程已退出，请重启程序".to_string())
     }
@@ -335,160 +199,21 @@ impl LocalEngine {
             .predict(vec![image.clone()])
             .map_err(|err| format!("本地 PP-OCR 推理失败：{err}"))?;
         let mut text = String::new();
-        let mut regions = Vec::new();
         for (index, result) in results.iter().enumerate() {
-            let (line_text, mut line_regions) = regions_to_text(result);
             if index > 0 {
                 text.push('\n');
             }
-            // `range` 是相对整段文本的字符下标，拼接后要整体平移。
-            let offset = text.chars().count();
-            for region in &mut line_regions {
-                region.range = (region.range.start + offset)..(region.range.end + offset);
-            }
-            text.push_str(&line_text);
-            regions.append(&mut line_regions);
+            text.push_str(&regions_to_text(result));
         }
         Ok(OcrText {
             text,
             elapsed_secs: started.elapsed().as_secs_f64(),
-            regions,
             notes: Vec::new(),
-            layout: None,
-            row_texts: Vec::new(),
         })
     }
 }
 
-/// 分行路径的识别引擎：只用识别模型（rec-only），不跑检测。
-///
-/// 行位置由 `text_layout` 的投影给出，这里负责：行图 → 长行切块 → 批量识别
-/// → 文本归一化 → 拼成 `OcrText`。
-struct RowsEngine {
-    rec: TextRecognitionPredictor,
-}
-
-impl RowsEngine {
-    fn new() -> Result<Self, String> {
-        let session = OrtSessionConfig::default().with_intra_threads(LOCAL_INTRA_THREADS);
-        let rec = TextRecognitionPredictor::builder()
-            .dict_path(bundled_model(LOCAL_DICT))
-            .with_ort_config(session)
-            .build(bundled_model(LOCAL_REC_MODEL))
-            .map_err(|err| format!("加载本地识别模型失败：{err}"))?;
-        Ok(Self { rec })
-    }
-
-    fn recognize(
-        &self,
-        image: &RgbImage,
-        layout: &crate::text_layout::RowLayout,
-        pad_ratio: f32,
-    ) -> Result<OcrText, String> {
-        let started = Instant::now();
-        let row_images = crate::text_layout::row_images(
-            image,
-            layout,
-            crate::text_layout::RowConfig {
-                pad_ratio,
-                ..Default::default()
-            },
-        );
-
-        // 每行按宽高比切块，拼成一个批次送一次识别（比逐行调用快很多）。
-        let mut batch: Vec<RgbImage> = Vec::new();
-        let mut chunk_counts: Vec<usize> = Vec::with_capacity(row_images.len());
-        for row in &row_images {
-            let gray = image::imageops::grayscale(row);
-            let spans = crate::text_layout::chunks(&gray, MAX_LINE_RATIO);
-            chunk_counts.push(spans.len());
-            for (x0, x1) in spans {
-                let width = x1.saturating_sub(x0).max(1);
-                batch.push(image::imageops::crop_imm(row, x0, 0, width, row.height()).to_image());
-            }
-        }
-
-        if batch.is_empty() {
-            return Ok(OcrText {
-                elapsed_secs: started.elapsed().as_secs_f64(),
-                ..Default::default()
-            });
-        }
-        let chunk_total = batch.len();
-        let result = self
-            .rec
-            .predict(batch)
-            .map_err(|err| format!("本地识别推理失败：{err}"))?;
-
-        // 按行拼回文本（识别结果与输入顺序一一对应；防御性处理长度不一致）。
-        let mut raw_rows: Vec<String> = vec![String::new(); row_images.len()];
-        let mut scores: Vec<Vec<f32>> = vec![Vec::new(); row_images.len()];
-        let mut cursor = 0usize;
-        for (row_index, count) in chunk_counts.iter().enumerate() {
-            for _ in 0..*count {
-                if let Some(text) = result.texts.get(cursor) {
-                    raw_rows[row_index].push_str(text);
-                }
-                if let Some(score) = result.scores.get(cursor) {
-                    scores[row_index].push(*score);
-                }
-                cursor += 1;
-            }
-        }
-
-        let mut ocr = OcrText {
-            elapsed_secs: 0.0,
-            notes: Vec::new(),
-            layout: Some(layout.clone()),
-            row_texts: Vec::with_capacity(row_images.len()),
-            ..Default::default()
-        };
-        if result.texts.len() != chunk_total {
-            ocr.notes.push(format!(
-                "识别结果数量异常：{} 块输入，{} 条输出",
-                chunk_total,
-                result.texts.len()
-            ));
-        }
-
-        for (row_index, raw) in raw_rows.iter().enumerate() {
-            let normalized =
-                crate::ocr_normalize::snap_confusables(&crate::ocr_normalize::normalize(raw));
-            let text = normalized.trim().to_string();
-            ocr.row_texts.push(text.clone());
-            if text.is_empty() {
-                continue;
-            }
-            let Some(row) = layout.rows.get(row_index) else {
-                continue;
-            };
-            if !ocr.text.is_empty() {
-                ocr.text.push('\n');
-            }
-            let start = ocr.text.chars().count();
-            ocr.text.push_str(&text);
-            let end = start + text.chars().count();
-            let score = if scores[row_index].is_empty() {
-                0.0
-            } else {
-                scores[row_index].iter().sum::<f32>() / scores[row_index].len() as f32
-            };
-            ocr.regions.push(OcrRegion {
-                text,
-                score,
-                left: row.rect.x0 as f32,
-                top: row.rect.y0 as f32,
-                right: row.rect.x1 as f32,
-                bottom: row.rect.y1 as f32,
-                range: start..end,
-            });
-        }
-        ocr.elapsed_secs = started.elapsed().as_secs_f64();
-        Ok(ocr)
-    }
-}
-
-/// 检测路径送模型前的放大（分行路径不需要：识别模型自己会把行高归一化到 48）。
+/// 送检测模型前先放大：任务栏文字小，放大后检测框更稳。
 fn upscale(image: &RgbImage, factor: u32) -> RgbImage {
     let factor = factor.clamp(1, 3);
     if factor <= 1 {
@@ -509,14 +234,12 @@ fn upscale(image: &RgbImage, factor: u32) -> RgbImage {
 /// 一个检测框的文本和位置（组装成文本行时的中间结构）。
 struct OcrItem {
     text: String,
-    score: f32,
     left: f32,
     top: f32,
-    right: f32,
     bottom: f32,
 }
 
-fn regions_to_text(result: &oar_ocr::oarocr::OAROCRResult) -> (String, Vec<OcrRegion>) {
+fn regions_to_text(result: &oar_ocr::oarocr::OAROCRResult) -> String {
     let items: Vec<OcrItem> = result
         .text_regions
         .iter()
@@ -528,19 +251,15 @@ fn regions_to_text(result: &oar_ocr::oarocr::OAROCRResult) -> (String, Vec<OcrRe
             let mut top = f32::INFINITY;
             let mut bottom = f32::NEG_INFINITY;
             let mut left = f32::INFINITY;
-            let mut right = f32::NEG_INFINITY;
             for point in &region.bounding_box.points {
                 top = top.min(point.y);
                 bottom = bottom.max(point.y);
                 left = left.min(point.x);
-                right = right.max(point.x);
             }
             top.is_finite().then_some(OcrItem {
                 text,
-                score: region.confidence.unwrap_or(0.0),
                 left,
                 top,
-                right,
                 bottom,
             })
         })
@@ -548,10 +267,10 @@ fn regions_to_text(result: &oar_ocr::oarocr::OAROCRResult) -> (String, Vec<OcrRe
     assemble(items)
 }
 
-/// 排序 + 分行 + 拼文本，同时记录每个检测框在文本里的字符区间。
+/// 排序 + 分行 + 拼文本。
 ///
 /// 拆出来是为了能单独测：拼文本的规则变了会直接影响 `parse_tasks` 能不能认出任务。
-fn assemble(mut items: Vec<OcrItem>) -> (String, Vec<OcrRegion>) {
+fn assemble(mut items: Vec<OcrItem>) -> String {
     items.sort_by(|a, b| a.top.total_cmp(&b.top).then(a.left.total_cmp(&b.left)));
 
     let mut lines: Vec<Vec<OcrItem>> = Vec::new();
@@ -574,34 +293,19 @@ fn assemble(mut items: Vec<OcrItem>) -> (String, Vec<OcrRegion>) {
     }
 
     let mut text = String::new();
-    let mut regions = Vec::new();
-    let mut char_index = 0usize;
     for (line_index, line) in lines.iter_mut().enumerate() {
         line.sort_by(|a, b| a.left.total_cmp(&b.left));
         if line_index > 0 {
             text.push('\n');
-            char_index += 1;
         }
         for (item_index, item) in line.iter().enumerate() {
             if item_index > 0 {
                 text.push(' ');
-                char_index += 1;
             }
-            let start = char_index;
             text.push_str(&item.text);
-            char_index += item.text.chars().count();
-            regions.push(OcrRegion {
-                text: item.text.clone(),
-                score: item.score,
-                left: item.left,
-                top: item.top,
-                right: item.right,
-                bottom: item.bottom,
-                range: start..char_index,
-            });
         }
     }
-    (text, regions)
+    text
 }
 
 /// 优先使用随包携带的模型（`assets/models` 或 exe 旁的 `models`）；
@@ -656,12 +360,10 @@ pub fn remote_recognize(
     let data = response_body
         .read_to_vec()
         .map_err(|err| format!("读取远程响应失败：{err}"))?;
-    // 远端接口只回文本，没有行位置，所以 `regions` 为空。
     Ok(OcrText {
         text: crate::ocr_normalize::normalize(&extract_ocr_text(&data)),
         elapsed_secs: started.elapsed().as_secs_f64(),
-        regions: Vec::new(),
-        ..Default::default()
+        notes: Vec::new(),
     })
 }
 
@@ -845,54 +547,25 @@ mod tests {
     }
 
     #[test]
-    fn row_mode_maps_config_values() {
-        assert_eq!(RowMode::from_config("auto"), RowMode::Auto);
-        assert_eq!(RowMode::from_config("manual"), RowMode::Manual);
-        assert_eq!(RowMode::from_config("detect"), RowMode::Detect);
-        // 缺失键（空串）与写错的值都当关闭：默认就不分行。
-        assert_eq!(RowMode::from_config(""), RowMode::Detect);
-        assert_eq!(RowMode::from_config("garbage"), RowMode::Detect);
-        for mode in [RowMode::Auto, RowMode::Manual, RowMode::Detect] {
-            assert_eq!(RowMode::from_config(mode.config_value()), mode);
-        }
-        assert_eq!(RowMode::default(), RowMode::Detect);
-    }
-
-    /// 组装规则：同一行按 x 排序用空格连，换行用 \n，并记录每个框的字符区间。
-    /// 这条规则变了会直接影响 `parse_tasks` 的解析结果，所以单独测。
-    #[test]
-    fn assembles_regions_into_lines_with_ranges() {
+    fn assembles_detected_boxes_into_lines() {
         let item = |text: &str, left: f32, top: f32| OcrItem {
             text: text.to_string(),
-            score: 0.9,
             left,
             top,
-            right: left + 80.0,
             bottom: top + 24.0,
         };
         // 故意乱序传入：右边那块先给。
-        let (text, regions) = assemble(vec![
+        let text = assemble(vec![
             item("79,26", 300.0, 100.0),
             item("抓鬼", 10.0, 100.0),
             item("鬼王 天宫", 10.0, 200.0),
         ]);
         assert_eq!(text, "抓鬼 79,26\n鬼王 天宫");
-        assert_eq!(regions.len(), 3);
-        // 区间要能直接从文本里切回来。
-        let slice = |range: std::ops::Range<usize>| -> String {
-            text.chars().skip(range.start).take(range.len()).collect()
-        };
-        assert_eq!(slice(regions[0].range.clone()), "抓鬼");
-        assert_eq!(slice(regions[1].range.clone()), "79,26");
-        assert_eq!(slice(regions[2].range.clone()), "鬼王 天宫");
-        assert!((regions[1].left - 300.0).abs() < 1e-6);
     }
 
     #[test]
     fn assemble_of_nothing_is_empty() {
-        let (text, regions) = assemble(Vec::new());
-        assert!(text.is_empty());
-        assert!(regions.is_empty());
+        assert!(assemble(Vec::new()).is_empty());
     }
 
     #[test]

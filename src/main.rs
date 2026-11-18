@@ -13,7 +13,6 @@ mod keymap;
 mod meditation;
 mod ocr;
 mod ocr_normalize;
-mod text_layout;
 mod theme;
 mod update;
 

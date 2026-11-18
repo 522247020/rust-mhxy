@@ -685,7 +685,7 @@ impl eframe::App for MhxyApp {
                     return;
                 }
 
-                // 主区页（顺序即优先级）：说明 / 打坐计时 / 识别区域 / 合成旗编辑器 / 行分割调试 / 识别方式 / 方案管理
+                // 主区页（顺序即优先级）：识别区域 / 按键映射 / 合成旗编辑器 / 识别方式 / 方案管理 / 日志
                 match self.sidebar_tab {
                     Page::Region => {
                         self.region_page_ui(ui);
@@ -706,15 +706,6 @@ impl eframe::App for MhxyApp {
                             .show(ui, |ui| {
                                 ui.set_width(ui.available_width().min(640.0));
                                 self.flight_flags_page_ui(ui);
-                            });
-                        return;
-                    }
-                    Page::RowsDebug => {
-                        egui::ScrollArea::vertical()
-                            .id_salt("rows_debug_page")
-                            .show(ui, |ui| {
-                                ui.set_width(ui.available_width().min(640.0));
-                                self.rows_debug_page_ui(ui);
                             });
                         return;
                     }

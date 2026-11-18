@@ -298,7 +298,7 @@ impl MhxyApp {
                 }
                 theme::divider(ui);
                 // 高级设置：单独一个分组在侧边，合成旗编辑器 / 识别方式 / 方案管理 /
-                // 行分割调试 / 日志都放里面。
+                // 日志都放里面。
                 theme::section_label(ui, "高级设置");
                 for page in page::ADVANCED {
                     let active = self.sidebar_tab == *page;
@@ -1002,9 +1002,7 @@ impl MhxyApp {
             for (value, label) in [(1, "1x"), (2, "2x"), (3, "3x")] {
                 if ui
                     .selectable_value(&mut self.config.ocr_upscale, value, label)
-                    .on_hover_text(
-                        "送 OCR 前放大截图；只在回退到检测模型（关闭分行或分行不可信）时生效",
-                    )
+                    .on_hover_text("送 OCR 前先放大截图：任务栏文字小，放大后检测框更稳")
                     .changed()
                 {
                     self.invalidate_scan();
@@ -1012,52 +1010,6 @@ impl MhxyApp {
                 }
             }
         });
-        if self.config.ocr_mode == "local" {
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.label("行分割");
-                for (mode, label, tip) in [
-                    (
-                        crate::ocr::RowMode::Auto,
-                        "自动分行",
-                        "投影分行 + 校验：每行单独跑识别，避开上下行粘连；分行不可信时自动回退检测模型",
-                    ),
-                    (
-                        crate::ocr::RowMode::Manual,
-                        "手动网格",
-                        "按首行定位和行高切，参数在「行分割调试」页里拖",
-                    ),
-                    (
-                        crate::ocr::RowMode::Detect,
-                        "关闭",
-                        "不做分行，直接走 PP-OCR「检测 + 识别」，和旧版一样",
-                    ),
-                ] {
-                    let selected = self.config.ocr_row_mode == mode.config_value();
-                    if ui
-                        .selectable_label(selected, label)
-                        .on_hover_text(tip)
-                        .clicked()
-                        && !selected
-                    {
-                        self.config.ocr_row_mode = mode.config_value().to_string();
-                        self.invalidate_scan();
-                        self.persist();
-                    }
-                }
-            });
-            if self.config.ocr_row_mode == crate::ocr::RowMode::Manual.config_value()
-                && self.config.ocr_row_height < 4
-            {
-                ui.label(
-                    egui::RichText::new(
-                        "手动网格还没设行高：到「行分割调试」页拖一个行高，否则本次按自动分行",
-                    )
-                    .small()
-                    .color(theme::gold()),
-                );
-            }
-        }
         if self.config.ocr_mode == "local"
             && ui
                 .checkbox(&mut self.config.ocr_high_recall, "高召回检测")
@@ -1075,57 +1027,6 @@ impl MhxyApp {
             .changed()
         {
             self.persist();
-        }
-        if self.config.ocr_mode == "local" {
-            ui.add_space(4.0);
-            match &self.last_ocr_layout {
-                Some(layout) => {
-                    let source = match layout.source {
-                        crate::text_layout::RowSource::Projection => "投影",
-                        crate::text_layout::RowSource::Cluster => "聚类兜底",
-                    };
-                    let color = if layout.reliable {
-                        theme::jade()
-                    } else {
-                        theme::gold()
-                    };
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "分行识别：{} 行｜行高 {}px｜{}｜{}",
-                            layout.rows.len(),
-                            layout.line_height,
-                            source,
-                            if self.config.ocr_row_mode
-                                == crate::ocr::RowMode::Detect.config_value()
-                            {
-                                "本次关闭了分行"
-                            } else if layout.reliable {
-                                "走分行路径"
-                            } else {
-                                "回退检测模型"
-                            }
-                        ))
-                        .small()
-                        .color(color),
-                    );
-                }
-                None => {
-                    let message =
-                        if self.config.ocr_row_mode == crate::ocr::RowMode::Detect.config_value() {
-                            "分行识别：已关闭（直接走检测模型）"
-                        } else {
-                            "分行识别：还没跑过识别"
-                        };
-                    ui.label(egui::RichText::new(message).small().weak());
-                }
-            }
-            if ui
-                .add(theme::secondary_button("行分割调试…"))
-                .on_hover_text("画出每一行的切分范围和投影曲线，确认切得对不对")
-                .clicked()
-            {
-                self.open_rows_debug();
-            }
         }
     }
 
@@ -1352,7 +1253,7 @@ impl MhxyApp {
             "2. 点顶栏右侧「开始识别」/「开始监听」启动，运行时同一个按钮变成「暂停识别」/「暂停监听」。",
             "3. 在「页面 → 任务类型」勾选要看的任务（抓鬼 / 鬼王 / 通用），主区就会出现对应地图面板。",
             "4. 在「页面 → 识别区域」拖动红框设置任务栏截图范围（图 1）；点「更新截图」后还能在预览里点选点位配图色门控。",
-            "5. 其余都在左侧菜单栏：「显示」组管地图浮窗、窗口置顶、界面主题、精简界面；「高级设置」组管合成旗编辑器、识别方式、方案管理、行分割调试和日志。",
+            "5. 其余都在左侧菜单栏：「显示」组管地图浮窗、窗口置顶、界面主题、精简界面；「高级设置」组管合成旗编辑器、识别方式、方案管理和日志。",
             "6. 想把地图单独放一边，在「显示」组打开「地图浮窗」，每个任务各开一个无边框浮窗；任务地图页下方就地出现浮窗开关、不透明度、宽度、置顶和锁定，不另开页面。",
         ] {
             ui.label(egui::RichText::new(line).small());
@@ -1390,10 +1291,8 @@ impl MhxyApp {
         for line in [
             "默认本地 PP-OCR（PP-OCRv5）：首次识别时加载模型；assets/models 缺失时自动下载约 25 MB。",
             "远端 PP-OCR：填服务地址和可选的 Bearer Token，点「测试连接」确认可用；支持 multipart / raw 两种请求格式。",
-            "行分割默认关闭：直接走 PP-OCR「检测 + 识别」，和旧版一致。想按行切，在「高级设置 → 识别方式 → 行分割」里选「自动分行」或「手动网格」。",
-            "自动分行：先投影切行，再逐行只跑识别模型，能避开上下行粘连；分行不可信时自动回退检测模型。",
-            "手动网格：按「高级设置 → 行分割调试」里定的首行定位和行高切，还能在指定行后插入空白行重新对齐；那一页的「测试当前设置」会直接跑一次识别并写出逐行文本，方便对比参数。",
-            "放大倍数默认 2x：只在回退到检测模型时生效；任务栏文字很小又坚持用检测模型时可以调到 3x。",
+            "识别流程：PP-OCR「检测 + 识别」一次跑完，再按检测框位置从左到右、从上到下重排，最后做字符归一化。",
+            "放大倍数默认 2x：送检测模型前先放大截图；任务栏文字特别小时可以调到 3x。",
             "高召回检测：把检测阈值调低减少漏字，代价是可能多出噪声框（只影响检测模型）。",
             "多帧投票：地图取最近几帧众数、坐标取同一地图最近 3 帧的中位数，避免单帧错认导致跳动。",
         ] {

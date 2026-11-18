@@ -19,13 +19,7 @@ pub(super) const PAGES: &[Page] = &[
 ];
 
 /// 侧栏「高级设置」组里的页（按显示顺序）。
-pub(super) const ADVANCED: &[Page] = &[
-    Page::FlightFlags,
-    Page::OcrMode,
-    Page::Profiles,
-    Page::RowsDebug,
-    Page::Log,
-];
+pub(super) const ADVANCED: &[Page] = &[Page::FlightFlags, Page::OcrMode, Page::Profiles, Page::Log];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub(super) enum Page {
@@ -48,8 +42,6 @@ pub(super) enum Page {
     OcrMode,
     /// 方案管理（高级设置）。
     Profiles,
-    /// 行分割调试（高级设置）。
-    RowsDebug,
     Log,
 }
 
@@ -69,7 +61,6 @@ impl Page {
             Page::FlightFlags => "合成旗编辑器",
             Page::OcrMode => "识别方式",
             Page::Profiles => "方案管理",
-            Page::RowsDebug => "行分割调试",
             Page::Log => "日志",
         }
     }
@@ -87,7 +78,7 @@ impl Page {
             Page::OcrMode => "\u{E174}",
             Page::Profiles => "\u{E8F1}",
             Page::Log => "\u{E8B4}",
-            Page::Region | Page::Help | Page::FlightFlags | Page::RowsDebug => "\u{E713}",
+            Page::Region | Page::Help | Page::FlightFlags => "\u{E713}",
         }
     }
 }

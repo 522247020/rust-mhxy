@@ -33,7 +33,6 @@ mod map_window;
 mod meditation;
 mod page;
 mod region;
-mod rows_debug;
 mod shell;
 mod sidebar;
 mod task;
@@ -60,20 +59,6 @@ struct TaskState {
     map_index: Option<usize>,
     /// 多帧投票缓冲，抑制单帧错认。
     votes: VoteBuffer,
-}
-
-/// 最近一次 OCR 走的分行路径。
-///
-/// 分行不可信时会静默回退检测模型，结果和「关闭分行」完全一样；只在详细日志里
-/// 留一句 note 的话，用户只会觉得「开不开分行没区别」。路径变化时用简单级别记一条。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RowPath {
-    /// 投影/聚类分行可信，每行单独识别。
-    Rows,
-    /// 分行不可信，回退到「检测 + 识别」。
-    Fallback,
-    /// 选了手动网格但没设行高（<4px），实际按自动分行跑。
-    ManualWithoutHeight,
 }
 
 /// 多帧投票：地图取最近几帧的众数（连续 2 帧相同则立即切换），
@@ -155,29 +140,6 @@ pub struct MhxyApp {
     preview_texture: Option<TextureHandle>,
     /// 上次把预览图转纹理的时间（节流用）。
     preview_synced_at: Option<Instant>,
-    /// 行分割调试窗口：开关、最近一帧面板、分行结果和缩略图纹理。
-    rows_debug_panel: Option<image::RgbImage>,
-    rows_debug_layout: Option<crate::text_layout::RowLayout>,
-    rows_debug_row_texts: Vec<String>,
-    rows_debug_texture: Option<TextureHandle>,
-    rows_debug_thumbnail: Option<Vec<Option<TextureHandle>>>,
-    /// 缓存的二值图 / 投影曲线 / 行裁图，避免每帧重算 Otsu。
-    rows_debug_binary: Option<image::GrayImage>,
-    rows_debug_profile: Vec<u32>,
-    rows_debug_rows: Vec<image::RgbImage>,
-    /// 面板每次更换就 +1：纹理列表靠它判断要不要重传。
-    rows_debug_revision: u64,
-    rows_debug_preview_revision: Option<u64>,
-    rows_debug_thumb_revision: Option<u64>,
-    /// 缩略图的缓存是二值还是灰度（跟随「显示二值图」开关）。
-    rows_debug_thumb_binary: bool,
-    /// 行分割调试测试识别是否跑着。
-    rows_debug_test_running: bool,
-
-    rows_debug_show_binary: bool,
-    rows_debug_message: Option<String>,
-    /// 最近一次识别用的行布局，侧边栏直接展示「几行、走哪条路」。
-    last_ocr_layout: Option<crate::text_layout::RowLayout>,
     client_size: Option<(u32, u32)>,
     pick_points: bool,
     /// 取点窗口「测试 OCR」的状态与结果。
@@ -267,8 +229,6 @@ pub struct MhxyApp {
     meditation_pending_size: Option<(Vec2, Instant)>,
     /// 上一次识别时的游戏客户区尺寸，用来在分辨率变化时切换识别区域。
     last_client_size: Option<(u32, u32)>,
-    /// 最近一次走的分行路径；只在变化时记日志，避免每轮刷屏。
-    last_row_path: Option<RowPath>,
     /// 悬浮窗去阴影的尝试次数；窗口重建后归零重试。
     meditation_shadow_attempts: u8,
     /// 每个任务类型独立地图浮窗的运行时状态（位置 / 大小缓存、层级、最小化）。
@@ -492,22 +452,6 @@ impl MhxyApp {
             preview_image: None,
             preview_texture: None,
             preview_synced_at: None,
-            rows_debug_panel: None,
-            rows_debug_layout: None,
-            rows_debug_row_texts: Vec::new(),
-            rows_debug_texture: None,
-            rows_debug_thumbnail: None,
-            rows_debug_binary: None,
-            rows_debug_profile: Vec::new(),
-            rows_debug_rows: Vec::new(),
-            rows_debug_revision: 0,
-            rows_debug_preview_revision: None,
-            rows_debug_thumb_revision: None,
-            rows_debug_thumb_binary: false,
-            rows_debug_test_running: false,
-            rows_debug_show_binary: false,
-            rows_debug_message: None,
-            last_ocr_layout: None,
             client_size: None,
             pick_points: true,
             ocr_test_running: false,
@@ -559,7 +503,6 @@ impl MhxyApp {
             meditation_applied_size: None,
             meditation_pending_size: None,
             last_client_size: None,
-            last_row_path: None,
             meditation_shadow_attempts: 0,
             map_windows: HashMap::new(),
             closed_map_windows: HashSet::new(),
@@ -751,17 +694,6 @@ impl MhxyApp {
             Err(err) => {
                 self.log_detail(format!("枚举窗口失败：{err}"));
             }
-        }
-    }
-
-    /// 配置里的行分割设置打成一个包，正式识别和测试识别用同一份。
-    fn row_tuning(&self) -> ocr::RowTuning {
-        ocr::RowTuning {
-            mode: ocr::RowMode::from_config(&self.config.ocr_row_mode),
-            height: self.config.ocr_row_height,
-            start: self.config.ocr_row_start,
-            gaps: self.config.ocr_gap_rows.clone(),
-            pad: self.config.ocr_row_pad,
         }
     }
 
@@ -1039,8 +971,6 @@ impl MhxyApp {
         thread::spawn(move || {
             let result = (|| -> Result<ocr::Captured, String> {
                 // 主区域和备用区域各截一块，上下拼成一张面板。不做预处理也不放大：
-                // 分行用原生分辨率做投影，识别模型自己会把行高归一化到 48；
-                // 只有回退检测模型时才在识别线程里放大。
                 let (full, panel) = if want_full {
                     let full = capture::capture_client(handle, region)?;
                     let mut panels = vec![capture::crop_task_region(&full, region)];
@@ -1097,7 +1027,6 @@ impl MhxyApp {
                 panel,
                 self.config.ocr_high_recall,
                 self.config.ocr_upscale,
-                self.row_tuning(),
             ) {
                 self.busy = false;
                 self.notice = Some(err);
@@ -1141,10 +1070,6 @@ impl MhxyApp {
                                 continue;
                             }
                             self.pending_signature = Some(captured.signature);
-                            // 调试窗口开着就跟着最新面板刷新，不用每次手点。
-                            if self.sidebar_tab == Page::RowsDebug {
-                                self.set_rows_debug_panel(captured.panel.clone());
-                            }
                             self.start_ocr(generation, captured.panel, &window_title);
                         }
                     }
@@ -1168,30 +1093,10 @@ impl MhxyApp {
                 }
                 OcrEvent::PanelTest { result } => {
                     self.ocr_test_running = false;
-                    self.rows_debug_test_running = false;
-                    match result {
-                        Ok(text) => {
-                            let formatted = self.format_test_result(&text);
-                            self.ocr_test_result = Some(Ok(formatted));
-                            // 行分割调试页的逐行文本跟着测试结果走，设置对不对马上看见。
-                            self.rows_debug_message = Some(format!(
-                                "识别用时 {:.2} 秒｜{}",
-                                text.elapsed_secs,
-                                self.ocr_test_result
-                                    .as_ref()
-                                    .map(|result| match result {
-                                        Ok(message) => message.clone(),
-                                        Err(err) => err.clone(),
-                                    })
-                                    .unwrap_or_default()
-                            ));
-                            self.set_rows_debug_texts(text.layout.as_ref(), &text.row_texts);
-                        }
-                        Err(err) => {
-                            self.ocr_test_result = Some(Err(err.clone()));
-                            self.rows_debug_message = Some(err);
-                        }
-                    }
+                    self.ocr_test_result = Some(match result {
+                        Ok(text) => Ok(self.format_test_result(&text)),
+                        Err(err) => Err(err),
+                    });
                     continue;
                 }
             };
@@ -1209,7 +1114,6 @@ impl MhxyApp {
                     self.last_signature = self.pending_signature.take();
                     self.last_ocr_secs = Some(text.elapsed_secs);
                     self.notice = None;
-                    self.set_rows_debug_texts(text.layout.as_ref(), &text.row_texts);
                     self.apply_ocr(&text);
                 }
             }
@@ -1289,63 +1193,14 @@ impl MhxyApp {
                 let _ = sender.send(OcrEvent::PanelTest { result });
                 ctx.request_repaint();
             });
-        } else if let Err(err) =
-            self.worker
-                .submit_test(panel, self.config.ocr_upscale, self.row_tuning())
-        {
+        } else if let Err(err) = self.worker.submit_test(panel, self.config.ocr_upscale) {
             self.ocr_test_running = false;
             self.ocr_test_result = Some(Err(err));
         }
     }
 
-    /// 分行路径变化时用简单级别记一条：让「行模式到底有没有生效」在日志页里一眼可见。
-    ///
-    /// 每轮都记会把日志刷满，所以只在「走分行 / 回退检测 / 手动没设行高」之间切换时记。
-    fn log_row_path(&mut self, ocr_text: &OcrText) {
-        let mode = ocr::RowMode::from_config(&self.config.ocr_row_mode);
-        let path = if mode == ocr::RowMode::Detect {
-            None
-        } else if mode == ocr::RowMode::Manual && self.config.ocr_row_height < 4 {
-            Some(RowPath::ManualWithoutHeight)
-        } else if ocr_text
-            .layout
-            .as_ref()
-            .is_some_and(|layout| layout.reliable)
-        {
-            Some(RowPath::Rows)
-        } else {
-            Some(RowPath::Fallback)
-        };
-        let Some(path) = path else {
-            self.last_row_path = None;
-            return;
-        };
-        if self.last_row_path == Some(path) {
-            return;
-        }
-        self.last_row_path = Some(path);
-        match path {
-            RowPath::Rows => {
-                let rows = ocr_text
-                    .layout
-                    .as_ref()
-                    .map(|layout| layout.rows.len())
-                    .unwrap_or(0);
-                self.log(format!("行分割：走分行路径（{rows} 行）"));
-            }
-            RowPath::Fallback => {
-                self.log("行分割：分行不可信，已回退检测模型（详细日志里有原因）");
-            }
-            RowPath::ManualWithoutHeight => {
-                self.log("行分割：手动网格没设行高，本次按自动分行（到「行分割调试」拖一个行高）");
-            }
-        }
-    }
-
     fn apply_ocr(&mut self, ocr_text: &OcrText) {
-        self.last_ocr_layout = ocr_text.layout.clone();
-        self.log_row_path(ocr_text);
-        // 分行、归一化、回退等后处理说明先进详细日志，再解析任务。
+        // 归一化、回退等后处理说明先进详细日志，再解析任务。
         for note in &ocr_text.notes {
             self.log_detail(note.clone());
         }

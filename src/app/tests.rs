@@ -644,9 +644,7 @@ fn high_chance_grid_drawn_only_when_nearby_text_present() {
         app.apply_ocr(&OcrText {
             text: text.into(),
             elapsed_secs: 0.1,
-            regions: Vec::new(),
             notes: Vec::new(),
-            ..Default::default()
         });
         let ctx = app.ctx.clone();
         let mut output = ctx.run_ui(
@@ -737,7 +735,6 @@ fn menu_bar_holds_everything_top_bar_stays_clean() {
         "识别方式",
         "方案管理",
         "日志",
-        "行分割调试",
         "地图浮窗",
         "窗口置顶",
         "精简界面",
@@ -781,9 +778,9 @@ fn menu_bar_holds_everything_top_bar_stays_clean() {
     }
 }
 
-/// 菜单分组：说明排在「页面」组最下面，行分割调试挪到「高级设置」组。
+/// 菜单分组：说明排在「页面」组最下面，高级设置组整组在页面组下面。
 #[test]
-fn menu_groups_put_help_last_and_rows_debug_in_advanced() {
+fn menu_groups_put_help_last_and_advanced_settings_below_pages() {
     let mut app = app();
     let ctx = app.ctx.clone();
     let mut frame = eframe::Frame::_new_kittest();
@@ -810,15 +807,15 @@ fn menu_groups_put_help_last_and_rows_debug_in_advanced() {
         find("打坐计时")
     );
     assert!(
-        find("行分割调试").y > find("方案管理").y,
-        "行分割调试应在高级设置组里：{:?} / {:?}",
-        find("行分割调试"),
+        find("日志").y > find("方案管理").y,
+        "高级设置组应按顺序排列：{:?} / {:?}",
+        find("日志"),
         find("方案管理")
     );
     assert!(
-        find("行分割调试").y > find("说明").y,
+        find("日志").y > find("说明").y,
         "高级设置组整体在页面组下面：{:?} / {:?}",
-        find("行分割调试"),
+        find("日志"),
         find("说明")
     );
 }
@@ -881,12 +878,7 @@ fn help_page_embeds_screenshots_and_current_copy() {
             "说明页缺少「{expected}」小节：{texts:?}"
         );
     }
-    for expected in [
-        "行分割默认关闭",
-        "放大倍数默认 2x",
-        "默认本地 PP-OCR",
-        "行分割调试",
-    ] {
+    for expected in ["放大倍数默认 2x", "默认本地 PP-OCR"] {
         assert!(
             texts.iter().any(|text| text.contains(expected)),
             "说明页缺少「{expected}」说明：{texts:?}"
@@ -1385,9 +1377,7 @@ fn switching_map_keeps_the_window_zoom() {
     app.apply_ocr(&OcrText {
         text: "抓鬼 长寿村 12,34".into(),
         elapsed_secs: 0.1,
-        regions: Vec::new(),
         notes: Vec::new(),
-        ..Default::default()
     });
     app.set_map_window(true);
     let mut output = ctx.run_ui(input(), |ui| app.ui(ui, &mut frame));
@@ -1415,9 +1405,7 @@ fn switching_map_keeps_the_window_zoom() {
     app.apply_ocr(&OcrText {
         text: "抓鬼 大唐境外 34,56".into(),
         elapsed_secs: 0.1,
-        regions: Vec::new(),
         notes: Vec::new(),
-        ..Default::default()
     });
     let mut output = ctx.run_ui(input(), |ui| app.ui(ui, &mut frame));
     output.textures_delta.clear();
@@ -1582,9 +1570,7 @@ fn map_window_sizes_itself_to_the_map_image() {
     app.apply_ocr(&OcrText {
         text: "抓鬼 长寿村 12,34".into(),
         elapsed_secs: 0.1,
-        regions: Vec::new(),
         notes: Vec::new(),
-        ..Default::default()
     });
     // 模拟旧版本存下来的固定 560×460 布局：升级后应自动贴合图片大小，
     // 但仍保留原来的位置。
@@ -1633,9 +1619,7 @@ fn map_window_builder_geometry_stays_frozen_after_manual_resize() {
     app.apply_ocr(&OcrText {
         text: "抓鬼 长寿村 12,34".into(),
         elapsed_secs: 0.1,
-        regions: Vec::new(),
         notes: Vec::new(),
-        ..Default::default()
     });
     app.set_map_window(true);
     let mut output = ctx.run_ui(input(), |ui| app.ui(ui, &mut frame));
@@ -1701,12 +1685,12 @@ fn compact_mode_hides_chrome_and_esc_restores_it() {
 
     app.compact = true;
     // 不管当前在哪个设置页，进精简模式主区只画地图。
-    app.sidebar_tab = Page::RowsDebug;
+    app.sidebar_tab = Page::Log;
     let mut output = ctx.run_ui(input(), |ui| app.ui(ui, &mut frame));
     let texts = collect_texts(&output.shapes);
     assert!(
-        !texts.iter().any(|text| text == "行分割调试"),
-        "精简模式主区只画地图，不应显示行分割调试页：{texts:?}"
+        !texts.iter().any(|text| text == "日志级别"),
+        "精简模式主区只画地图，不应显示设置页内容：{texts:?}"
     );
     for hidden in [
         "开始识别",
@@ -1753,9 +1737,7 @@ fn result(generation: u64) -> OcrEvent {
         result: Ok(OcrText {
             text: "抓鬼 长寿村 12,34 鬼王 天宫 56,78".into(),
             elapsed_secs: 0.25,
-            regions: Vec::new(),
             notes: Vec::new(),
-            ..Default::default()
         }),
     }
 }
@@ -1767,9 +1749,7 @@ fn switching_windows_discards_inflight_results_and_previous_coordinates() {
     app.apply_ocr(&OcrText {
         text: "抓鬼 长寿村 12,34".into(),
         elapsed_secs: 0.1,
-        regions: Vec::new(),
         notes: Vec::new(),
-        ..Default::default()
     });
     assert!(app.tasks["抓鬼"].location.is_some());
     app.busy = true;
@@ -1901,9 +1881,7 @@ fn panel_test_result_is_formatted_for_region_window() {
             result: Ok(OcrText {
                 text: "抓鬼 长寿村 12,34".into(),
                 elapsed_secs: 0.2,
-                regions: Vec::new(),
                 notes: Vec::new(),
-                ..Default::default()
             }),
         })
         .unwrap();
@@ -2023,9 +2001,7 @@ fn failed_recognition_keeps_previous_map_and_bounds() {
     let success = OcrText {
         text: "抓鬼 长寿村 12,34".into(),
         elapsed_secs: 0.1,
-        regions: Vec::new(),
         notes: Vec::new(),
-        ..Default::default()
     };
     for width in [700.0, 320.0] {
         let mut expected = None;
@@ -2036,9 +2012,7 @@ fn failed_recognition_keeps_previous_map_and_bounds() {
                 app.apply_ocr(&OcrText {
                     text: String::new(),
                     elapsed_secs: 0.1,
-                    regions: Vec::new(),
                     notes: Vec::new(),
-                    ..Default::default()
                 });
             }
             let mut output = ctx.run_ui(
@@ -2274,9 +2248,7 @@ fn renders_local_remote_and_map_layouts_at_supported_sizes() {
             app.apply_ocr(&OcrText {
                 text: "抓鬼 长寿村 12,34 鬼王 天宫 56,78".into(),
                 elapsed_secs: 0.1,
-                regions: Vec::new(),
                 notes: Vec::new(),
-                ..Default::default()
             });
         }
         let mut output = ctx.run_ui(
@@ -2311,257 +2283,6 @@ fn renders_local_remote_and_map_layouts_at_supported_sizes() {
     assert_eq!(app.map_textures.len(), 2);
 }
 
-/// 行分割调试窗口：拿到合成面板后应算出两行，并把行框 / 投影画出来。
-#[test]
-fn rows_debug_preview_shows_projection_rows() {
-    let mut app = app();
-    // 两行「方块字」，行间留足空隙，确保投影能切开。
-    let panel = two_line_panel();
-    app.sidebar_tab = Page::RowsDebug;
-    app.set_rows_debug_panel(panel);
-    let layout = app.rows_debug_layout.clone().expect("应算出分行结果");
-    assert_eq!(layout.rows.len(), 2, "两行应切成两条带：{layout:?}");
-    assert!(layout.reliable, "规整的两行应判可信");
-
-    let ctx = app.ctx.clone();
-    let mut output = ctx.run_ui(
-        egui::RawInput {
-            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 700.0))),
-            ..Default::default()
-        },
-        |ui| app.rows_debug_window_ui(ui),
-    );
-    let texts = collect_texts(&output.shapes);
-    assert!(
-        texts.iter().any(|text| text.contains("行数 2")),
-        "应显示行数统计：{texts:?}"
-    );
-    assert!(app.rows_debug_texture.is_some(), "预览纹理应在渲染后建立");
-    output.textures_delta.clear();
-}
-
-/// 分行不可信时会静默回退检测模型，结果和「关闭」一样；路径变化必须能用简单级别
-/// 在日志里看到，否则用户只会觉得「行模式没生效」。
-#[test]
-fn row_path_changes_are_logged_once_at_simple_level() {
-    let mut app = app();
-    app.config.log_level = "simple".into();
-    app.config.ocr_row_mode = "auto".into();
-    // 不可信的分行结果：模拟回退检测模型。
-    let layout = crate::text_layout::rows(&two_line_panel(), Default::default());
-    assert!(layout.reliable, "样例图本身应当可信，这里只要它的结构");
-    let unreliable = crate::text_layout::RowLayout {
-        reliable: false,
-        ..layout
-    };
-    let text = OcrText {
-        text: "抓鬼 长寿村 12,34".into(),
-        elapsed_secs: 0.1,
-        regions: Vec::new(),
-        notes: Vec::new(),
-        layout: Some(unreliable.clone()),
-        row_texts: Vec::new(),
-    };
-    app.apply_ocr(&text);
-    app.apply_ocr(&text);
-    let hits = app
-        .log_lines
-        .iter()
-        .filter(|line| line.contains("已回退检测模型"))
-        .count();
-    assert_eq!(hits, 1, "同一路径重复识别不该刷屏：{:?}", app.log_lines);
-
-    // 切回「关闭分行」时清空状态，下次再开还会记一条。
-    app.config.ocr_row_mode = "detect".into();
-    app.apply_ocr(&text);
-    app.config.ocr_row_mode = "auto".into();
-    app.apply_ocr(&text);
-    let hits = app
-        .log_lines
-        .iter()
-        .filter(|line| line.contains("已回退检测模型"))
-        .count();
-    assert_eq!(hits, 2, "关掉再开应重新提示：{:?}", app.log_lines);
-}
-
-/// 手动网格选了但没设行高时，实际按自动分行跑；这一条也要说清楚。
-#[test]
-fn manual_mode_without_height_is_reported() {
-    let mut app = app();
-    app.config.log_level = "simple".into();
-    app.config.ocr_row_mode = "manual".into();
-    app.config.ocr_row_height = 0;
-    let layout = crate::text_layout::rows(&two_line_panel(), Default::default());
-    app.apply_ocr(&OcrText {
-        text: String::new(),
-        elapsed_secs: 0.0,
-        regions: Vec::new(),
-        notes: Vec::new(),
-        layout: Some(layout),
-        row_texts: Vec::new(),
-    });
-    assert!(
-        app.log_lines
-            .iter()
-            .any(|line| line.contains("手动网格没设行高")),
-        "应提示手动网格缺行高：{:?}",
-        app.log_lines
-    );
-}
-
-/// 调试页的预览和「测试当前设置」必须用同一个模式：全局关闭分行、但设过行高时，
-/// 预览要按手动网格画（否则拖行高看不到任何变化）。
-#[test]
-fn rows_debug_preview_and_test_share_the_same_mode() {
-    let mut app = app();
-    app.config.ocr_row_mode = "detect".into();
-    app.config.ocr_row_height = 22;
-    let config = app.rows_debug_row_config();
-    assert_eq!(config.line_height, Some(22), "设过行高时预览应按手动网格切");
-    assert_eq!(config.first_line_top, Some(app.config.ocr_row_start));
-
-    // 手动网格但行高无效：预览退回自动，和正式识别一致。
-    app.config.ocr_row_mode = "manual".into();
-    app.config.ocr_row_height = 1;
-    let config = app.rows_debug_row_config();
-    assert_eq!(config.line_height, None, "行高 < 4 时应退回自动分行");
-
-    // 自动分行：不带手动参数。
-    app.config.ocr_row_mode = "auto".into();
-    app.config.ocr_row_height = 22;
-    assert_eq!(app.rows_debug_row_config().line_height, None);
-}
-
-/// 归一化 + 混淆字符还原之后，解析器要能认出坐标和地图名。
-#[test]
-fn manual_row_height_reaches_rows_layout() {
-    let mut app = app();
-    app.config.ocr_row_mode = "manual".into();
-    app.config.ocr_row_height = 22;
-    let panel = two_line_panel();
-    app.set_rows_debug_panel(panel);
-    let layout = app.rows_debug_layout.clone().expect("应有分行结果");
-    assert_eq!(layout.line_height, 22, "notes: {:?}", layout.notes);
-    assert!(
-        layout.notes.iter().any(|note| note.contains("手动网格")),
-        "应走手动网格：{:?}",
-        layout.notes
-    );
-
-    // 调试页出现手动行高控件。
-    let ctx = app.ctx.clone();
-    let mut output = ctx.run_ui(
-        egui::RawInput {
-            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 900.0))),
-            ..Default::default()
-        },
-        |ui| app.rows_debug_window_ui(ui),
-    );
-    let texts = collect_texts(&output.shapes);
-    output.textures_delta.clear();
-    for expected in ["行高", "自动", "手动", "首行定位"] {
-        assert!(
-            texts.iter().any(|text| text.contains(expected)),
-            "行分割调试页缺少「{expected}」：{texts:?}"
-        );
-    }
-}
-
-#[test]
-fn gap_rows_are_shown_and_inserted() {
-    let mut app = app();
-    app.config.ocr_row_mode = "manual".into();
-    app.config.ocr_row_height = 22;
-    app.config.ocr_gap_rows = "1x40".to_string();
-    app.set_rows_debug_panel(two_line_panel());
-    let layout = app.rows_debug_layout.clone().expect("应有分行结果");
-    let blank = layout.rows.iter().find(|row| row.ink == 0);
-    assert!(
-        blank.is_some(),
-        "空白行应被插入：{:?}",
-        layout
-            .rows
-            .iter()
-            .map(|row| (row.rect.y0, row.ink))
-            .collect::<Vec<_>>()
-    );
-    assert_eq!(
-        blank.map(|row| row.rect.y1 - row.rect.y0),
-        Some(40),
-        "空白行高是配置里的"
-    );
-
-    // 调试页出现空白行编辑器。
-    let ctx = app.ctx.clone();
-    let mut output = ctx.run_ui(
-        egui::RawInput {
-            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 900.0))),
-            ..Default::default()
-        },
-        |ui| app.rows_debug_window_ui(ui),
-    );
-    let texts = collect_texts(&output.shapes);
-    output.textures_delta.clear();
-    for expected in ["空白行", "添加空白行", "第", "之后 ·"] {
-        assert!(
-            texts.iter().any(|text| text.contains(expected)),
-            "行分割调试页缺少「{expected}」：{texts:?}"
-        );
-    }
-}
-
-#[test]
-fn rows_debug_test_needs_a_panel_first() {
-    let mut app = app();
-    app.test_rows_debug_ocr();
-    assert!(!app.rows_debug_test_running);
-    assert!(
-        app.rows_debug_message
-            .as_deref()
-            .is_some_and(|message| message.contains("先抓一帧")),
-        "没面板时测试应提示先抓一帧：{:?}",
-        app.rows_debug_message
-    );
-}
-
-#[test]
-fn rows_debug_test_submits_and_panel_result_fills_texts() {
-    let mut app = app();
-    app.set_rows_debug_panel(two_line_panel());
-    let layout = app.rows_debug_layout.clone().expect("应有分行结果");
-
-    app.test_rows_debug_ocr();
-    assert!(app.rows_debug_test_running, "点了测试后应在跑");
-
-    // 模拟工人线程回了一次 PanelTest：行分割调试的逐行文本跟它走。
-    app.sender
-        .send(crate::ocr::OcrEvent::PanelTest {
-            result: Ok(crate::ocr::OcrText {
-                text: "第一行 第二行".into(),
-                elapsed_secs: 0.05,
-                regions: Vec::new(),
-                notes: Vec::new(),
-                layout: Some(layout),
-                row_texts: vec!["第一行".into(), "第二行".into()],
-            }),
-        })
-        .expect("测试通道应可写");
-    app.poll_events();
-    assert!(!app.rows_debug_test_running, "有结果后测试状态应清空");
-    assert_eq!(
-        app.rows_debug_row_texts,
-        vec!["第一行".to_string(), "第二行".to_string()],
-        "逐行文本应写回调试预览"
-    );
-    assert!(
-        app.rows_debug_message
-            .as_deref()
-            .is_some_and(|message| message.contains("识别用时")),
-        "应显示这次测试的用时：{:?}",
-        app.rows_debug_message
-    );
-}
-
 #[test]
 fn normalized_row_text_still_parses_tasks() {
     let app = app();
@@ -2576,135 +2297,4 @@ fn normalized_row_text_still_parses_tasks() {
     let task = tasks.first().expect("应解析出抓鬼任务");
     assert_eq!(task.map_name, "长寿村");
     assert_eq!((task.x, task.y), (79, 26));
-}
-
-/// 最近一次识别的行布局要留给侧边栏展示。
-#[test]
-fn apply_ocr_remembers_row_layout() {
-    let mut app = app();
-    let layout = crate::text_layout::rows(&two_line_panel(), Default::default());
-    app.apply_ocr(&OcrText {
-        text: "抓鬼 长寿村 12,34".into(),
-        elapsed_secs: 0.1,
-        regions: Vec::new(),
-        notes: Vec::new(),
-        layout: Some(layout),
-        row_texts: vec!["抓鬼 长寿村 12,34".into()],
-    });
-    let remembered = app.last_ocr_layout.as_ref().expect("应保留行布局");
-    assert_eq!(remembered.rows.len(), 2);
-}
-
-/// 两行方块字的面板：每行 12 个 8×12 的实心块，行间留 16px 空隙。
-#[test]
-fn auto_row_mode_ignores_manual_height() {
-    let mut app = app();
-    app.config.ocr_row_mode = "auto".into();
-    app.config.ocr_row_height = 22;
-    app.set_rows_debug_panel(two_line_panel());
-    let layout = app.rows_debug_layout.clone().expect("应有分行结果");
-    assert!(
-        !layout.notes.iter().any(|note| note.contains("手动网格")),
-        "自动分行不该用手动网格：{:?}",
-        layout.notes
-    );
-}
-
-/// 识别方式页：行分割三档开关 + 手动网格缺行高时的提示。
-#[test]
-fn mode_page_exposes_row_split_switch() {
-    let mut app = app();
-    app.config.ocr_row_mode = "manual".into();
-    assert_eq!(app.row_tuning().mode, crate::ocr::RowMode::Manual);
-
-    let ctx = app.ctx.clone();
-    let mut output = ctx.run_ui(
-        egui::RawInput {
-            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 900.0))),
-            ..Default::default()
-        },
-        |ui| app.mode_page_ui(ui),
-    );
-    let texts = collect_texts(&output.shapes);
-    output.textures_delta.clear();
-    for expected in ["行分割", "自动分行", "手动网格", "关闭"] {
-        assert!(
-            texts.iter().any(|text| text == expected),
-            "识别方式页缺少「{expected}」：{texts:?}"
-        );
-    }
-    assert!(
-        texts.iter().any(|text| text.contains("手动网格还没设行高")),
-        "缺行高时应提示按自动分行：{texts:?}"
-    );
-
-    // 设了行高就不再警告。
-    app.config.ocr_row_height = 22;
-    let mut output = ctx.run_ui(
-        egui::RawInput {
-            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 900.0))),
-            ..Default::default()
-        },
-        |ui| app.mode_page_ui(ui),
-    );
-    let texts = collect_texts(&output.shapes);
-    output.textures_delta.clear();
-    assert!(
-        !texts.iter().any(|text| text.contains("手动网格还没设行高")),
-        "设了行高就不该再提示：{texts:?}"
-    );
-}
-
-fn two_line_panel() -> image::RgbImage {
-    let mut image = image::RgbImage::from_pixel(160, 80, image::Rgb([20, 24, 30]));
-    for row in 0..2 {
-        let top = 12 + row * 40;
-        for index in 0..12u32 {
-            let left = 8 + index * 12;
-            for y in top..top + 14 {
-                for x in left..left + 8 {
-                    image.put_pixel(x, y, image::Rgb([240, 240, 240]));
-                }
-            }
-        }
-    }
-    image
-}
-
-/// 左侧菜单栏「窗口」组里要有行分割调试入口，点击按钮能切换开关。
-#[test]
-fn menu_bar_exposes_rows_debug_entry() {
-    let mut app = app();
-    let ctx = app.ctx.clone();
-    let mut frame = eframe::Frame::_new_kittest();
-    let mut output = ctx.run_ui(
-        egui::RawInput {
-            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1120.0, 900.0))),
-            ..Default::default()
-        },
-        |ui| app.ui(ui, &mut frame),
-    );
-    let texts = collect_texts(&output.shapes);
-    output.textures_delta.clear();
-    assert!(
-        texts.iter().any(|text| text == "行分割调试"),
-        "菜单栏应提供行分割调试入口：{texts:?}"
-    );
-}
-
-/// 没有选窗口时打开调试页只给提示，不崩；页签随点击切换。
-#[test]
-fn open_rows_debug_switches_page_and_explains_missing_window() {
-    let mut app = app();
-    assert_ne!(app.sidebar_tab, Page::RowsDebug);
-    app.open_rows_debug();
-    assert_eq!(app.sidebar_tab, Page::RowsDebug);
-    assert!(
-        app.rows_debug_message
-            .as_deref()
-            .unwrap_or_default()
-            .contains("游戏窗口"),
-        "没有选窗口时应提示先选窗口：{:?}",
-        app.rows_debug_message
-    );
 }

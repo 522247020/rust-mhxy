@@ -1,6 +1,6 @@
 //! OCR 文本归一化：把识别结果整理成后续解析可以直接使用的形态。
 //!
-//! 主路径中的位置是「投影分行 → 每行 rec-only 识别 → **本模块** → 地图名/坐标解析」。
+//! 主路径中的位置是「PP-OCR 检测 + 识别 → **本模块** → 地图名/坐标解析」。
 //! 这里只做纯文本变换：不读图、不写文件、不依赖 OCR 引擎，方便单独写单测。
 //!
 //! 规则取舍面向梦幻西游任务栏：
@@ -137,6 +137,9 @@ fn is_numeric_space(chars: &[char], index: usize) -> bool {
 
 /// 把 OCR 常混淆的字母映射成数字（只对字母生效，中文原样保留）。
 ///
+/// 正式识别路径不调用它：归一化只统一字符形态，不猜「字母其实是数字」。
+/// 保留给测试构造「字母被认成数字/反之」的样例。
+///
 /// 映射表：`O o D`→`0`、`I |`→`1`、`Z`→`2`、`A`→`4`、`S`→`5`、`G`→`6`、
 /// `T`→`7`、`B`→`8`、`g q`→`9`。
 ///
@@ -150,6 +153,7 @@ fn is_numeric_space(chars: &[char], index: usize) -> bool {
 ///
 /// 注意：`normalize` 的白名单里没有 `|`，如果 OCR 原文可能把 `1` 认成竖线，
 /// 应先调用本函数再调用 [`normalize`]，否则竖线会在归一化时被删掉。
+#[cfg(test)]
 pub fn snap_confusables(text: &str) -> String {
     let chars: Vec<char> = text.chars().collect();
     let mut out = String::with_capacity(text.len());
