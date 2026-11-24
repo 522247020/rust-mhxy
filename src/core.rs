@@ -228,8 +228,34 @@ fn compact(text: &str) -> String {
     text.chars().filter(|ch| !ch.is_whitespace()).collect()
 }
 
+/// 空白规整：连续空白压成一个、去掉首尾空白，但**保留换行**。
+///
+/// 任务栏文字放不下时 OCR 会把一条坐标折成两行（`12` + `3,45`），
+/// 换行和同行内的空格在这里不是同一个东西：后者是分隔语义，前者多半是折行噪声。
+/// 保留换行让下游能分开处理。`\r\n` / `\r` 统一成 `\n`。
 fn collapse_whitespace(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
+    let mut out = String::with_capacity(text.len());
+    let mut pending_space = false;
+    let mut pending_newline = false;
+    for ch in text.chars() {
+        if ch == '\n' || ch == '\r' {
+            pending_newline = true;
+        } else if ch.is_whitespace() {
+            pending_space = true;
+        } else {
+            if !out.is_empty() {
+                if pending_newline {
+                    out.push('\n');
+                } else if pending_space {
+                    out.push(' ');
+                }
+            }
+            pending_space = false;
+            pending_newline = false;
+            out.push(ch);
+        }
+    }
+    out
 }
 
 fn is_cjk(ch: char) -> bool {
@@ -321,7 +347,18 @@ pub fn find_map_definition<'a>(
     )
 }
 
+/// 坐标一段最多 3 位数字（游戏里坐标最大 `999`）。
+const MAX_COORDINATE_DIGITS: usize = 3;
+
 /// 在 ``block`` 中寻找第一个「数字 分隔符 数字」坐标，返回 (字节起点, x, y)。
+///
+/// 坐标里的空白有两种来源，处理方式不同：
+/// - **换行**：任务栏文字放不下时的折行，`12` + `3,45` 是同一个数字 `123`；
+///   把换行当分隔符会读出 `(12, 3)` 并丢掉后面的数字（用户反馈的问题）。
+/// - **空格**：同一行内两个检测框之间的间隔，既可能是数字内部噪声
+///   （`7 9`），也可能是坐标分隔符（`123 45`）。
+///
+/// 所以先把换行接回同一数字，再按「显式分隔符 → 空格」的顺序判定。
 fn find_coordinate(block: &str) -> Option<(usize, i32, i32)> {
     let chars: Vec<char> = block.chars().collect();
     // 记录每个 char 对应的字节位置，方便返回偏移。
@@ -335,53 +372,103 @@ fn find_coordinate(block: &str) -> Option<(usize, i32, i32)> {
         if !chars[start].is_ascii_digit() {
             continue;
         }
-        let mut index = start;
-        let mut first = String::new();
-        while index < chars.len() && chars[index].is_ascii_digit() && first.len() < 3 {
-            first.push(chars[index]);
-            index += 1;
-        }
-        let mut had_space = false;
-        while index < chars.len() && chars[index] == ' ' {
-            index += 1;
-            had_space = true;
-        }
-        if index < chars.len() && is_separator(chars[index]) {
-            index += 1;
-            while index < chars.len() && chars[index] == ' ' {
-                index += 1;
-            }
-        } else if !had_space {
-            continue;
-        }
-        let mut second = String::new();
-        while index < chars.len() && chars[index].is_ascii_digit() && second.len() < 3 {
-            second.push(chars[index]);
-            index += 1;
-        }
-        if second.is_empty() {
-            continue;
-        }
-        // OCR 可能把坐标的第二个数字换行拆开（例如 "79,2" + "6"）。
-        // 如果后面隔了空格还有数字，就接上去（最多 3 位）。
-        let mut probe = index;
-        while second.len() < 3 {
-            let mut next = probe;
-            while next < chars.len() && chars[next] == ' ' {
-                next += 1;
-            }
-            if next > probe && next < chars.len() && chars[next].is_ascii_digit() {
-                second.push(chars[next]);
-                probe = next + 1;
-            } else {
-                break;
-            }
-        }
-        if let (Ok(x), Ok(y)) = (first.parse::<i32>(), second.parse::<i32>()) {
+        if let Some((x, y)) = coordinate_at(&chars, start) {
             return Some((byte_offsets[start], x, y));
         }
     }
     None
+}
+
+/// 从 `start` 开始尝试解析一条坐标。
+fn coordinate_at(chars: &[char], start: usize) -> Option<(i32, i32)> {
+    let (first, index) = collect_number(chars, start)?;
+    let after_first = skip_spaces(chars, index);
+    // 1) 显式分隔符（逗号 / 句号等）：最可靠，空格可有可无。
+    if chars.get(after_first).is_some_and(|ch| is_separator(*ch)) {
+        let (second, _) = collect_number(chars, skip_spaces(chars, after_first + 1))?;
+        return Some((first.parse().ok()?, second.parse().ok()?));
+    }
+    // 2) 没有分隔符：`123 45` / `79 26` 这种用空格分两个数字的写法。
+    if index > 0 && after_first > index {
+        let (second, _) = collect_number(chars, after_first)?;
+        return Some((first.parse().ok()?, second.parse().ok()?));
+    }
+    None
+}
+
+/// 收集一个坐标数字，最多 [`MAX_COORDINATE_DIGITS`] 位。
+///
+/// 中间的空白直接跳过：换行是折行拆开的同一个数字，空格是 OCR 在数字中间
+/// 插入的噪声（`7 9` → `79`）。只要接完不超过 3 位就接，超过就在空格处
+/// 断开 —— `123 45` 拼起来是 6 位，说明空格是坐标分隔符而不是数字内噪声。
+fn collect_number(chars: &[char], start: usize) -> Option<(String, usize)> {
+    let mut digits = String::new();
+    let mut index = start;
+    while index < chars.len() && chars[index].is_ascii_digit() {
+        if digits.len() >= MAX_COORDINATE_DIGITS {
+            return None;
+        }
+        digits.push(chars[index]);
+        index += 1;
+    }
+    if digits.is_empty() {
+        return None;
+    }
+    loop {
+        let cursor = skip_spaces(chars, index);
+        // 空白后面必须紧跟数字；否则这串数字到此为止。
+        if cursor == index || !chars.get(cursor).is_some_and(|ch| ch.is_ascii_digit()) {
+            break;
+        }
+        // 先数一下空白后这段相邻数字有多长，超过一位就不再接：
+        // 那样拼出来会超过 3 位或者更像两个独立数字。
+        let mut run = 0usize;
+        while chars
+            .get(cursor + run)
+            .is_some_and(|ch| ch.is_ascii_digit())
+        {
+            run += 1;
+        }
+        if digits.len() + run > MAX_COORDINATE_DIGITS {
+            break;
+        }
+        let mut cursor = cursor;
+        while chars.get(cursor).is_some_and(|ch| ch.is_ascii_digit())
+            && digits.len() < MAX_COORDINATE_DIGITS
+        {
+            digits.push(chars[cursor]);
+            cursor += 1;
+        }
+        index = cursor;
+    }
+    Some((digits, index))
+}
+
+fn skip_spaces(chars: &[char], start: usize) -> usize {
+    let mut index = start;
+    while index < chars.len() && chars[index].is_whitespace() {
+        index += 1;
+    }
+    index
+}
+
+/// 匹配任务关键字，允许关键字中间插入换行（OCR 把 `降伏` 折成 `降` + `伏`）。
+///
+/// 返回关键字在 `chars` 中的**字符长度**（含被跳过的换行），方便调用方继续切块。
+/// 只跳过换行、不跳空格：同行内的空格本来就不是关键字的一部分。
+fn match_folded(chars: &[char], start: usize, prefix: &[char]) -> Option<usize> {
+    let mut cursor = start;
+    for expected in prefix {
+        // 每个字符前面允许有一个换行。
+        if chars.get(cursor) == Some(&'\n') {
+            cursor += 1;
+        }
+        if chars.get(cursor) != Some(expected) {
+            return None;
+        }
+        cursor += 1;
+    }
+    Some(cursor - start)
 }
 
 /// 从「去XXX / 前往XXX」这样的描述里推断地图名。
@@ -434,13 +521,12 @@ pub fn parse_tasks(text: &str, maps: &[MapDefinition], filter: TaskFilter) -> Ve
     let chars: Vec<char> = normalized.chars().collect();
 
     // 记录每个任务关键字出现的位置（等价于 Python 的非重叠匹配 + 前置非汉字断言）。
+    // 关键字中间也可能被折行拆开（`降` + `伏`），匹配时允许跳过换行。
     let mut matches: Vec<(usize, usize, &str)> = Vec::new();
     let mut index = 0;
     while index < chars.len() {
         let hit = TASK_KEYWORDS.iter().find_map(|(task, prefix, boundary)| {
-            chars[index..]
-                .starts_with(prefix)
-                .then_some((*task, prefix.len(), *boundary))
+            match_folded(&chars, index, prefix).map(|len| (*task, len, *boundary))
         });
         match hit {
             Some((task, len, boundary)) if !boundary || index == 0 || !is_cjk(chars[index - 1]) => {
@@ -960,6 +1046,85 @@ mod tests {
                 tasks: vec!["抓鬼".into()],
             },
         ]
+    }
+
+    #[test]
+    fn rejoins_coordinate_split_across_lines_at_any_position() {
+        // 用户反馈：坐标被换行拆开时，识别出的坐标会缺掉跨行的数字。
+        // 这里把换行插到每一处位置（含第一个数字内部、行首带空格、双重折行），
+        // 只要原文是一条合法坐标，就必须解析回同一个值。
+        let samples = [
+            ("钟馗抓鬼：去长寿村123,45附近抓僵尸", (123, 45)),
+            ("钟馗抓鬼：去长寿村79,26处抓僵尸", (79, 26)),
+            ("钟馗抓鬼：去长寿村7,9附近抓僵尸", (7, 9)),
+            ("钟馗抓鬼：去长寿村120,4附近抓僵尸", (120, 4)),
+            ("钟馗抓鬼：去长寿村123,45抓僵尸", (123, 45)),
+            ("降伏千年厉鬼：去长寿村123,45降伏僵尸鬼王", (123, 45)),
+            ("降伏千年厉鬼：去长寿村12,345降伏僵尸鬼王", (12, 345)),
+            ("抓鬼 长寿村 123 45", (123, 45)),
+            ("抓鬼 长寿村 123, 45", (123, 45)),
+            ("抓鬼 长寿村 123 4", (123, 4)),
+        ];
+        for (sample, want) in samples {
+            let chars: Vec<char> = sample.chars().collect();
+            let check = |text: String| {
+                let tasks = parse_tasks(&text, &maps(), TaskFilter::KEYWORD_TASKS);
+                let got = tasks.first().map(|task| (task.x, task.y));
+                assert_eq!(
+                    got,
+                    Some(want),
+                    "换行切点解析错误：{}",
+                    text.replace('\n', "⏎")
+                );
+            };
+            for split in 0..=chars.len() {
+                check(
+                    chars[..split]
+                        .iter()
+                        .chain(std::iter::once(&'\n'))
+                        .chain(chars[split..].iter())
+                        .collect(),
+                );
+            }
+            // 两种折行叠加：坐标被拆成三段。
+            for first in 0..=chars.len() {
+                for second in first..=chars.len() {
+                    check(
+                        chars[..first]
+                            .iter()
+                            .chain(std::iter::once(&'\n'))
+                            .chain(chars[first..second].iter())
+                            .chain(std::iter::once(&'\n'))
+                            .chain(chars[second..].iter())
+                            .collect(),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn coordinate_split_inside_first_number_keeps_all_digits() {
+        // 关键回归：换行落在第一个数字内部时，旧实现把换行当分隔符，
+        // `123,45` 会被读成 `(1, 23)` 或 `(12, 3)`，后面的数字整个丢掉。
+        for text in [
+            "钟馗抓鬼：去长寿村1\n23,45抓僵尸",
+            "钟馗抓鬼：去长寿村12\n3,45抓僵尸",
+            "钟馗抓鬼：去长寿村123,\n45抓僵尸",
+            "钟馗抓鬼：去长寿村123,4\n5抓僵尸",
+        ] {
+            let tasks = parse_tasks(text, &maps(), TaskFilter::default());
+            assert_eq!(tasks.len(), 1, "{text}");
+            assert_eq!((tasks[0].x, tasks[0].y), (123, 45), "{text}");
+        }
+    }
+
+    #[test]
+    fn grid_style_space_separated_coordinate_is_not_merged() {
+        // 反向保护：空格式分隔的坐标不能被拼成一串（`123 45` ≠ `12345`）。
+        let tasks = parse_tasks("抓鬼 长寿村 123 45", &maps(), TaskFilter::KEYWORD_TASKS);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!((tasks[0].x, tasks[0].y), (123, 45));
     }
 
     #[test]

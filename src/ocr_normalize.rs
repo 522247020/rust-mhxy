@@ -124,6 +124,8 @@ fn is_allowed(ch: char) -> bool {
 /// 空格是否夹在数字串内部（两侧是数字或坐标分隔符，且至少一侧是数字）。
 ///
 /// 这样 `79, 26` 里的空格会删掉，而 `抓鬼 长寿村` 里的空格会保留。
+/// 但两侧都是数字时还要看位数：坐标一段最多 3 位，`123 45` 拼起来是
+/// `12345`，那说明这个空格是坐标分隔符，不能删。
 /// `chars` 已经压过空白，所以下标两侧不会再有空格。
 fn is_numeric_space(chars: &[char], index: usize) -> bool {
     if index == 0 || index + 1 >= chars.len() {
@@ -132,7 +134,44 @@ fn is_numeric_space(chars: &[char], index: usize) -> bool {
     let prev = chars[index - 1];
     let next = chars[index + 1];
     let numeric = |ch: char| ch.is_ascii_digit() || ch == ',' || ch == '.';
-    numeric(prev) && numeric(next) && (prev.is_ascii_digit() || next.is_ascii_digit())
+    if !(numeric(prev) && numeric(next) && (prev.is_ascii_digit() || next.is_ascii_digit())) {
+        return false;
+    }
+    // 两侧都是数字时，拼接后不能超过坐标的 3 位上限；超过说明空格是分隔符。
+    if prev.is_ascii_digit() && next.is_ascii_digit() {
+        let left = digit_run_len(chars, index, true);
+        let right = digit_run_len(chars, index, false);
+        if left + right > MAX_COORDINATE_DIGITS {
+            return false;
+        }
+    }
+    true
+}
+
+/// 坐标一段最多 3 位数字（与 `core::find_coordinate` 的上限一致）。
+const MAX_COORDINATE_DIGITS: usize = 3;
+
+/// 以 `index` 处的空格为界，往左（`left` 为 true）或往右数连续数字的位数。
+fn digit_run_len(chars: &[char], index: usize, left: bool) -> usize {
+    let mut count = 0usize;
+    let mut cursor = index;
+    while cursor > 0 && left {
+        cursor -= 1;
+        if chars[cursor].is_ascii_digit() {
+            count += 1;
+        } else {
+            break;
+        }
+    }
+    while cursor + 1 < chars.len() && !left {
+        cursor += 1;
+        if chars[cursor].is_ascii_digit() {
+            count += 1;
+        } else {
+            break;
+        }
+    }
+    count
 }
 
 /// 把 OCR 常混淆的字母映射成数字（只对字母生效，中文原样保留）。
@@ -196,6 +235,15 @@ mod tests {
             "去长寿镇(79,26)附近"
         );
         assert_eq!(normalize("【79，26】"), "[79,26]");
+    }
+
+    #[test]
+    fn normalize_keeps_space_between_two_coordinate_numbers() {
+        // 坐标一段最多 3 位：`123 45` 拼成 5 位说明空格是分隔符，不能删。
+        assert_eq!(normalize("抓鬼 长寿村 123 45"), "抓鬼 长寿村 123 45");
+        assert_eq!(normalize("抓鬼 长寿村 1234 5"), "抓鬼 长寿村 1234 5");
+        // 拼起来不超过 3 位的仍按数字内部噪声处理。
+        assert_eq!(normalize("7 9, 2 6"), "79,26");
     }
 
     #[test]
